@@ -51,6 +51,7 @@ export function processRunner(): CommandRunner {
         });
         let stdout = "";
         let stderr = "";
+        let inputFailed = false;
         child.stdout.setEncoding("utf8");
         child.stderr.setEncoding("utf8");
         child.stdout.on("data", (chunk: string) => {
@@ -59,9 +60,11 @@ export function processRunner(): CommandRunner {
         child.stderr.on("data", (chunk: string) => {
           stderr += chunk;
         });
+        // A tool may close stdin without reading it; only promised nonempty input can be lost.
+        child.stdin.on("error", () => { inputFailed = (options.input?.length ?? 0) > 0; });
         child.stdin.end(options.input ?? "");
         child.on("error", (error) => resolve({ code: null, stdout, stderr, error: error.message }));
-        child.on("close", (code) => resolve({ code, stdout, stderr }));
+        child.on("close", (code) => resolve({ code, stdout, stderr, ...(inputFailed ? { error: "Command input could not be delivered." } : {}) }));
       });
     },
   };
