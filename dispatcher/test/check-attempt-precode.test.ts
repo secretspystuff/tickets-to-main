@@ -97,8 +97,8 @@ function fixture(t: TestContext) {
   });
   let execute = async (input: ExecuteInput): Promise<Observation> => good(input);
   let observe = (): Snapshot => structuredClone(current);
-  const run = () => runCheckAttempt({
-    stateDir, workspace, request, env, gitRunner: processRunner(), now: () => 1794009600000, secrets: ["fixture-held-secret"],
+  const run = (requestedStateDir = stateDir) => runCheckAttempt({
+    stateDir: requestedStateDir, workspace, request, env, gitRunner: processRunner(), now: () => 1794009600000, secrets: ["fixture-held-secret"],
     readCurrent: async () => { reads++; return observe(); },
     executor: { kind: "fabricated-harness" as const, execute: async (input: ExecuteInput) => { calls.push(input); return execute(input); } },
   });
@@ -487,6 +487,70 @@ test("an executor exception cannot leak its secret message or leave a successful
   assert.equal(result.publicResult, "unavailable");
   assert.equal(JSON.stringify(result).includes("fixture-held-secret"), false);
   assert.equal(readFileSync(join(f.stateDir, "ledger.json"), "utf8").includes("fixture-held-secret"), false);
+});
+
+for (const uncertainty of ["unknown descendants", "missing terminal", "wrong source", "executor exception"] as const) {
+  test(`${uncertainty} prevents a new attempt from reassigning the same effect ownership`, async (t) => {
+    const f = fixture(t);
+    f.execute = async (input) => {
+      if (uncertainty === "executor exception") throw new Error("Fabricated executor disconnected");
+      const observation = f.good(input);
+      if (uncertainty === "unknown descendants") observation.terminal!.writerCustody = "unknown";
+      if (uncertainty === "missing terminal") observation.terminal = null;
+      if (uncertainty === "wrong source") observation.terminal!.sourceId = "foreign-executor";
+      return observation;
+    };
+    assert.equal((await f.run()).publicResult, "unavailable");
+    f.request.attemptId = id("61");
+    f.execute = async (input) => f.good(input);
+    const replacement = await f.run();
+    assert.equal(replacement.state, "held");
+    assert.equal(replacement.publicResult, "unavailable");
+    assert.equal(replacement.publishable, false);
+    assert.equal(f.calls.length, 1);
+    assert.equal(f.saved().checkAttempts.length, 1);
+  });
+}
+
+test("uncertain ownership follows the actual workspace across another private state directory", async (t) => {
+  const f = fixture(t);
+  f.execute = async (input) => {
+    const observation = f.good(input);
+    observation.terminal!.writerCustody = "unknown";
+    return observation;
+  };
+  assert.equal((await f.run()).state, "held");
+  const alternateState = join(f.stateDir, "..", "alternate-private-state");
+  install({ stateDir: alternateState, platform: "linux", arch: "x64", nowIso: "2026-11-07T00:00:00Z" });
+  const alternate = loadLedger(alternateState);
+  if (!alternate.ok) throw new Error("Alternate fabricated state is missing");
+  alternate.ledger.workspace = { path: f.workspace, writerPid: null, qualified: false };
+  saveLedger(alternateState, alternate.ledger, []);
+  f.request.attemptId = id("62");
+  f.execute = async (input) => f.good(input);
+  const replacement = await f.run(alternateState);
+  assert.equal(replacement.state, "held");
+  assert.equal(replacement.publicResult, "unavailable");
+  assert.equal(f.calls.length, 1);
+  const saved = loadLedger(alternateState);
+  assert.equal(saved.ok && (saved.ledger.checkAttempts?.length ?? 0), 0);
+});
+
+test("uncertain ownership of one fabricated workspace does not block a disjoint workspace", async (t) => {
+  const first = fixture(t);
+  first.execute = async (input) => {
+    const observation = first.good(input);
+    observation.terminal!.writerCustody = "unknown";
+    return observation;
+  };
+  assert.equal((await first.run()).state, "held");
+  const second = fixture(t);
+  const result = await second.run();
+  assert.equal(result.state, "passed");
+  assert.equal(result.qualification, "unqualified-harness");
+  assert.equal(result.publishable, false);
+  assert.equal(first.calls.length, 1);
+  assert.equal(second.calls.length, 1);
 });
 
 test("no caller boolean can promote the fabricated executor to production qualification", async (t) => {
