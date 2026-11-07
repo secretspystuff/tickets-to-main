@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { spawnSync } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -528,4 +528,78 @@ test("malformed or secret-bearing durable attempts are rejected without rewritin
   assert.equal(parseLedger(JSON.stringify(duplicate)), null);
   assert.throws(() => saveLedger(f.stateDir, duplicate, []), /record is not valid/);
   assert.equal(readFileSync(filename, "utf8"), original);
+});
+
+test("an actual check subprocess and supported installer preserve each other's ledger updates", async (t) => {
+  const f = fixture(t);
+  assert.equal((await f.run()).state, "passed");
+  const historical = structuredClone(f.saved().checkAttempts[0]);
+  const request = { ...structuredClone(f.request), attemptId: id("60") };
+  const childProgram = `
+    import { runCheckAttempt } from ${JSON.stringify(new URL("../src/check-attempt.ts", import.meta.url).href)};
+    import { processRunner } from ${JSON.stringify(new URL("../src/command.ts", import.meta.url).href)};
+    let payload = "";
+    for await (const part of process.stdin) payload += part;
+    const input = JSON.parse(payload);
+    const released = new Promise((resolve) => process.once("message", resolve));
+    const result = await runCheckAttempt({
+      ...input, gitRunner: processRunner(), now: () => 1794009600000, secrets: [],
+      readCurrent: async () => structuredClone(input.request.snapshot),
+      executor: {
+        kind: "fabricated-harness",
+        execute: async (check) => {
+          process.send({ kind: "executing" });
+          await released;
+          return {
+            stdout: "fabricated subprocess behavior verified", stderr: "",
+            coveredMemberIds: [...input.request.snapshot.memberIds],
+            terminal: {
+              attemptId: check.attemptId, checkId: check.checkId,
+              sourceId: input.request.snapshot.profile.sourceId, candidateCommit: check.candidateCommit,
+              code: 0, signal: null, error: null, writerCustody: "contained",
+            },
+          };
+        },
+      },
+    });
+    process.send({ kind: "finished", state: result.state, publishable: result.publishable }, () => process.disconnect());
+  `;
+  const child = spawn(process.execPath, ["--experimental-strip-types", "--input-type=module", "-e", childProgram], {
+    cwd: root, env: { PATH: process.env.PATH ?? "" }, stdio: ["pipe", "ignore", "ignore", "ipc"],
+  });
+  let enter!: () => void;
+  const entered = new Promise<void>((resolve) => { enter = resolve; });
+  let terminal: { state: string; publishable: boolean } | null = null;
+  const finished = new Promise<void>((resolve, reject) => {
+    child.on("error", () => reject(new Error("The fabricated check subprocess could not start.")));
+    child.on("message", (message: unknown) => {
+      const value = message as { kind?: string; state?: string; publishable?: boolean };
+      if (value.kind === "executing") enter();
+      if (value.kind === "finished" && typeof value.state === "string" && typeof value.publishable === "boolean") {
+        terminal = { state: value.state, publishable: value.publishable };
+      }
+    });
+    child.on("close", (code) => code === 0 && terminal ? resolve() : reject(new Error("The fabricated check subprocess did not finish.")));
+  });
+  child.stdin!.on("error", () => {});
+  child.stdin!.end(JSON.stringify({ stateDir: f.stateDir, workspace: f.workspace, request }));
+  try {
+    await Promise.race([entered, finished.then(() => { throw new Error("The check did not reach the execution barrier."); })]);
+    assert.equal(f.saved().checkAttempts.at(-1)?.state, "running");
+    install({ stateDir: f.stateDir, platform: "linux", arch: "arm64", nowIso: "2026-11-07T00:01:00Z" });
+    assert.equal(f.saved().install?.arch, "arm64");
+    assert.equal(f.saved().checkAttempts.at(-1)?.state, "running");
+    child.send("continue", () => {});
+    await finished;
+    assert.deepEqual(terminal, { state: "passed", publishable: false });
+    const saved = f.saved();
+    assert.equal(saved.install?.arch, "arm64");
+    assert.equal(saved.checkAttempts.length, 2);
+    assert.deepEqual(saved.checkAttempts[0], historical);
+    assert.equal(saved.checkAttempts[1]?.attemptId, request.attemptId);
+    assert.equal(saved.checkAttempts[1]?.state, "passed");
+  } finally {
+    if (child.connected) child.send("continue", () => {});
+    await finished;
+  }
 });
