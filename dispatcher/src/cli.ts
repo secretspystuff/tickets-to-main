@@ -14,7 +14,7 @@ import {
 import { openCustody } from "./custody.ts";
 import { rememberCodex } from "./discover.ts";
 import { install } from "./install.ts";
-import { loadLedger, saveLedger } from "./ledger.ts";
+import { loadLedger, updateLedger } from "./ledger.ts";
 import { computerName } from "./platform.ts";
 import { renderStatus, statusOf } from "./status.ts";
 import { claimWorkspace, prepareWorkspace, processAlive, releaseWorkspace } from "./workspace.ts";
@@ -231,8 +231,10 @@ async function runTool(argv: string[], io: Io): Promise<number> {
   const loaded = loadLedger(dir);
   if (!loaded.ok || !loaded.ledger.install) throw new Error("Tickets to Main is not installed. Run tickets-to-main install.");
   const discovery = await discoverCodex(interfaceId as CodexInterfaceId, io.runner);
-  rememberCodex(loaded.ledger, discovery);
-  saveLedger(dir, loaded.ledger, []);
+  updateLedger(dir, [], (current) => {
+    if (!current.install) throw new Error("Tickets to Main is not installed. Run tickets-to-main install.");
+    rememberCodex(current, discovery);
+  });
   const label = discovery.claim.qualification === "documented"
     ? "documented"
     : discovery.claim.qualification;

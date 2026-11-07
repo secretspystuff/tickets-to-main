@@ -37,9 +37,13 @@ test("the public surface imports no private app code and opens no network stack"
   assert.deepEqual(processUsers.map((path) => basename(path)).sort(), ["command.ts", "custody.ts", "native-transport.ts"]);
   const outside = combined.flatMap((path) => {
     const text = readFileSync(path, "utf8");
-    return [...text.matchAll(/from "([^"]+)"/g)].map((match) => match[1] ?? "").filter((spec) => /src\/lib\/|workers\//.test(spec));
+    return [...text.matchAll(/from "([^"]+)"/g)].map((match) => match[1] ?? "").filter((spec) => /src\/lib\/|workers\//.test(spec))
+      .map((spec) => [basename(path), spec]);
   });
-  assert.deepEqual(outside, ["../../src/lib/ttm-protocol.ts"]);
+  assert.deepEqual(outside.sort((a, b) => a[0]!.localeCompare(b[0]!)), [
+    ["check-attempt.ts", "../../src/lib/ttm-protocol.ts"],
+    ["coordination.ts", "../../src/lib/ttm-protocol.ts"],
+  ]);
 });
 
 test("fixtures name the two Codex interfaces and one fabricated key", () => {

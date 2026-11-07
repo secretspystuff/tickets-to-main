@@ -1,7 +1,7 @@
 import { createHash, randomBytes } from "node:crypto";
 import type { Custody } from "./custody.ts";
 import { BOARD_KEY_ACCOUNT, DEVICE_CODE_ACCOUNT } from "./custody.ts";
-import { loadLedger, saveLedger, type ConnectionRecord, type DeliveryReceipt, type Ledger } from "./ledger.ts";
+import { loadLedger, updateLedger, type ConnectionRecord, type DeliveryReceipt, type Ledger } from "./ledger.ts";
 import { confirmHello } from "./coordination.ts";
 import { FixtureTransport, loadFixture, type DevicePoll } from "./protocol.ts";
 import { PROTOCOL_REVISION } from "./version.ts";
@@ -13,6 +13,14 @@ function requireInstalled(stateDir: string): Ledger {
   if (!loaded.ok) throw new Error("The local record could not be read.");
   if (!loaded.ledger.install) throw new Error("Tickets to Main is not installed. Run tickets-to-main install.");
   return loaded.ledger;
+}
+
+function commitConnection(stateDir: string, expected: string, connection: ConnectionRecord, secrets: readonly string[]): string {
+  updateLedger(stateDir, secrets, (current) => {
+    if (!current.install || JSON.stringify(current.connection) !== expected) throw new Error("The connection changed. Its work was preserved; reload before retrying.");
+    current.connection = structuredClone(connection);
+  });
+  return JSON.stringify(connection);
 }
 
 function digest(value: string): string { return createHash("sha256").update(value).digest("hex"); }
@@ -45,6 +53,7 @@ export async function connectStart(input: {
   nowIso: string;
 }): Promise<ConnectResult> {
   const ledger = requireInstalled(input.stateDir);
+  let expectedConnection = JSON.stringify(ledger.connection);
   if (input.custody.describe().kind === "unavailable") {
     return {
       exitCode: 1,
@@ -77,8 +86,7 @@ export async function connectStart(input: {
     fixturePollIndex: 0,
     ...(scopeOf(input.custody) === null ? {} : { enrollmentId: randomBytes(16).toString("hex") }),
   };
-  ledger.connection = connection;
-  saveLedger(input.stateDir, ledger, [fixture.challenge.deviceCode]);
+  commitConnection(input.stateDir, expectedConnection, connection, [fixture.challenge.deviceCode]);
   return {
     exitCode: 0,
     lines: [`Open ${fixture.challenge.verificationUriComplete} and approve code ${fixture.challenge.userCode}.`],
@@ -123,6 +131,7 @@ export async function connectPoll(input: {
   nowMs: number;
 }): Promise<ConnectResult> {
   const ledger = requireInstalled(input.stateDir);
+  let expectedConnection = JSON.stringify(ledger.connection);
   const connection = ledger.connection;
   if (!connection || connection.phase !== "pending") {
     return { exitCode: 1, lines: ["There is no connection waiting for approval."] };
@@ -144,8 +153,7 @@ export async function connectPoll(input: {
     await input.custody.delete(DEVICE_CODE_ACCOUNT);
     const approved: ConnectionRecord = { ...connection, phase: "approved", boardName: receipt.boardName, agentName: receipt.agentName };
     delete approved.deliveryReceipt;
-    ledger.connection = approved;
-    saveLedger(input.stateDir, ledger, [stored]);
+    commitConnection(input.stateDir, expectedConnection, approved, [stored]);
     return { exitCode: 0, lines: connectedLines(approved) };
   }
   const deviceCode = await input.custody.get(DEVICE_CODE_ACCOUNT);
@@ -178,18 +186,15 @@ export async function connectPoll(input: {
   const applied = applyPoll({ ...connection }, result, true);
   if (scope !== null && applied.key !== null) {
     const receipt = receiptOf(connection, scope, applied.key, applied.connection.boardName!, applied.connection.agentName!);
-    ledger.connection = { ...connection, deliveryReceipt: receipt };
-    saveLedger(input.stateDir, ledger, [deviceCode, applied.key]);
+    expectedConnection = commitConnection(input.stateDir, expectedConnection, { ...connection, deliveryReceipt: receipt }, [deviceCode, applied.key]);
     await input.custody.put(BOARD_KEY_ACCOUNT, applied.key);
     await input.custody.delete(DEVICE_CODE_ACCOUNT);
-    ledger.connection = applied.connection;
-    saveLedger(input.stateDir, ledger, [deviceCode, applied.key]);
+    commitConnection(input.stateDir, expectedConnection, applied.connection, [deviceCode, applied.key]);
     return { exitCode: applied.exitCode, lines: applied.lines };
   }
   if (applied.dropDevice) await input.custody.delete(DEVICE_CODE_ACCOUNT);
   if (applied.key) await input.custody.put(BOARD_KEY_ACCOUNT, applied.key);
-  ledger.connection = applied.connection;
   const hidden = [deviceCode, applied.key ?? ""].filter(Boolean);
-  saveLedger(input.stateDir, ledger, hidden);
+  commitConnection(input.stateDir, expectedConnection, applied.connection, hidden);
   return { exitCode: applied.exitCode, lines: applied.lines };
 }

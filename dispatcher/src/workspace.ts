@@ -1,7 +1,7 @@
 import { lstatSync, realpathSync, rmdirSync } from "node:fs";
 import { isAbsolute, resolve, sep } from "node:path";
 import { StateError, ensurePrivateDirectory } from "./fs-safety.ts";
-import { loadLedger, saveLedger, type Ledger } from "./ledger.ts";
+import { loadLedger, updateLedger, type Ledger } from "./ledger.ts";
 
 function nested(parent: string, child: string): boolean {
   const root = parent.endsWith(sep) ? parent : parent + sep;
@@ -83,29 +83,31 @@ export function prepareWorkspace(stateDir: string, workspace: string, pidAlive: 
     throw new StateError("A writer already holds this workspace.");
   }
   const path = separateDirectory(stateDir, workspace);
-  ledger.workspace = { path, writerPid: null, qualified: false };
-  saveLedger(stateDir, ledger, []);
+  updateLedger(stateDir, [], (current) => {
+    if (!current.install || (current.workspace?.writerPid !== null && current.workspace?.writerPid !== undefined && pidAlive(current.workspace.writerPid))) throw new StateError("A writer already holds this workspace.");
+    current.workspace = { path, writerPid: null, qualified: false };
+  });
   return ["Workspace prepared. It is unqualified."];
 }
 
 export function claimWorkspace(stateDir: string, pid: number, pidAlive: (pid: number) => boolean): string[] {
   if (!Number.isInteger(pid) || pid <= 0) throw new StateError("The writer id is not usable.");
-  const ledger = requireInstalled(stateDir);
-  const workspace = ledger.workspace;
-  if (!workspace) throw new StateError("No workspace is prepared.");
-  assertCurrentWorkspace(stateDir, workspace.path);
-  if (workspace.writerPid !== null && workspace.writerPid !== pid && pidAlive(workspace.writerPid)) {
-    throw new StateError("A writer already holds this workspace.");
-  }
-  ledger.workspace = { path: workspace.path, writerPid: pid, qualified: false };
-  saveLedger(stateDir, ledger, []);
+  updateLedger(stateDir, [], (ledger) => {
+    if (!ledger.install) throw new StateError("Tickets to Main is not installed. Run tickets-to-main install.");
+    const workspace = ledger.workspace;
+    if (!workspace) throw new StateError("No workspace is prepared.");
+    assertCurrentWorkspace(stateDir, workspace.path);
+    if (workspace.writerPid !== null && workspace.writerPid !== pid && pidAlive(workspace.writerPid)) throw new StateError("A writer already holds this workspace.");
+    ledger.workspace = { path: workspace.path, writerPid: pid, qualified: false };
+  });
   return ["Writer recorded. The workspace is unqualified."];
 }
 
 export function releaseWorkspace(stateDir: string): string[] {
-  const ledger = requireInstalled(stateDir);
-  if (!ledger.workspace) throw new StateError("No workspace is prepared.");
-  ledger.workspace = { path: ledger.workspace.path, writerPid: null, qualified: false };
-  saveLedger(stateDir, ledger, []);
+  updateLedger(stateDir, [], (ledger) => {
+    if (!ledger.install) throw new StateError("Tickets to Main is not installed. Run tickets-to-main install.");
+    if (!ledger.workspace) throw new StateError("No workspace is prepared.");
+    ledger.workspace = { path: ledger.workspace.path, writerPid: null, qualified: false };
+  });
   return ["Writer released."];
 }
