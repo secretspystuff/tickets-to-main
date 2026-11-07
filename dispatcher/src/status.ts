@@ -27,6 +27,7 @@ function keychainLine(kind: string, signedIn: boolean, approved: boolean): strin
   if (approved && !signedIn) return "Keychain: secret missing";
   if (kind === "test-double") return "Keychain: test double, unqualified";
   if (kind === "secret-tool") return "Keychain: secret-tool, unqualified";
+  if (kind === "windows-credential-manager") return "Keychain: Windows Credential Manager, unqualified";
   return "Keychain: unavailable";
 }
 
