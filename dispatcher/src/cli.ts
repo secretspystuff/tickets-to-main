@@ -79,7 +79,7 @@ function stateDir(io: Io, argv: string[]): string {
 
 function custodyFor(io: Io): Custody {
   if (io.custody) return io.custody;
-  return openCustody(io.env, io.secretTool, processSecretTool());
+  return openCustody(io.env, io.secretTool, processSecretTool(), io.platform);
 }
 
 function computer(io: Io, argv: string[]): string {
@@ -256,6 +256,6 @@ export function defaultIo(): Io {
     hostname: hostname(),
     now: () => Date.now(),
     runner: processRunner(),
-    secretTool: secretToolPresent(),
+    secretTool: process.platform === "linux" && secretToolPresent(),
   };
 }
