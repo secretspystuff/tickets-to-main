@@ -1,0 +1,55 @@
+{
+  "name": "connection-status",
+  "fabricated": true,
+  "shows": "Installed, signed in, compatible and ready for an assignment are separate facts.",
+  "wire": [
+    {
+      "role": "request",
+      "document": {
+        "protocol": "tickets-to-main.coordination",
+        "version": 1,
+        "command": "connection.status",
+        "id": "fab00000000000000000000000000003",
+        "idempotency_key": null,
+        "body": {}
+      }
+    },
+    {
+      "role": "response",
+      "document": {
+        "protocol": "tickets-to-main.coordination",
+        "version": 1,
+        "command": "connection.status",
+        "id": "fab00000000000000000000000000003",
+        "idempotency_key": null,
+        "body": {
+          "connection_id": "fab00000000000000000000000000004",
+          "board_id": "fabricated-board",
+          "tool": "cursor",
+          "computer": "Fabricated computer",
+          "person_label": "Fabricated person",
+          "installed": true,
+          "signed_in": false,
+          "compatible": false,
+          "ready_for_assignment": false
+        }
+      }
+    }
+  ],
+  "cases": [
+    {
+      "rule": "serveConnectionSettings",
+      "input": {
+        "command": "connection.status"
+      },
+      "expect": {
+        "ok": false,
+        "code": "not_served",
+        "field": null,
+        "error": "This coordination command is not served yet.",
+        "fix": "Use the contract. The server does not answer this command yet.",
+        "then": "stop"
+      }
+    }
+  ]
+}

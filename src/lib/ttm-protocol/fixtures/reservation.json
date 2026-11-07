@@ -1,0 +1,224 @@
+{
+  "name": "reservation",
+  "fabricated": true,
+  "shows": "Pause keeps the lane. Park and idle release it only after the writer is stopped or isolated. Acquire can hold a lane with no writing area. A lease expiry does not count as stopped.",
+  "wire": [
+    {
+      "role": "request",
+      "document": {
+        "protocol": "tickets-to-main.coordination",
+        "version": 1,
+        "command": "reservation.decide",
+        "id": "fab0000000000000000000000000001e",
+        "idempotency_key": "fab-reserve-acquire",
+        "body": {
+          "job_id": "fab00000000000000000000000000018",
+          "intent": "acquire",
+          "writers": "running",
+          "expected_revision": 1,
+          "lane_id": null,
+          "area_id": null
+        }
+      }
+    },
+    {
+      "role": "response",
+      "document": {
+        "protocol": "tickets-to-main.coordination",
+        "version": 1,
+        "command": "reservation.decide",
+        "id": "fab0000000000000000000000000001e",
+        "idempotency_key": "fab-reserve-acquire",
+        "body": {
+          "job_id": "fab00000000000000000000000000018",
+          "intent": "acquire",
+          "writers": "running",
+          "released": false,
+          "lane_id": "fab00000000000000000000000000010",
+          "area_id": null,
+          "revision": 2
+        }
+      }
+    },
+    {
+      "role": "response",
+      "document": {
+        "protocol": "tickets-to-main.coordination",
+        "version": 1,
+        "command": "reservation.decide",
+        "id": "fab0000000000000000000000000001f",
+        "idempotency_key": "fab-reserve-pause",
+        "body": {
+          "job_id": "fab00000000000000000000000000018",
+          "intent": "pause",
+          "writers": "stopped",
+          "released": false,
+          "lane_id": "fab00000000000000000000000000010",
+          "area_id": "fab00000000000000000000000000011",
+          "revision": 3
+        }
+      }
+    },
+    {
+      "role": "response",
+      "document": {
+        "protocol": "tickets-to-main.coordination",
+        "version": 1,
+        "command": "reservation.decide",
+        "id": "fab00000000000000000000000000020",
+        "idempotency_key": "fab-reserve-park",
+        "body": {
+          "job_id": "fab00000000000000000000000000018",
+          "intent": "park",
+          "writers": "isolated",
+          "released": true,
+          "lane_id": null,
+          "area_id": null,
+          "revision": 4
+        }
+      }
+    },
+    {
+      "role": "refusal",
+      "document": {
+        "protocol": "tickets-to-main.coordination",
+        "version": 1,
+        "command": "reservation.decide",
+        "id": "fab00000000000000000000000000021",
+        "idempotency_key": "fab-reserve-busy",
+        "error": "The writer is not stopped or isolated.",
+        "code": "not_stopped",
+        "field": "writers",
+        "fix": "Stop the writer or isolate it before releasing the lane. A lease expiry does not count.",
+        "then": "stop"
+      }
+    },
+    {
+      "role": "refusal",
+      "document": {
+        "protocol": "tickets-to-main.coordination",
+        "version": 1,
+        "command": "reservation.decide",
+        "id": "fab00000000000000000000000000022",
+        "idempotency_key": "fab-reserve-full",
+        "error": "Every lane for this repo is in use.",
+        "code": "lane_full",
+        "field": "lane_id",
+        "fix": "Wait for a lane. Admission stays queued and takes no lane.",
+        "then": "stop"
+      }
+    }
+  ],
+  "cases": [
+    {
+      "rule": "reservationDecision",
+      "input": {
+        "intent": "pause",
+        "writers": "stopped"
+      },
+      "expect": {
+        "release": false
+      }
+    },
+    {
+      "rule": "reservationDecision",
+      "input": {
+        "intent": "pause_all",
+        "writers": "running"
+      },
+      "expect": {
+        "release": false
+      }
+    },
+    {
+      "rule": "reservationDecision",
+      "input": {
+        "intent": "acquire",
+        "writers": "unknown"
+      },
+      "expect": {
+        "release": false
+      }
+    },
+    {
+      "rule": "reservationDecision",
+      "input": {
+        "intent": "park",
+        "writers": "unknown"
+      },
+      "expect": {
+        "ok": false,
+        "code": "not_stopped",
+        "field": "writers",
+        "error": "The writer is not stopped or isolated.",
+        "fix": "Stop the writer or isolate it before releasing the lane. A lease expiry does not count.",
+        "then": "stop"
+      }
+    },
+    {
+      "rule": "reservationDecision",
+      "input": {
+        "intent": "park",
+        "writers": "running"
+      },
+      "expect": {
+        "ok": false,
+        "code": "not_stopped",
+        "field": "writers",
+        "error": "The writer is not stopped or isolated.",
+        "fix": "Stop the writer or isolate it before releasing the lane. A lease expiry does not count.",
+        "then": "stop"
+      }
+    },
+    {
+      "rule": "reservationDecision",
+      "input": {
+        "intent": "park",
+        "writers": "isolated"
+      },
+      "expect": {
+        "release": true
+      }
+    },
+    {
+      "rule": "reservationDecision",
+      "input": {
+        "intent": "idle",
+        "writers": "stopped"
+      },
+      "expect": {
+        "release": true
+      }
+    },
+    {
+      "rule": "writerStoppedByLeaseExpiry",
+      "input": {},
+      "expect": false
+    },
+    {
+      "rule": "expectRevision",
+      "input": {
+        "expected": 4,
+        "current": 4
+      },
+      "expect": {
+        "ok": true
+      }
+    },
+    {
+      "rule": "expectRevision",
+      "input": {
+        "expected": 3,
+        "current": 4
+      },
+      "expect": {
+        "ok": false,
+        "code": "changed_since",
+        "field": "expected_revision",
+        "error": "That changed after you read it. Nothing was saved.",
+        "fix": "Read it again and send the version you read.",
+        "then": "retry"
+      }
+    }
+  ]
+}

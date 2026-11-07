@@ -1,0 +1,18 @@
+{
+  "name": "tickets-to-main",
+  "version": "0.1.0",
+  "private": false,
+  "license": "Apache-2.0",
+  "description": "Public Dispatcher surface: install, connect, status, and the native adapter harness.",
+  "type": "module",
+  "bin": {
+    "tickets-to-main": "./bin/tickets-to-main.mjs"
+  },
+  "scripts": {
+    "test": "node --test --experimental-strip-types test/",
+    "typecheck": "tsc --noEmit -p ."
+  },
+  "engines": {
+    "node": ">=22"
+  }
+}

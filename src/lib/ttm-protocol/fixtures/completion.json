@@ -1,0 +1,135 @@
+{
+  "name": "completion",
+  "fabricated": true,
+  "shows": "On main and closed are separate. Pending or failed completion evidence cannot close the ticket.",
+  "wire": [
+    {
+      "role": "request",
+      "document": {
+        "protocol": "tickets-to-main.coordination",
+        "version": 1,
+        "command": "completion.record",
+        "id": "fab00000000000000000000000000046",
+        "idempotency_key": "fab-complete-1",
+        "body": {
+          "job_id": "fab00000000000000000000000000018",
+          "on_main": true,
+          "closed": false,
+          "completion_evidence": "pending",
+          "expected_revision": 6
+        }
+      }
+    },
+    {
+      "role": "response",
+      "document": {
+        "protocol": "tickets-to-main.coordination",
+        "version": 1,
+        "command": "completion.record",
+        "id": "fab00000000000000000000000000046",
+        "idempotency_key": "fab-complete-1",
+        "body": {
+          "job_id": "fab00000000000000000000000000018",
+          "on_main": true,
+          "closed": false,
+          "completion_evidence": "pending",
+          "revision": 7
+        }
+      }
+    },
+    {
+      "role": "response",
+      "document": {
+        "protocol": "tickets-to-main.coordination",
+        "version": 1,
+        "command": "completion.record",
+        "id": "fab00000000000000000000000000047",
+        "idempotency_key": "fab-complete-2",
+        "body": {
+          "job_id": "fab00000000000000000000000000018",
+          "on_main": false,
+          "closed": true,
+          "completion_evidence": "satisfied",
+          "revision": 8
+        }
+      }
+    },
+    {
+      "role": "refusal",
+      "document": {
+        "protocol": "tickets-to-main.coordination",
+        "version": 1,
+        "command": "completion.record",
+        "id": "fab00000000000000000000000000048",
+        "idempotency_key": "fab-complete-3",
+        "error": "The ticket cannot close before its completion evidence is satisfied.",
+        "code": "completion_open",
+        "field": "closed",
+        "fix": "Record the integration without closing the ticket, and wait for the configured completion evidence.",
+        "then": "stop"
+      }
+    }
+  ],
+  "cases": [
+    {
+      "rule": "completionRecord",
+      "input": {
+        "on_main": true,
+        "closed": false,
+        "completion_evidence": "pending"
+      },
+      "expect": {
+        "ok": true,
+        "on_main": true,
+        "closed": false,
+        "completion_evidence": "pending"
+      }
+    },
+    {
+      "rule": "completionRecord",
+      "input": {
+        "on_main": false,
+        "closed": true,
+        "completion_evidence": "satisfied"
+      },
+      "expect": {
+        "ok": true,
+        "on_main": false,
+        "closed": true,
+        "completion_evidence": "satisfied"
+      }
+    },
+    {
+      "rule": "completionRecord",
+      "input": {
+        "on_main": true,
+        "closed": true,
+        "completion_evidence": "pending"
+      },
+      "expect": {
+        "ok": false,
+        "code": "completion_open",
+        "field": "closed",
+        "error": "The ticket cannot close before its completion evidence is satisfied.",
+        "fix": "Record the integration without closing the ticket, and wait for the configured completion evidence.",
+        "then": "stop"
+      }
+    },
+    {
+      "rule": "completionRecord",
+      "input": {
+        "on_main": true,
+        "closed": true,
+        "completion_evidence": "failed"
+      },
+      "expect": {
+        "ok": false,
+        "code": "completion_open",
+        "field": "closed",
+        "error": "The ticket cannot close before its completion evidence is satisfied.",
+        "fix": "Record the integration without closing the ticket, and wait for the configured completion evidence.",
+        "then": "stop"
+      }
+    }
+  ]
+}

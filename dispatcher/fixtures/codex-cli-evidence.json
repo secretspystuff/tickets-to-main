@@ -1,0 +1,5 @@
+{
+  "vendor": "codex",
+  "interfaceId": "cli",
+  "note": "Scripted harness evidence for Codex cli. This is not runtime qualification and does not cover app-server."
+}

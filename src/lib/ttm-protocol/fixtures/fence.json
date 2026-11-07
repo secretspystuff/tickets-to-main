@@ -1,0 +1,85 @@
+{
+  "name": "fence",
+  "fabricated": true,
+  "shows": "A coordinator fence and an executor fence are checked separately. Coordinator failover does not by itself reject a current executor.",
+  "wire": [
+    {
+      "role": "refusal",
+      "document": {
+        "protocol": "tickets-to-main.coordination",
+        "version": 1,
+        "command": "reservation.decide",
+        "id": "fab00000000000000000000000000028",
+        "idempotency_key": "fab-fence-old",
+        "error": "A newer fence owns that work.",
+        "code": "stale_writer",
+        "field": "executor",
+        "fix": "Read the current fence. A new writer waits until the old one has stopped or is isolated.",
+        "then": "reconcile"
+      }
+    }
+  ],
+  "cases": [
+    {
+      "rule": "fenceAllows",
+      "input": {
+        "role": "executor",
+        "expected": {
+          "coordinator": "fab00000000000000000000000000012",
+          "executor": "fab00000000000000000000000000014"
+        },
+        "current": {
+          "coordinator": "fab00000000000000000000000000013",
+          "executor": "fab00000000000000000000000000014"
+        }
+      },
+      "expect": {
+        "ok": true
+      }
+    },
+    {
+      "rule": "fenceAllows",
+      "input": {
+        "role": "executor",
+        "expected": {
+          "coordinator": "fab00000000000000000000000000013",
+          "executor": "fab00000000000000000000000000015"
+        },
+        "current": {
+          "coordinator": "fab00000000000000000000000000013",
+          "executor": "fab00000000000000000000000000014"
+        }
+      },
+      "expect": {
+        "ok": false,
+        "code": "stale_writer",
+        "field": "executor",
+        "error": "A newer fence owns that work.",
+        "fix": "Read the current fence. A new writer waits until the old one has stopped or is isolated.",
+        "then": "reconcile"
+      }
+    },
+    {
+      "rule": "fenceAllows",
+      "input": {
+        "role": "coordinator",
+        "expected": {
+          "coordinator": "fab00000000000000000000000000012",
+          "executor": "fab00000000000000000000000000014"
+        },
+        "current": {
+          "coordinator": "fab00000000000000000000000000013",
+          "executor": "fab00000000000000000000000000014"
+        }
+      },
+      "expect": {
+        "ok": false,
+        "code": "stale_writer",
+        "field": "coordinator",
+        "error": "A newer fence owns that work.",
+        "fix": "Read the current fence. A new writer waits until the old one has stopped or is isolated.",
+        "then": "reconcile"
+      }
+    }
+  ]
+}

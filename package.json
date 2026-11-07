@@ -1,0 +1,34 @@
+{
+  "name": "tickets-to-main",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "license": "Apache-2.0",
+  "description": "Pre-release Dispatcher source and public coordination protocol.",
+  "engines": {
+    "node": "24.18.0"
+  },
+  "scripts": {
+    "build": "tsc --noEmit -p dispatcher",
+    "typecheck": "tsc --noEmit -p dispatcher",
+    "test": "node --test --test-concurrency=1 --experimental-strip-types dispatcher/test/*.test.ts",
+    "check": "npm run build && npm test",
+    "start": "node dispatcher/bin/tickets-to-main.mjs"
+  },
+  "devDependencies": {
+    "typescript": "5.9.3",
+    "@types/node": "22.20.2"
+  },
+  "bin": {
+    "tickets-to-main": "dispatcher/bin/tickets-to-main.mjs"
+  },
+  "files": [
+    "dispatcher/bin/",
+    "dispatcher/src/",
+    "dispatcher/fixtures/",
+    "dispatcher/LICENSE",
+    "src/lib/ttm-protocol.ts",
+    "src/lib/ttm-protocol/manifest.json",
+    "src/lib/ttm-protocol/fixtures/"
+  ]
+}

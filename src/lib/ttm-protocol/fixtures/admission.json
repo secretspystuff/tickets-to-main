@@ -1,0 +1,193 @@
+{
+  "name": "admission",
+  "fabricated": true,
+  "shows": "One batch is one queued job and takes no lane. The same key and body replay that job. The same key with a different body does not create a second job.",
+  "wire": [
+    {
+      "role": "request",
+      "document": {
+        "protocol": "tickets-to-main.coordination",
+        "version": 1,
+        "command": "job.admit",
+        "id": "fab00000000000000000000000000009",
+        "idempotency_key": "fab-admit-1",
+        "body": {
+          "repo": {
+            "host": "example.com",
+            "owner": "fabricated-owner",
+            "name": "fabricated-repo",
+            "board_repo_id": "fabricated-board-repo"
+          },
+          "members": [
+            "fab00000000000000000000000000016",
+            "fab00000000000000000000000000017"
+          ],
+          "expected_revision": null
+        }
+      }
+    },
+    {
+      "role": "response",
+      "document": {
+        "protocol": "tickets-to-main.coordination",
+        "version": 1,
+        "command": "job.admit",
+        "id": "fab00000000000000000000000000009",
+        "idempotency_key": "fab-admit-1",
+        "body": {
+          "job_id": "fab00000000000000000000000000018",
+          "state": "queued",
+          "lane_id": null,
+          "revision": 1,
+          "members": [
+            "fab00000000000000000000000000016",
+            "fab00000000000000000000000000017"
+          ]
+        }
+      }
+    },
+    {
+      "role": "refusal",
+      "document": {
+        "protocol": "tickets-to-main.coordination",
+        "version": 1,
+        "command": "job.admit",
+        "id": "fab0000000000000000000000000000a",
+        "idempotency_key": "fab-admit-2",
+        "error": "That Idempotency-Key was already used for a different action.",
+        "code": "idempotency_conflict",
+        "field": "idempotency_key",
+        "fix": "Repeat the original action, or use a new key for a new one.",
+        "then": "stop"
+      }
+    }
+  ],
+  "cases": [
+    {
+      "rule": "replayAdmission",
+      "input": {
+        "stored": null,
+        "next": {
+          "idempotency_key": "fab-admit-1",
+          "body": {
+            "repo": {
+              "host": "example.com",
+              "owner": "fabricated-owner",
+              "name": "fabricated-repo",
+              "board_repo_id": "fabricated-board-repo"
+            },
+            "members": [
+              "fab00000000000000000000000000016",
+              "fab00000000000000000000000000017"
+            ],
+            "expected_revision": null
+          }
+        }
+      },
+      "expect": {
+        "kind": "create"
+      }
+    },
+    {
+      "rule": "replayAdmission",
+      "input": {
+        "stored": {
+          "idempotency_key": "fab-admit-1",
+          "body": {
+            "members": [
+              "fab00000000000000000000000000016",
+              "fab00000000000000000000000000017"
+            ],
+            "expected_revision": null,
+            "repo": {
+              "host": "example.com",
+              "owner": "fabricated-owner",
+              "name": "fabricated-repo",
+              "board_repo_id": "fabricated-board-repo"
+            }
+          },
+          "job_id": "fab00000000000000000000000000018"
+        },
+        "next": {
+          "idempotency_key": "fab-admit-1",
+          "body": {
+            "repo": {
+              "host": "example.com",
+              "owner": "fabricated-owner",
+              "name": "fabricated-repo",
+              "board_repo_id": "fabricated-board-repo"
+            },
+            "members": [
+              "fab00000000000000000000000000016",
+              "fab00000000000000000000000000017"
+            ],
+            "expected_revision": null
+          }
+        }
+      },
+      "expect": {
+        "kind": "replay",
+        "job_id": "fab00000000000000000000000000018"
+      }
+    },
+    {
+      "rule": "replayAdmission",
+      "input": {
+        "stored": {
+          "idempotency_key": "fab-admit-1",
+          "body": {
+            "repo": {
+              "host": "example.com",
+              "owner": "fabricated-owner",
+              "name": "fabricated-repo",
+              "board_repo_id": "fabricated-board-repo"
+            },
+            "members": [
+              "fab00000000000000000000000000016",
+              "fab00000000000000000000000000017"
+            ],
+            "expected_revision": null
+          },
+          "job_id": "fab00000000000000000000000000018"
+        },
+        "next": {
+          "idempotency_key": "fab-admit-1",
+          "body": {
+            "repo": {
+              "host": "example.com",
+              "owner": "fabricated-owner",
+              "name": "fabricated-repo",
+              "board_repo_id": "fabricated-board-repo"
+            },
+            "members": [
+              "fab00000000000000000000000000016"
+            ],
+            "expected_revision": null
+          }
+        }
+      },
+      "expect": {
+        "ok": false,
+        "code": "idempotency_conflict",
+        "field": "idempotency_key",
+        "error": "That Idempotency-Key was already used for a different action.",
+        "fix": "Repeat the original action, or use a new key for a new one.",
+        "then": "stop"
+      }
+    },
+    {
+      "rule": "serveAdmissionReservations",
+      "input": {
+        "command": "job.admit"
+      },
+      "expect": {
+        "ok": false,
+        "code": "not_served",
+        "field": null,
+        "error": "This coordination command is not served yet.",
+        "fix": "Use the contract. The server does not answer this command yet.",
+        "then": "stop"
+      }
+    }
+  ]
+}

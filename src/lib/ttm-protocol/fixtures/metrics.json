@@ -1,0 +1,378 @@
+{
+  "name": "metrics",
+  "fabricated": true,
+  "shows": "Anonymous totals have no person, board or ticket. Unknown usage stays null. A known zero stays zero. One attempt is counted once across a retry and a replay.",
+  "wire": [
+    {
+      "role": "request",
+      "document": {
+        "protocol": "tickets-to-main.coordination",
+        "version": 1,
+        "command": "metrics.aggregate",
+        "id": "fab0000000000000000000000000005a",
+        "idempotency_key": "fab-metrics-1",
+        "body": {
+          "period": "day",
+          "totals": [
+            {
+              "metric": "ttm.runs",
+              "label": "build",
+              "amount": 1,
+              "observations": 1
+            },
+            {
+              "metric": "ttm.results",
+              "label": "failed",
+              "amount": 1,
+              "observations": 1
+            },
+            {
+              "metric": "ttm.tokens",
+              "label": "known",
+              "amount": 0,
+              "observations": 1
+            },
+            {
+              "metric": "ttm.tokens",
+              "label": "unknown",
+              "amount": null,
+              "observations": 2
+            },
+            {
+              "metric": "ttm.cost",
+              "label": "unknown",
+              "amount": null,
+              "observations": 1
+            },
+            {
+              "metric": "ttm.fallbacks",
+              "label": "used",
+              "amount": 1,
+              "observations": 1
+            }
+          ]
+        }
+      }
+    },
+    {
+      "role": "response",
+      "document": {
+        "protocol": "tickets-to-main.coordination",
+        "version": 1,
+        "command": "metrics.aggregate",
+        "id": "fab0000000000000000000000000005a",
+        "idempotency_key": "fab-metrics-1",
+        "body": {
+          "accepted": true,
+          "period": "day",
+          "totals": [
+            {
+              "metric": "ttm.runs",
+              "label": "build",
+              "amount": 1,
+              "observations": 1
+            },
+            {
+              "metric": "ttm.results",
+              "label": "failed",
+              "amount": 1,
+              "observations": 1
+            },
+            {
+              "metric": "ttm.tokens",
+              "label": "known",
+              "amount": 0,
+              "observations": 1
+            },
+            {
+              "metric": "ttm.tokens",
+              "label": "unknown",
+              "amount": null,
+              "observations": 2
+            },
+            {
+              "metric": "ttm.cost",
+              "label": "unknown",
+              "amount": null,
+              "observations": 1
+            },
+            {
+              "metric": "ttm.fallbacks",
+              "label": "used",
+              "amount": 1,
+              "observations": 1
+            }
+          ]
+        }
+      }
+    },
+    {
+      "role": "request",
+      "accept": false,
+      "code": "forbidden_identifier",
+      "document": {
+        "protocol": "tickets-to-main.coordination",
+        "version": 1,
+        "command": "metrics.aggregate",
+        "id": "fab0000000000000000000000000005b",
+        "idempotency_key": "fab-metrics-2",
+        "body": {
+          "period": "day",
+          "totals": [
+            {
+              "metric": "ttm.runs",
+              "label": "build",
+              "amount": 1,
+              "observations": 1,
+              "board_id": "fabricated-board"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "role": "request",
+      "accept": false,
+      "code": "unknown_amount",
+      "document": {
+        "protocol": "tickets-to-main.coordination",
+        "version": 1,
+        "command": "metrics.aggregate",
+        "id": "fab0000000000000000000000000005c",
+        "idempotency_key": "fab-metrics-3",
+        "body": {
+          "period": "day",
+          "totals": [
+            {
+              "metric": "ttm.tokens",
+              "label": "unknown",
+              "amount": 0,
+              "observations": 1
+            }
+          ]
+        }
+      }
+    }
+  ],
+  "cases": [
+    {
+      "rule": "foldMetricEvents",
+      "input": {
+        "events": [
+          {
+            "metric": "ttm.runs",
+            "label": "build",
+            "amount": 1,
+            "attempt": "fab00000000000000000000000000029",
+            "known": true
+          },
+          {
+            "metric": "ttm.runs",
+            "label": "build",
+            "amount": 1,
+            "attempt": "fab00000000000000000000000000029",
+            "known": true
+          },
+          {
+            "metric": "ttm.runs",
+            "label": "build",
+            "amount": 1,
+            "attempt": "fab00000000000000000000000000029",
+            "known": true
+          }
+        ]
+      },
+      "expect": {
+        "ok": true,
+        "totals": [
+          {
+            "metric": "ttm.runs",
+            "label": "build",
+            "amount": 1,
+            "observations": 1
+          }
+        ]
+      }
+    },
+    {
+      "rule": "foldMetricEvents",
+      "input": {
+        "events": [
+          {
+            "metric": "ttm.tokens",
+            "label": "unknown",
+            "amount": null,
+            "attempt": "fab00000000000000000000000000029",
+            "known": false
+          },
+          {
+            "metric": "ttm.tokens",
+            "label": "unknown",
+            "amount": null,
+            "attempt": "fab0000000000000000000000000002a",
+            "known": false
+          },
+          {
+            "metric": "ttm.tokens",
+            "label": "known",
+            "amount": 0,
+            "attempt": "fab0000000000000000000000000002b",
+            "known": true
+          }
+        ]
+      },
+      "expect": {
+        "ok": true,
+        "totals": [
+          {
+            "metric": "ttm.tokens",
+            "label": "known",
+            "amount": 0,
+            "observations": 1
+          },
+          {
+            "metric": "ttm.tokens",
+            "label": "unknown",
+            "amount": null,
+            "observations": 2
+          }
+        ]
+      }
+    },
+    {
+      "rule": "foldMetricEvents",
+      "input": {
+        "events": [
+          {
+            "metric": "ttm.tokens",
+            "label": "known",
+            "amount": 5,
+            "attempt": "fab00000000000000000000000000029",
+            "known": true
+          },
+          {
+            "metric": "ttm.tokens",
+            "label": "known",
+            "amount": 7,
+            "attempt": "fab0000000000000000000000000002a",
+            "known": true
+          }
+        ]
+      },
+      "expect": {
+        "ok": true,
+        "totals": [
+          {
+            "metric": "ttm.tokens",
+            "label": "known",
+            "amount": 12,
+            "observations": 2
+          }
+        ]
+      }
+    },
+    {
+      "rule": "foldMetricEvents",
+      "input": {
+        "events": [
+          {
+            "metric": "ttm.tokens",
+            "label": "known",
+            "amount": 10,
+            "attempt": "fab00000000000000000000000000029",
+            "known": true
+          },
+          {
+            "metric": "ttm.tokens",
+            "label": "known",
+            "amount": 12,
+            "attempt": "fab00000000000000000000000000029",
+            "known": true
+          }
+        ]
+      },
+      "expect": {
+        "ok": false,
+        "code": "metric_conflict",
+        "field": "amount",
+        "error": "That usage was already counted.",
+        "fix": "Repeat the same amount under the same label, or leave unknown usage unknown. Do not add it twice.",
+        "then": "stop"
+      }
+    },
+    {
+      "rule": "foldMetricEvents",
+      "input": {
+        "events": [
+          {
+            "metric": "ttm.tokens",
+            "label": "unknown",
+            "amount": null,
+            "attempt": "fab00000000000000000000000000029",
+            "known": false
+          },
+          {
+            "metric": "ttm.tokens",
+            "label": "known",
+            "amount": 0,
+            "attempt": "fab00000000000000000000000000029",
+            "known": true
+          }
+        ]
+      },
+      "expect": {
+        "ok": false,
+        "code": "metric_conflict",
+        "field": "attempt",
+        "error": "That usage was already counted.",
+        "fix": "Repeat the same amount under the same label, or leave unknown usage unknown. Do not add it twice.",
+        "then": "stop"
+      }
+    },
+    {
+      "rule": "foldMetricEvents",
+      "input": {
+        "events": [
+          {
+            "metric": "ttm.tokens",
+            "label": "unknown",
+            "amount": 0,
+            "attempt": "fab00000000000000000000000000029",
+            "known": false
+          }
+        ]
+      },
+      "expect": {
+        "ok": false,
+        "code": "unknown_amount",
+        "field": "amount",
+        "error": "Unknown usage has to stay unknown.",
+        "fix": "Send a null amount for unknown usage. Do not send zero in its place.",
+        "then": "stop"
+      }
+    },
+    {
+      "rule": "foldMetricEvents",
+      "input": {
+        "events": [
+          {
+            "metric": "ttm.runs",
+            "label": "build",
+            "amount": 1,
+            "attempt": "fab00000000000000000000000000029",
+            "known": true,
+            "board_id": "fabricated-board"
+          }
+        ]
+      },
+      "expect": {
+        "ok": false,
+        "code": "forbidden_identifier",
+        "field": "board_id",
+        "error": "That total includes a private identifier.",
+        "fix": "Send only the anonymous total, with no person, board, ticket or address.",
+        "then": "stop"
+      }
+    }
+  ]
+}

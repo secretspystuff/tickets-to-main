@@ -1,0 +1,222 @@
+{
+  "name": "evidence",
+  "fabricated": true,
+  "shows": "Not required is stored as Not required, never as passed. Evidence for one candidate does not cover another.",
+  "wire": [
+    {
+      "role": "request",
+      "document": {
+        "protocol": "tickets-to-main.coordination",
+        "version": 1,
+        "command": "evidence.record",
+        "id": "fab00000000000000000000000000032",
+        "idempotency_key": "fab-evidence-1",
+        "body": {
+          "job_id": "fab00000000000000000000000000018",
+          "candidate_id": "fab0000000000000000000000000000b",
+          "requirements_id": "fab0000000000000000000000000000d",
+          "base_id": "fab0000000000000000000000000000c",
+          "policy_id": "fab0000000000000000000000000000e",
+          "attempt_id": "fab00000000000000000000000000012",
+          "result": "not_required",
+          "expected_revision": 4
+        }
+      }
+    },
+    {
+      "role": "response",
+      "document": {
+        "protocol": "tickets-to-main.coordination",
+        "version": 1,
+        "command": "evidence.record",
+        "id": "fab00000000000000000000000000032",
+        "idempotency_key": "fab-evidence-1",
+        "body": {
+          "job_id": "fab00000000000000000000000000018",
+          "candidate_id": "fab0000000000000000000000000000b",
+          "requirements_id": "fab0000000000000000000000000000d",
+          "base_id": "fab0000000000000000000000000000c",
+          "policy_id": "fab0000000000000000000000000000e",
+          "attempt_id": "fab00000000000000000000000000012",
+          "result": "not_required",
+          "recorded": true,
+          "revision": 5
+        }
+      }
+    },
+    {
+      "role": "response",
+      "document": {
+        "protocol": "tickets-to-main.coordination",
+        "version": 1,
+        "command": "evidence.record",
+        "id": "fab00000000000000000000000000033",
+        "idempotency_key": "fab-evidence-2",
+        "body": {
+          "job_id": "fab00000000000000000000000000018",
+          "candidate_id": "fab0000000000000000000000000000b",
+          "requirements_id": "fab0000000000000000000000000000d",
+          "base_id": "fab0000000000000000000000000000c",
+          "policy_id": "fab0000000000000000000000000000e",
+          "attempt_id": "fab00000000000000000000000000012",
+          "result": "failed",
+          "recorded": true,
+          "revision": 6
+        }
+      }
+    },
+    {
+      "role": "refusal",
+      "document": {
+        "protocol": "tickets-to-main.coordination",
+        "version": 1,
+        "command": "evidence.record",
+        "id": "fab00000000000000000000000000034",
+        "idempotency_key": "fab-evidence-3",
+        "error": "That evidence is for a different candidate, base, requirements or policy.",
+        "code": "stale_candidate",
+        "field": "candidate_id",
+        "fix": "Send evidence for the current candidate, base, requirements and policy.",
+        "then": "stop"
+      }
+    }
+  ],
+  "cases": [
+    {
+      "rule": "reportedPassed",
+      "input": {
+        "result": "passed"
+      },
+      "expect": true
+    },
+    {
+      "rule": "reportedPassed",
+      "input": {
+        "result": "not_required"
+      },
+      "expect": false
+    },
+    {
+      "rule": "reportedPassed",
+      "input": {
+        "result": "failed"
+      },
+      "expect": false
+    },
+    {
+      "rule": "selectedGateSatisfied",
+      "input": {
+        "result": "passed"
+      },
+      "expect": true
+    },
+    {
+      "rule": "selectedGateSatisfied",
+      "input": {
+        "result": "not_required"
+      },
+      "expect": true
+    },
+    {
+      "rule": "selectedGateSatisfied",
+      "input": {
+        "result": "failed"
+      },
+      "expect": false
+    },
+    {
+      "rule": "selectedGateSatisfied",
+      "input": {
+        "result": "running"
+      },
+      "expect": false
+    },
+    {
+      "rule": "selectedGateSatisfied",
+      "input": {
+        "result": "unavailable"
+      },
+      "expect": false
+    },
+    {
+      "rule": "testsImposeExtraApproval",
+      "input": {
+        "result": "not_required"
+      },
+      "expect": false
+    },
+    {
+      "rule": "testsImposeExtraApproval",
+      "input": {
+        "result": "passed"
+      },
+      "expect": false
+    },
+    {
+      "rule": "testsImposeExtraApproval",
+      "input": {
+        "result": "failed"
+      },
+      "expect": false
+    },
+    {
+      "rule": "evidenceBinds",
+      "input": {
+        "evidence": {
+          "candidate_id": "fab0000000000000000000000000000b",
+          "requirements_id": "fab0000000000000000000000000000d",
+          "base_id": "fab0000000000000000000000000000c",
+          "policy_id": "fab0000000000000000000000000000e"
+        },
+        "target": {
+          "candidate_id": "fab0000000000000000000000000000b",
+          "requirements_id": "fab0000000000000000000000000000d",
+          "base_id": "fab0000000000000000000000000000c",
+          "policy_id": "fab0000000000000000000000000000e"
+        }
+      },
+      "expect": {
+        "ok": true
+      }
+    },
+    {
+      "rule": "evidenceBinds",
+      "input": {
+        "evidence": {
+          "candidate_id": "fab0000000000000000000000000000b",
+          "requirements_id": "fab0000000000000000000000000000d",
+          "base_id": "fab0000000000000000000000000001d",
+          "policy_id": "fab0000000000000000000000000000e"
+        },
+        "target": {
+          "candidate_id": "fab0000000000000000000000000000b",
+          "requirements_id": "fab0000000000000000000000000000d",
+          "base_id": "fab0000000000000000000000000000c",
+          "policy_id": "fab0000000000000000000000000000e"
+        }
+      },
+      "expect": {
+        "ok": false,
+        "code": "stale_candidate",
+        "field": "base_id",
+        "error": "That evidence is for a different candidate, base, requirements or policy.",
+        "fix": "Send evidence for the current candidate, base, requirements and policy.",
+        "then": "stop"
+      }
+    },
+    {
+      "rule": "serveCandidateApproval",
+      "input": {
+        "command": "evidence.record"
+      },
+      "expect": {
+        "ok": false,
+        "code": "not_served",
+        "field": null,
+        "error": "This coordination command is not served yet.",
+        "fix": "Use the contract. The server does not answer this command yet.",
+        "then": "stop"
+      }
+    }
+  ]
+}

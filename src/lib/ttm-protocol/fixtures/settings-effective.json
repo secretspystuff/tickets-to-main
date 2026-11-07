@@ -1,0 +1,204 @@
+{
+  "name": "settings-effective",
+  "fabricated": true,
+  "shows": "Effective settings name board or repo provenance. Build with zero correction cycles still runs the initial review. Triage and Tests cannot enable an adversarial review. The delay default is 10 and 0 is immediate. There is no upper bound.",
+  "wire": [
+    {
+      "role": "request",
+      "document": {
+        "protocol": "tickets-to-main.coordination",
+        "version": 1,
+        "command": "settings.effective.read",
+        "id": "fab00000000000000000000000000008",
+        "idempotency_key": null,
+        "body": {
+          "repo": {
+            "host": "example.com",
+            "owner": "fabricated-owner",
+            "name": "fabricated-repo",
+            "board_repo_id": "fabricated-board-repo"
+          }
+        }
+      }
+    },
+    {
+      "role": "response",
+      "document": {
+        "protocol": "tickets-to-main.coordination",
+        "version": 1,
+        "command": "settings.effective.read",
+        "id": "fab00000000000000000000000000008",
+        "idempotency_key": null,
+        "body": {
+          "repo": {
+            "host": "example.com",
+            "owner": "fabricated-owner",
+            "name": "fabricated-repo",
+            "board_repo_id": "fabricated-board-repo"
+          },
+          "lanes": {
+            "value": 1,
+            "min": 1,
+            "max": 5
+          },
+          "steps": {
+            "triage": {
+              "source": "board",
+              "review": "not_required",
+              "delay_minutes": 10,
+              "fallback": {
+                "value": "wait",
+                "label": "Wait"
+              },
+              "guidance_version": "fab-guidance-1",
+              "model": {
+                "requested": "fabricated-model",
+                "observed": null
+              },
+              "initial_review": false
+            },
+            "plan": {
+              "source": "repo",
+              "review": "enabled",
+              "fallback": {
+                "value": "choose",
+                "label": "Choose a supported fallback"
+              },
+              "guidance_version": "fab-guidance-1",
+              "model": {
+                "requested": "fabricated-model",
+                "observed": null
+              },
+              "initial_review": true,
+              "correction_cycles": 2
+            },
+            "build": {
+              "source": "board",
+              "review": "enabled",
+              "fallback": {
+                "value": "wait",
+                "label": "Wait"
+              },
+              "guidance_version": "fab-guidance-1",
+              "model": {
+                "requested": "fabricated-model",
+                "observed": null
+              },
+              "initial_review": true,
+              "correction_cycles": 0
+            },
+            "tests": {
+              "source": "board",
+              "review": "not_required",
+              "selection": "not_required",
+              "initial_review": false
+            },
+            "main": {
+              "source": "board",
+              "merges": {
+                "value": "every",
+                "label": "Every merge"
+              },
+              "approvers": {
+                "value": "owner",
+                "label": "Owner only"
+              }
+            }
+          }
+        }
+      }
+    }
+  ],
+  "cases": [
+    {
+      "rule": "effectiveSettings",
+      "input": {
+        "id": "fab00000000000000000000000000008",
+        "caller": {
+          "connection_id": "fab00000000000000000000000000004",
+          "board_id": "fabricated-board",
+          "seat": "viewer"
+        },
+        "repo": {
+          "host": "example.com",
+          "owner": "fabricated-owner",
+          "name": "fabricated-repo",
+          "board_repo_id": "fabricated-board-repo"
+        },
+        "board": {},
+        "override": null
+      },
+      "expect": {
+        "ok": false,
+        "code": "invalid",
+        "field": "triage",
+        "error": "That coordination message is not valid.",
+        "fix": "Send the version 1 message for this command.",
+        "then": "stop"
+      }
+    },
+    {
+      "rule": "delayAllowed",
+      "input": {
+        "minutes": 0
+      },
+      "expect": true
+    },
+    {
+      "rule": "delayAllowed",
+      "input": {
+        "minutes": 10
+      },
+      "expect": true
+    },
+    {
+      "rule": "delayAllowed",
+      "input": {
+        "minutes": -1
+      },
+      "expect": false
+    },
+    {
+      "rule": "delayAllowed",
+      "input": {
+        "minutes": 43200
+      },
+      "expect": true
+    },
+    {
+      "rule": "areaRequired",
+      "input": {
+        "step": "triage"
+      },
+      "expect": false
+    },
+    {
+      "rule": "areaRequired",
+      "input": {
+        "step": "plan"
+      },
+      "expect": false
+    },
+    {
+      "rule": "areaRequired",
+      "input": {
+        "step": "build"
+      },
+      "expect": true
+    },
+    {
+      "rule": "areaRequired",
+      "input": {
+        "step": "tests"
+      },
+      "expect": true
+    },
+    {
+      "rule": "areaRequired",
+      "input": {
+        "step": "main"
+      },
+      "expect": true
+    }
+  ]
+}
