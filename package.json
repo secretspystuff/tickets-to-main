@@ -25,6 +25,7 @@
   "files": [
     "dispatcher/bin/",
     "dispatcher/src/",
+    "dispatcher/native/",
     "dispatcher/fixtures/",
     "dispatcher/LICENSE",
     "src/lib/ttm-protocol.ts",

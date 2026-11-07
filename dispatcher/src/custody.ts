@@ -1,16 +1,19 @@
 import { spawn, spawnSync } from "node:child_process";
-import { readFileSync } from "node:fs";
+import { createHash } from "node:crypto";
+import type { WindowsCredentialHost } from "./windows-custody.ts";
+import { lstatSync, readdirSync, readFileSync, realpathSync } from "node:fs";
+import { basename, dirname, resolve } from "node:path";
 import { StateError, writePrivateFile } from "./fs-safety.ts";
 
-export type CustodyKind = "test-double" | "secret-tool" | "unavailable";
+export type CustodyKind = "test-double" | "secret-tool" | "windows-credential-manager" | "unavailable";
 
 export type CustodyDescription = {
   kind: CustodyKind;
-  /** No keychain in this milestone is a qualified Windows or macOS release. */
   qualified: false;
 };
 
 export type Custody = {
+  readonly scopeId?: string;
   describe(): CustodyDescription;
   put(account: string, secret: string): Promise<void>;
   get(account: string): Promise<string | null>;
@@ -42,7 +45,6 @@ export class MemoryCustody implements Custody {
   }
 }
 
-/** Test double with a private file. Production connect refuses a file keychain. */
 export class TestKeychain implements Custody {
   private readonly path: string;
 
@@ -90,7 +92,6 @@ export type SecretToolRunner = {
   run(argv: readonly string[], input: string): Promise<{ code: number | null; stdout: string; error?: string }>;
 };
 
-/** secret-tool receives the secret on stdin. The secret is never an argument. */
 export class SecretToolCustody implements Custody {
   private readonly runner: SecretToolRunner;
 
@@ -178,14 +179,14 @@ export function processSecretTool(): SecretToolRunner {
   };
 }
 
-/** True when the secret-tool binary answers. A missing tool stays unavailable. */
-export function openCustody(env: NodeJS.ProcessEnv, secretTool: boolean, runner: SecretToolRunner): Custody {
+export function openCustody(env: NodeJS.ProcessEnv, secretTool: boolean, runner: SecretToolRunner, platform: NodeJS.Platform = process.platform): Custody {
   if (env.TICKETS_TO_MAIN_TEST_CUSTODY === "1") {
     const path = env.TICKETS_TO_MAIN_TEST_KEYCHAIN;
     if (!path || !path.startsWith("/")) throw new StateError("The test keychain path is missing.");
     return new TestKeychain(path);
   }
   if (env.TICKETS_TO_MAIN_TEST_CUSTODY !== undefined) throw new StateError("The test keychain switch is not valid.");
+  if (platform === "win32") return new UnavailableCustody();
   if (secretTool) return new SecretToolCustody(runner);
   return new UnavailableCustody();
 }
@@ -193,4 +194,55 @@ export function openCustody(env: NodeJS.ProcessEnv, secretTool: boolean, runner:
 export function secretToolPresent(): boolean {
   const result = spawnSync("secret-tool", ["--version"], { timeout: 1000, windowsHide: true, stdio: "ignore" });
   return result.error === undefined && result.status === 0;
+}
+
+// CLR startup can load sibling configuration before Main; the helper directory therefore contains only its pinned image.
+function helperSha256(executable: string): string {
+  const directory = dirname(executable);
+  const image = lstatSync(executable);
+  const folder = lstatSync(directory);
+  const entries = readdirSync(directory, { withFileTypes: true });
+  if (!image.isFile() || image.isSymbolicLink() || !folder.isDirectory() || folder.isSymbolicLink()
+    || realpathSync(directory) !== resolve(directory) || entries.length !== 1
+    || entries[0]?.name !== basename(executable) || !entries[0].isFile() || entries[0].isSymbolicLink()) {
+    throw new StateError("The credential helper installation boundary could not be verified.");
+  }
+  return createHash("sha256").update(readFileSync(executable)).digest("hex");
+}
+
+export function processWindowsCredentialHost(): WindowsCredentialHost {
+  return {
+    async executableSha256(executable) {
+      return helperSha256(executable);
+    },
+    async invoke(launch, input) {
+      const unavailable = { code: null, stdout: "", stderr: "", error: "The pinned Windows credential helper is unavailable." };
+      try {
+        const executable = launch.argv[0];
+        if (!executable || launch.argv.length !== 1 || launch.shell !== false || input.length > 16384
+          || Object.keys(launch.env).some((name) => name !== "SystemRoot" && name !== "WINDIR")
+          || helperSha256(executable) !== launch.expectedSha256) return unavailable;
+        return await new Promise((resolve) => {
+          const child = spawn(executable, [], { shell: false, windowsHide: true, timeout: 5000, cwd: dirname(executable), env: launch.env, stdio: ["pipe", "pipe", "pipe"] });
+          let stdout = "";
+          let stderr = "";
+          let error: string | undefined;
+          child.stdout.setEncoding("utf8");
+          child.stderr.setEncoding("utf8");
+          child.stdout.on("data", (chunk: string) => {
+            if (stdout.length + chunk.length > 16384) error = "The credential helper reply was too large.";
+            else if (!error) stdout += chunk;
+          });
+          child.stderr.on("data", (chunk: string) => {
+            if (stderr.length + chunk.length > 1024) error = "The credential helper returned unexpected diagnostics.";
+            else if (!error) stderr += chunk;
+          });
+          child.stdin.on("error", () => { error = "The credential helper input was interrupted."; });
+          child.on("error", () => { error = "The credential helper could not start."; });
+          child.on("close", (code, signal) => resolve({ code, stdout, stderr, ...(error || signal ? { error: error ?? "The credential helper was interrupted." } : {}) }));
+          child.stdin.end(input);
+        });
+      } catch { return unavailable; }
+    },
+  };
 }

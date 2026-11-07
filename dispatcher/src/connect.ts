@@ -1,6 +1,7 @@
+import { createHash, randomBytes } from "node:crypto";
 import type { Custody } from "./custody.ts";
 import { BOARD_KEY_ACCOUNT, DEVICE_CODE_ACCOUNT } from "./custody.ts";
-import { loadLedger, saveLedger, type ConnectionRecord, type Ledger } from "./ledger.ts";
+import { loadLedger, saveLedger, type ConnectionRecord, type DeliveryReceipt, type Ledger } from "./ledger.ts";
 import { confirmHello } from "./coordination.ts";
 import { FixtureTransport, loadFixture, type DevicePoll } from "./protocol.ts";
 import { PROTOCOL_REVISION } from "./version.ts";
@@ -14,8 +15,25 @@ function requireInstalled(stateDir: string): Ledger {
   return loaded.ledger;
 }
 
-function secretsOf(ledger: Ledger, extra: string[]): string[] {
-  return extra.filter((secret) => secret.length > 0);
+function digest(value: string): string { return createHash("sha256").update(value).digest("hex"); }
+
+function scopeOf(custody: Custody): string | null {
+  if (custody.scopeId === undefined) return null;
+  if (!/^[a-f0-9]{64}$/.test(custody.scopeId)) throw new Error("The credential scope is unavailable.");
+  return custody.scopeId;
+}
+
+function bindingOf(connection: ConnectionRecord): string {
+  return digest(JSON.stringify([connection.enrollmentId, connection.fixture, connection.protocolRevision, connection.origin, connection.computer, connection.userCode, connection.verificationUriComplete]));
+}
+
+function connectedLines(connection: ConnectionRecord): string[] {
+  return [`Connected to the board ${connection.boardName} as ${connection.agentName}.`, "Connection: fixture."];
+}
+
+function receiptOf(connection: ConnectionRecord, scopeId: string, key: string, boardName: string, agentName: string): DeliveryReceipt {
+  if (!connection.enrollmentId) throw new Error("The pending connection has no enrollment identity. Its work was preserved.");
+  return { version: 1, scopeId, enrollmentId: connection.enrollmentId, bindingDigest: bindingOf(connection), credentialDigest: digest(key), boardName, agentName };
 }
 
 export async function connectStart(input: {
@@ -57,6 +75,7 @@ export async function connectStart(input: {
     agentName: null,
     lastPollAt: null,
     fixturePollIndex: 0,
+    ...(scopeOf(input.custody) === null ? {} : { enrollmentId: randomBytes(16).toString("hex") }),
   };
   ledger.connection = connection;
   saveLedger(input.stateDir, ledger, [fixture.challenge.deviceCode]);
@@ -89,10 +108,7 @@ function applyPoll(connection: ConnectionRecord, result: DevicePoll, keyHeld: bo
   connection.agentName = result.agentName;
   return {
     connection,
-    lines: [
-      `Connected to the board ${result.boardName} as ${result.agentName}.`,
-      "Connection: fixture.",
-    ],
+    lines: connectedLines(connection),
     exitCode: 0,
     dropDevice: true,
     key: result.key,
@@ -114,6 +130,23 @@ export async function connectPoll(input: {
   if (!input.fixturePath) return { exitCode: 0, lines: confirmHello().lines };
   if (!input.allowFixture) {
     return { exitCode: 1, lines: ["A fixture connection is only for the test harness. No network request was sent."] };
+  }
+  const scope = scopeOf(input.custody);
+  if (scope !== null && connection.deliveryReceipt !== undefined) {
+    const receipt = connection.deliveryReceipt;
+    if (receipt.scopeId !== scope || receipt.enrollmentId !== connection.enrollmentId || receipt.bindingDigest !== bindingOf(connection)) {
+      return { exitCode: 1, lines: ["The saved delivery does not belong to this pending connection and credential scope. Its work was preserved."] };
+    }
+    const stored = await input.custody.get(BOARD_KEY_ACCOUNT);
+    if (stored === null || digest(stored) !== receipt.credentialDigest) {
+      return { exitCode: 1, lines: ["The saved delivery could not be verified in the keychain. Its work was preserved without another token request."] };
+    }
+    await input.custody.delete(DEVICE_CODE_ACCOUNT);
+    const approved: ConnectionRecord = { ...connection, phase: "approved", boardName: receipt.boardName, agentName: receipt.agentName };
+    delete approved.deliveryReceipt;
+    ledger.connection = approved;
+    saveLedger(input.stateDir, ledger, [stored]);
+    return { exitCode: 0, lines: connectedLines(approved) };
   }
   const deviceCode = await input.custody.get(DEVICE_CODE_ACCOUNT);
   if (!deviceCode) {
@@ -142,11 +175,21 @@ export async function connectPoll(input: {
   }
   connection.lastPollAt = new Date(input.nowMs).toISOString();
   connection.fixturePollIndex += 1;
-  const applied = applyPoll(connection, result, true);
+  const applied = applyPoll({ ...connection }, result, true);
+  if (scope !== null && applied.key !== null) {
+    const receipt = receiptOf(connection, scope, applied.key, applied.connection.boardName!, applied.connection.agentName!);
+    ledger.connection = { ...connection, deliveryReceipt: receipt };
+    saveLedger(input.stateDir, ledger, [deviceCode, applied.key]);
+    await input.custody.put(BOARD_KEY_ACCOUNT, applied.key);
+    await input.custody.delete(DEVICE_CODE_ACCOUNT);
+    ledger.connection = applied.connection;
+    saveLedger(input.stateDir, ledger, [deviceCode, applied.key]);
+    return { exitCode: applied.exitCode, lines: applied.lines };
+  }
   if (applied.dropDevice) await input.custody.delete(DEVICE_CODE_ACCOUNT);
   if (applied.key) await input.custody.put(BOARD_KEY_ACCOUNT, applied.key);
   ledger.connection = applied.connection;
-  const hidden = secretsOf(ledger, [deviceCode, applied.key ?? ""]);
+  const hidden = [deviceCode, applied.key ?? ""].filter(Boolean);
   saveLedger(input.stateDir, ledger, hidden);
   return { exitCode: applied.exitCode, lines: applied.lines };
 }

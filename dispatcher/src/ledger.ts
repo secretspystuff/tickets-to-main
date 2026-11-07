@@ -28,6 +28,16 @@ export type InstallRecord = {
   signedInstallers: "not-qualified";
 };
 
+export type DeliveryReceipt = {
+  version: 1;
+  scopeId: string;
+  enrollmentId: string;
+  bindingDigest: string;
+  credentialDigest: string;
+  boardName: string;
+  agentName: string;
+};
+
 export type ConnectionRecord = {
   phase: ConnectionPhase;
   fixture: true;
@@ -40,6 +50,8 @@ export type ConnectionRecord = {
   agentName: string | null;
   lastPollAt: string | null;
   fixturePollIndex: number;
+  enrollmentId?: string;
+  deliveryReceipt?: DeliveryReceipt;
 };
 
 export type WorkspaceRecord = {
@@ -77,7 +89,6 @@ function exposure(node: string, secrets: readonly string[]): "unreadable" | "key
   return null;
 }
 
-/** Refuse secrets in the durable record. The key and device code stay in the keychain. */
 export function assertPublicRecord(value: unknown, secrets: readonly string[]): void {
   const walk = (node: unknown): void => {
     if (typeof node === "string") {
@@ -127,6 +138,19 @@ function isWorkspace(value: unknown): value is WorkspaceRecord {
     && row.qualified === false;
 }
 
+function isDeliveryReceipt(value: unknown): value is DeliveryReceipt {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) return false;
+  const row = value as Record<string, unknown>;
+  const keys = ["version", "scopeId", "enrollmentId", "bindingDigest", "credentialDigest", "boardName", "agentName"];
+  return Object.keys(row).length === keys.length && keys.every((key) => Object.hasOwn(row, key))
+    && row.version === 1
+    && typeof row.scopeId === "string" && /^[a-f0-9]{64}$/.test(row.scopeId)
+    && typeof row.enrollmentId === "string" && /^[a-f0-9]{32}$/.test(row.enrollmentId)
+    && typeof row.bindingDigest === "string" && /^[a-f0-9]{64}$/.test(row.bindingDigest)
+    && typeof row.credentialDigest === "string" && /^[a-f0-9]{64}$/.test(row.credentialDigest)
+    && typeof row.boardName === "string" && typeof row.agentName === "string";
+}
+
 function isConnection(value: unknown): value is ConnectionRecord {
   if (value === null || typeof value !== "object") return false;
   const row = value as Record<string, unknown>;
@@ -141,7 +165,9 @@ function isConnection(value: unknown): value is ConnectionRecord {
     && (row.boardName === null || typeof row.boardName === "string")
     && (row.agentName === null || typeof row.agentName === "string")
     && (row.lastPollAt === null || typeof row.lastPollAt === "string")
-    && typeof row.fixturePollIndex === "number";
+    && typeof row.fixturePollIndex === "number"
+    && (row.enrollmentId === undefined || (typeof row.enrollmentId === "string" && /^[a-f0-9]{32}$/.test(row.enrollmentId)))
+    && (row.deliveryReceipt === undefined || isDeliveryReceipt(row.deliveryReceipt));
 }
 
 export function parseLedger(text: string): Ledger | null {
