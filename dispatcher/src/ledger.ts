@@ -1,4 +1,7 @@
-import { lstatSync, readFileSync } from "node:fs";
+import { closeSync, fsyncSync, lstatSync, openSync, readFileSync } from "node:fs";
+import { createHash } from "node:crypto";
+import { resolve } from "node:path";
+import { withStateLease } from "./state-lease.ts";
 import { join } from "node:path";
 import { KEY_MARK, unfold } from "./secret-text.ts";
 import { PACKAGE_VERSION } from "./version.ts";
@@ -27,6 +30,7 @@ export type InstallRecord = {
   installedAt: string;
   startup: "not-registered";
   signedInstallers: "not-qualified";
+  release?: { directory: string; manifestDigest: string; qualified: false };
 };
 
 export type DeliveryReceipt = {
@@ -72,10 +76,15 @@ export type Ledger = {
 
 export const LEDGER_FILE = "ledger.json";
 
+const origins = new WeakMap<Ledger, { path: string | null; digest: string | null }>();
+const fingerprint = (text: string) => createHash("sha256").update(text).digest("hex");
+
 const FORBIDDEN_KEYS = new Set(["key", "device_code", "secret", "token", "password", "authorization", "bearer"]);
 
 export function emptyLedger(): Ledger {
-  return { version: 1, install: null, connection: null, tools: [], workspace: null };
+  const ledger: Ledger = { version: 1, install: null, connection: null, tools: [], workspace: null };
+  origins.set(ledger, { path: null, digest: null });
+  return ledger;
 }
 
 export function ledgerPath(stateDir: string): string {
@@ -181,7 +190,7 @@ export function parseLedger(text: string): Ledger | null {
   }
   if (parsed === null || typeof parsed !== "object") return null;
   const row = parsed as Record<string, unknown>;
-  if (row.version !== 1) return null;
+  if (row.version !== 1 || Object.keys(row).some((key) => !["version", "install", "connection", "tools", "workspace", "checkAttempts"].includes(key))) return null;
   const install = row.install;
   let installRecord: InstallRecord | null = null;
   if (install !== null) {
@@ -191,6 +200,13 @@ export function parseLedger(text: string): Ledger | null {
     if (!isOsLabel(item.platform) || typeof item.arch !== "string" || typeof item.installedAt !== "string") return null;
     if (item.startup !== "not-registered" || item.signedInstallers !== "not-qualified") return null;
     if (typeof item.packageVersion !== "string") return null;
+    if (item.release !== undefined) {
+      if (item.release === null || typeof item.release !== "object" || Array.isArray(item.release)) return null;
+      const selected = item.release as Record<string, unknown>;
+      if (Object.keys(selected).length !== 3 || typeof selected.directory !== "string"
+        || !/^releases\/[0-9A-Za-z.+-]+-[a-f0-9]{64}$/.test(selected.directory)
+        || typeof selected.manifestDigest !== "string" || !/^[a-f0-9]{64}$/.test(selected.manifestDigest) || selected.qualified !== false) return null;
+    }
     installRecord = {
       packageVersion: item.packageVersion,
       platform: item.platform,
@@ -198,6 +214,7 @@ export function parseLedger(text: string): Ledger | null {
       installedAt: item.installedAt,
       startup: "not-registered",
       signedInstallers: "not-qualified",
+      ...(item.release === undefined ? {} : { release: item.release as NonNullable<InstallRecord["release"]> }),
     };
   }
   if (row.connection !== null && !isConnection(row.connection)) return null;
@@ -241,7 +258,11 @@ export function loadLedger(stateDir: string): LoadResult {
     if (lstatSync(path).isSymbolicLink()) throw new StateError("The local record is a link. It was not saved.");
   } catch (error) {
     if (error instanceof StateError) throw error;
-    if ((error as NodeJS.ErrnoException).code === "ENOENT") return { ok: true, ledger: emptyLedger() };
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+      const ledger = emptyLedger();
+      origins.set(ledger, { path: resolve(stateDir), digest: null });
+      return { ok: true, ledger };
+    }
     return { ok: false, reason: "unreadable" };
   }
   let text: string;
@@ -252,14 +273,62 @@ export function loadLedger(stateDir: string): LoadResult {
   }
   const ledger = parseLedger(text);
   if (!ledger) return { ok: false, reason: "unreadable" };
+  origins.set(ledger, { path: resolve(stateDir), digest: fingerprint(text) });
   return { ok: true, ledger };
 }
 
-export function saveLedger(stateDir: string, ledger: Ledger, secrets: readonly string[]): void {
+function validateSave(ledger: Ledger, secrets: readonly string[]): void {
   if (ledger.checkAttempts !== undefined && (!Array.isArray(ledger.checkAttempts) || !ledger.checkAttempts.every(validCheckAttemptRecord)
     || new Set(ledger.checkAttempts.map((attempt) => attempt.attemptId)).size !== ledger.checkAttempts.length)) {
     throw new StateError("The check attempt record is not valid. It was not saved.");
   }
   assertPublicRecord(ledger, secrets);
-  writePrivateFile(ledgerPath(stateDir), `${JSON.stringify(ledger, null, 2)}\n`);
+  if (parseLedger(JSON.stringify(ledger)) === null) throw new StateError("The local record is not valid. It was not saved.");
+}
+
+function currentLedger(stateDir: string): Ledger {
+  const loaded = loadLedger(stateDir);
+  if (loaded.ok) return loaded.ledger;
+  if (loaded.reason === "missing") return emptyLedger();
+  throw new StateError("The local record could not be read safely. Its work was preserved.");
+}
+
+function persist(stateDir: string, ledger: Ledger, secrets: readonly string[]): void {
+  validateSave(ledger, secrets);
+  const text = JSON.stringify(ledger, null, 2) + "\n";
+  writePrivateFile(ledgerPath(stateDir), text);
+  if (process.platform !== "win32") {
+    const fd = openSync(stateDir, "r");
+    try { fsyncSync(fd); } finally { closeSync(fd); }
+  }
+  origins.set(ledger, { path: resolve(stateDir), digest: fingerprint(text) });
+}
+
+function sameOrigin(stateDir: string, expected: { path: string | null; digest: string | null } | undefined, current: Ledger): boolean {
+  const actual = origins.get(current);
+  return expected !== undefined && (expected.path === null || expected.path === resolve(stateDir))
+    && expected.digest === actual?.digest;
+}
+
+export function saveLedger(stateDir: string, ledger: Ledger, secrets: readonly string[]): void {
+  validateSave(ledger, secrets);
+  const origin = origins.get(ledger) ?? { path: resolve(stateDir), digest: null };
+  if (!sameOrigin(stateDir, origin, currentLedger(stateDir))) throw new StateError("The local record changed. Reload it before retrying; its work was preserved.");
+  withStateLease(stateDir, "ledger", () => {
+    if (!sameOrigin(stateDir, origin, currentLedger(stateDir))) throw new StateError("The local record changed. Reload it before retrying; its work was preserved.");
+    persist(stateDir, ledger, secrets);
+  });
+}
+
+export function updateLedger(stateDir: string, secrets: readonly string[], mutate: (current: Ledger) => void): Ledger {
+  currentLedger(stateDir);
+  return withStateLease(stateDir, "ledger", () => {
+    const current = currentLedger(stateDir);
+    const before = JSON.stringify(current);
+    const result: unknown = mutate(current);
+    if (result !== null && typeof result === "object" && "then" in result) throw new StateError("The local record transaction must finish before returning.");
+    validateSave(current, secrets);
+    if (JSON.stringify(current) !== before || origins.get(current)?.digest === null) persist(stateDir, current, secrets);
+    return current;
+  });
 }

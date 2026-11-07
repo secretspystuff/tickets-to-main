@@ -139,13 +139,19 @@ for (const phase of ["staged", "published", "committed"] as const) {
           import { fixture } from ${JSON.stringify(new URL("./release-test-fixtures.ts", import.meta.url).href)};
           import { install } from ${JSON.stringify(new URL("../src/install.ts", import.meta.url).href)};
           const sample = fixture(process.argv[1]);
+          const prior = JSON.parse(process.argv[3]);
+          if (prior) {
+            const { createPublicKey } = await import("node:crypto");
+            sample.services.releaseTrust.keys.set(prior.keyId, createPublicKey({ key: Buffer.from(prior.publicKey, "base64"), type: "spki", format: "der" }));
+          }
           const publicKey = sample.services.releaseTrust.keys.get(sample.manifest.keyId).export({ type: 'spki', format: 'der' }).toString('base64');
           process.stdout.write(JSON.stringify({ publicKey, keyId: sample.manifest.keyId }));
           sample.services.onReleaseCheckpoint = (at) => { if (at === process.argv[2]) process.exit(73); };
           install(sample.signed(), sample.services);
           process.exit(74);
         `;
-        const child = spawnSync(process.execPath, ["--experimental-strip-types", "--input-type=module", "-e", childSource, dir, phase], { encoding: "utf8", cwd: fileURLToPath(new URL("..", import.meta.url)) });
+        const prior = old ? { keyId: old.manifest.keyId, publicKey: old.services.releaseTrust!.keys.get(old.manifest.keyId)!.export({ type: "spki", format: "der" }).toString("base64") } : null;
+        const child = spawnSync(process.execPath, ["--experimental-strip-types", "--input-type=module", "-e", childSource, dir, phase, JSON.stringify(prior)], { encoding: "utf8", cwd: fileURLToPath(new URL("..", import.meta.url)) });
         assert.equal(child.error, undefined);
         assert.equal(child.status, 73, child.stderr);
         const emitted = JSON.parse(child.stdout.trim()) as { publicKey: string; keyId: string };

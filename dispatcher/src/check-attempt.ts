@@ -1,10 +1,10 @@
-import { closeSync, fsyncSync, mkdirSync, openSync, realpathSync, rmdirSync } from "node:fs";
+import { mkdirSync, realpathSync, rmdirSync } from "node:fs";
 import { createHash } from "node:crypto";
 import { isAbsolute, join, sep } from "node:path";
 import { canonical, evidenceBinds, selectedGateSatisfied } from "../../src/lib/ttm-protocol.ts";
 import type { CommandRunner } from "./command.ts";
 import { assertPrivateDirectory } from "./fs-safety.ts";
-import { ledgerPath, loadLedger, saveLedger } from "./ledger.ts";
+import { loadLedger, updateLedger } from "./ledger.ts";
 import {
   copyCheckAttemptRecord, gitObjectId, publicCheckResult, redactCheckText, validCheckSnapshot, validCheckTerminal,
   type CheckAttemptRecord, type CheckDetail, type CheckState, type CurrentCheckSnapshot, type CheckTerminal,
@@ -157,19 +157,15 @@ function initialRecord(request: CheckAttemptRequest, startedAt: number): CheckAt
 }
 
 function flushRecord(input: CheckAttemptInput, record: CheckAttemptRecord): void {
-  const loaded = loadLedger(input.stateDir);
-  if (!loaded.ok || !loaded.ledger.install) throw new Error("The private record is unavailable.");
   const saved = copyCheckAttemptRecord(record);
-  const attempts = loaded.ledger.checkAttempts ?? [];
-  const index = attempts.findIndex((attempt) => attempt.attemptId === record.attemptId);
-  if (index === -1) attempts.push(saved);
-  else attempts[index] = saved;
-  loaded.ledger.checkAttempts = attempts;
-  saveLedger(input.stateDir, loaded.ledger, input.secrets);
-  for (const path of [ledgerPath(input.stateDir), input.stateDir]) {
-    const handle = openSync(path, "r");
-    try { fsyncSync(handle); } finally { closeSync(handle); }
-  }
+  updateLedger(input.stateDir, input.secrets, (ledger) => {
+    if (!ledger.install) throw new Error("The private record is unavailable.");
+    const attempts = ledger.checkAttempts ?? [];
+    const index = attempts.findIndex((attempt) => attempt.attemptId === record.attemptId);
+    if (index === -1) attempts.push(saved);
+    else attempts[index] = saved;
+    ledger.checkAttempts = attempts;
+  });
 }
 
 function finish(record: CheckAttemptRecord, state: CheckState, now: number): CheckAttemptRecord {

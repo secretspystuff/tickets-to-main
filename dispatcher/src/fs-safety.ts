@@ -1,4 +1,4 @@
-import { chmodSync, closeSync, lstatSync, mkdirSync, openSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, closeSync, fsyncSync, lstatSync, mkdirSync, openSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
 import { dirname } from "node:path";
 
 export class StateError extends Error {
@@ -62,6 +62,7 @@ export function writePrivateFile(path: string, text: string): void {
   }
   try {
     writeFileSync(fd, text);
+    fsyncSync(fd);
   } finally {
     closeSync(fd);
   }
