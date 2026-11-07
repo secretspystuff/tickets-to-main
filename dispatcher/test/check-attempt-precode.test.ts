@@ -5,9 +5,10 @@ import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { test, type TestContext } from "node:test";
 import { runCheckAttempt } from "../src/check-attempt.ts";
+import type { CheckAttemptRecord } from "../src/check-attempt.ts";
 import { processRunner } from "../src/command.ts";
 import { install } from "../src/install.ts";
-import { loadLedger, saveLedger } from "../src/ledger.ts";
+import { loadLedger, parseLedger, saveLedger } from "../src/ledger.ts";
 
 type Bind = { candidate_id: string; requirements_id: string; base_id: string; policy_id: string };
 type Check = { id: string; argv: string[]; memberIds: string[]; dependsOn: string[] };
@@ -495,4 +496,36 @@ test("no caller boolean can promote the fabricated executor to production qualif
   const result = await f.run();
   assert.equal(result.publishable, false);
   assert.equal(result.qualification, "unqualified-harness");
+});
+
+test("malformed or secret-bearing durable attempts are rejected without rewriting the valid ledger", async (t) => {
+  const f = fixture(t);
+  assert.equal((await f.run()).state, "passed");
+  const filename = join(f.stateDir, "ledger.json");
+  const original = readFileSync(filename, "utf8");
+  const changes: Array<(record: CheckAttemptRecord) => void> = [
+    (record) => { Object.assign(record, { version: 2 }); },
+    (record) => { Object.assign(record, { publishable: true }); },
+    (record) => { Object.assign(record, { env: { injected: "fixture-held-secret" } }); },
+    (record) => { Object.assign(record.snapshot.profile, { qualified: true }); },
+    (record) => { record.publicResult = "failed"; },
+    (record) => { record.checks[0]!.coveredMemberIds = []; },
+    (record) => { record.checks[0]!.terminal!.candidateCommit = "0".repeat(40); },
+    (record) => { record.checks[0]!.stdout = "ghp" + "_" + "E".repeat(36); },
+    (record) => { record.checks = []; },
+    (record) => { record.snapshot.buildReview = null; },
+    (record) => { record.completedAt = null; },
+  ];
+  for (const change of changes) {
+    const document = parseLedger(original)!;
+    change(document.checkAttempts![0]!);
+    assert.equal(parseLedger(JSON.stringify(document)), null);
+    assert.throws(() => saveLedger(f.stateDir, document, ["fixture-held-secret"]), /record is not valid/);
+    assert.equal(readFileSync(filename, "utf8"), original);
+  }
+  const duplicate = parseLedger(original)!;
+  duplicate.checkAttempts!.push(structuredClone(duplicate.checkAttempts![0]!));
+  assert.equal(parseLedger(JSON.stringify(duplicate)), null);
+  assert.throws(() => saveLedger(f.stateDir, duplicate, []), /record is not valid/);
+  assert.equal(readFileSync(filename, "utf8"), original);
 });
