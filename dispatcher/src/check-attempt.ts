@@ -1,5 +1,5 @@
 import { closeSync, fsyncSync, mkdirSync, openSync, realpathSync, rmdirSync } from "node:fs";
-import { isAbsolute, join, resolve } from "node:path";
+import { isAbsolute, join, resolve, sep } from "node:path";
 import { canonical, evidenceBinds, selectedGateSatisfied } from "../../src/lib/ttm-protocol.ts";
 import type { CommandRunner } from "./command.ts";
 import { assertPrivateDirectory } from "./fs-safety.ts";
@@ -69,6 +69,20 @@ function validSelection(snapshot: CurrentCheckSnapshot): boolean {
   };
   return checks.every((check) => check.memberIds.every((member) => members.has(member)) && visit(check.id))
     && snapshot.memberIds.every((member) => checks.some((check) => check.memberIds.includes(member)));
+}
+
+function orderedChecks(snapshot: CurrentCheckSnapshot) {
+  const ordered: typeof snapshot.profile.checks = [];
+  const visited = new Set<string>();
+  const visit = (id: string) => {
+    if (visited.has(id)) return;
+    const check = snapshot.profile.checks.find((entry) => entry.id === id)!;
+    visited.add(id);
+    for (const dependency of check.dependsOn) visit(dependency);
+    ordered.push(check);
+  };
+  for (const check of snapshot.profile.checks) visit(check.id);
+  return ordered;
 }
 
 async function currentBoundary(input: CheckAttemptInput, captured: CurrentCheckSnapshot): Promise<CheckState | null> {
@@ -190,7 +204,8 @@ export async function runCheckAttempt(input: CheckAttemptInput): Promise<CheckAt
     if (!Number.isSafeInteger(startedAt) || startedAt < 0 || !isAbsolute(input.workspace) || !isAbsolute(input.stateDir)) return outcome("unavailable");
     workspace = realpathSync(input.workspace);
     assertPrivateDirectory(input.stateDir);
-    if (workspace === realpathSync(input.stateDir)) return outcome("held");
+    const state = realpathSync(input.stateDir);
+    if (workspace === state || workspace.startsWith(state + sep) || state.startsWith(workspace + sep)) return outcome("held");
   } catch {
     return outcome("unavailable");
   }
@@ -205,16 +220,21 @@ export async function runCheckAttempt(input: CheckAttemptInput): Promise<CheckAt
     const admitted = await currentBoundary(input, request.snapshot);
     if (admitted) return outcome(admitted);
     if (!await candidateUnchanged(input, workspace, request.snapshot)) return outcome("stale");
-    if (previous) return previous.state === "running" ? outcome("held") : copyCheckAttemptRecord(previous);
+    if (previous) {
+      const replayBoundary = await currentBoundary(input, request.snapshot);
+      if (replayBoundary) return outcome(replayBoundary);
+      return previous.state === "running" ? outcome("held") : copyCheckAttemptRecord(previous);
+    }
     record = initialRecord(request, startedAt);
     flushRecord(input, record);
     if (request.snapshot.profile.mode === "none") {
       const boundary = await currentBoundary(input, request.snapshot);
-      record = finish(record, boundary ?? "not_required", input.now());
+      const unchanged = await candidateUnchanged(input, workspace, request.snapshot);
+      record = finish(record, boundary ?? (unchanged ? "not_required" : "stale"), input.now());
       flushRecord(input, record);
       return copyCheckAttemptRecord(record);
     }
-    for (const selected of request.snapshot.profile.checks) {
+    for (const selected of orderedChecks(request.snapshot)) {
       const index = record.checks.findIndex((check) => check.id === selected.id);
       const check = record.checks[index]!;
       if (selected.dependsOn.some((dependency) => record!.checks.find((entry) => entry.id === dependency)?.state !== "passed")) continue;

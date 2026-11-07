@@ -113,7 +113,8 @@ export function validCheckSnapshot(value: unknown): value is CurrentCheckSnapsho
   const ids = new Set<string>();
   for (const check of profile.checks) {
     if (!exact(check, ["id", "argv", "memberIds", "dependsOn"]) || !label(check.id) || ids.has(check.id)
-      || !Array.isArray(check.argv) || check.argv.length === 0 || !check.argv.every((arg) => label(arg))
+      || !Array.isArray(check.argv) || check.argv.length === 0 || typeof check.argv[0] !== "string" || check.argv[0].length === 0
+      || !check.argv.every((arg) => text(arg))
       || !strings(check.memberIds, opaque) || check.memberIds.length === 0 || !strings(check.dependsOn)) return false;
     ids.add(check.id);
   }
@@ -140,19 +141,43 @@ export function validCheckAttemptRecord(value: unknown): value is CheckAttemptRe
     || !Array.isArray(value.checks) || !strings(value.outstandingHostChecks) || !timestamp(value.startedAt)
     || (value.completedAt !== null && (!timestamp(value.completedAt) || value.completedAt < value.startedAt))
     || ((value.state === "running") !== (value.completedAt === null))) return false;
+  const snapshot = value.snapshot;
+  const details = value.checks;
+  const outstandingHostChecks = value.outstandingHostChecks;
+  const review = snapshot.buildReview;
+  if (!snapshot.authorized || review === null || review.result !== "passed" || review.candidateCommit !== snapshot.candidateCommit
+    || !BINDING_KEYS.every((key) => review.binding[key as keyof CheckBinding] === snapshot.binding[key as keyof CheckBinding])) return false;
   const seen = new Set<string>();
-  for (const check of value.checks) {
+  for (const check of details) {
     if (!exact(check, ["id", "state", "publicResult", "sourceId", "coveredMemberIds", "stdout", "stderr", "terminal"])
       || !label(check.id) || seen.has(check.id) || !STATES.includes(check.state as CheckState)
       || check.publicResult !== publicCheckResult(check.state as CheckState) || !label(check.sourceId)
       || !strings(check.coveredMemberIds, opaque) || !text(check.stdout, 1048576) || !text(check.stderr, 1048576)
       || (check.terminal !== null && !validCheckTerminal(check.terminal))) return false;
+    const selected = snapshot.profile.checks.find((entry) => entry.id === check.id);
+    if (!selected || check.sourceId !== snapshot.profile.sourceId
+      || !check.coveredMemberIds.every((member) => selected.memberIds.includes(member))) return false;
+    const terminal = check.terminal;
+    if (terminal !== null && (terminal.attemptId !== value.attemptId || terminal.checkId !== check.id
+      || terminal.sourceId !== check.sourceId || terminal.candidateCommit !== snapshot.candidateCommit)) return false;
+    const coveredMembers = check.coveredMemberIds;
+    if (check.state === "passed" && (terminal === null || terminal.code !== 0 || terminal.signal !== null || terminal.error !== null
+      || terminal.writerCustody !== "contained" || !selected.memberIds.every((member) => coveredMembers.includes(member)))) return false;
+    if (check.state === "failed" && (terminal === null || terminal.code === null || terminal.code === 0
+      || terminal.signal !== null || terminal.error !== null || terminal.writerCustody !== "contained")) return false;
     seen.add(check.id);
   }
+  if (seen.size !== snapshot.profile.checks.length
+    || !snapshot.requiredHostChecks.every((id) => outstandingHostChecks.includes(id))
+    || outstandingHostChecks.length !== snapshot.requiredHostChecks.length) return false;
+  if (value.state === "passed" && (snapshot.profile.mode !== "scripted" || details.length === 0
+    || !details.every((check) => check.state === "passed"))) return false;
+  if (value.state === "failed" && !details.some((check) => check.state === "failed")) return false;
+  if (value.state === "not_required" && (snapshot.profile.mode !== "none" || details.length !== 0)) return false;
   return true;
 }
 
-// Projection prevents a future caller from accidentally persisting its environment or transport handles.
+// The exact schema prevents a caller from accidentally persisting its environment or transport handles.
 export function copyCheckAttemptRecord(value: CheckAttemptRecord): CheckAttemptRecord {
   if (!validCheckAttemptRecord(value)) throw new Error("The check attempt record is not valid.");
   return structuredClone(value);

@@ -3,6 +3,7 @@ import { join } from "node:path";
 import { KEY_MARK, unfold } from "./secret-text.ts";
 import { PACKAGE_VERSION } from "./version.ts";
 import { StateError, assertPrivateDirectory, writePrivateFile } from "./fs-safety.ts";
+import { validCheckAttemptRecord, type CheckAttemptRecord } from "./check-attempt-record.ts";
 
 export type OsLabel = "early-linux-probe" | "unqualified-windows" | "unqualified-macos" | "unqualified-other";
 
@@ -66,6 +67,7 @@ export type Ledger = {
   connection: ConnectionRecord | null;
   tools: ToolRecord[];
   workspace: WorkspaceRecord | null;
+  checkAttempts?: CheckAttemptRecord[];
 };
 
 export const LEDGER_FILE = "ledger.json";
@@ -200,6 +202,8 @@ export function parseLedger(text: string): Ledger | null {
   }
   if (row.connection !== null && !isConnection(row.connection)) return null;
   if (!Array.isArray(row.tools) || !row.tools.every(isTool)) return null;
+  if (row.checkAttempts !== undefined && (!Array.isArray(row.checkAttempts) || !row.checkAttempts.every(validCheckAttemptRecord)
+    || new Set(row.checkAttempts.map((attempt) => attempt.attemptId)).size !== row.checkAttempts.length)) return null;
   let workspace: WorkspaceRecord | null = null;
   if (row.workspace !== undefined && row.workspace !== null) {
     if (!isWorkspace(row.workspace)) return null;
@@ -216,6 +220,7 @@ export function parseLedger(text: string): Ledger | null {
     connection: row.connection === null ? null : row.connection,
     tools: row.tools,
     workspace,
+    ...(row.checkAttempts === undefined ? {} : { checkAttempts: row.checkAttempts }),
   };
 }
 
@@ -251,6 +256,10 @@ export function loadLedger(stateDir: string): LoadResult {
 }
 
 export function saveLedger(stateDir: string, ledger: Ledger, secrets: readonly string[]): void {
+  if (ledger.checkAttempts !== undefined && (!Array.isArray(ledger.checkAttempts) || !ledger.checkAttempts.every(validCheckAttemptRecord)
+    || new Set(ledger.checkAttempts.map((attempt) => attempt.attemptId)).size !== ledger.checkAttempts.length)) {
+    throw new StateError("The check attempt record is not valid. It was not saved.");
+  }
   assertPublicRecord(ledger, secrets);
   writePrivateFile(ledgerPath(stateDir), `${JSON.stringify(ledger, null, 2)}\n`);
 }
