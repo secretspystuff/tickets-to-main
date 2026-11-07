@@ -2,7 +2,6 @@ import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
 import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { fileURLToPath } from "node:url";
 import { test } from "node:test";
 import { runCheckAttempt } from "../src/check-attempt.ts";
 import { processRunner } from "../src/command.ts";
@@ -10,8 +9,6 @@ import { install, recoverInstall } from "../src/install.ts";
 import { loadLedger, saveLedger } from "../src/ledger.ts";
 import { removeDir, tempDir } from "./helpers.ts";
 import { assertNonInstallState, failedCheckAttemptFixture, fixture, installFixture, nonInstallState, seedRetainedLedger, snapshot } from "./release-test-fixtures.ts";
-
-const checkout = fileURLToPath(new URL("../..", import.meta.url));
 
 function git(cwd: string, ...args: string[]): string {
   const result = spawnSync("git", ["-c", "core.hooksPath=/dev/null", "-c", "commit.gpgsign=false", ...args], {
@@ -29,7 +26,8 @@ test("actual check controller history survives signed replacement, compatible ro
     mkdirSync(stateDir, { mode: 0o700 });
     mkdirSync(workspace, { mode: 0o700 });
     git(workspace, "init", "--quiet", "--initial-branch=fixture-work");
-    for (const key of ["user.name", "user.email"]) git(workspace, "config", key, git(checkout, "config", key));
+    git(workspace, "config", "--local", "user.name", "Fabricated Fixture");
+    git(workspace, "config", "--local", "user.email", "fixture@fixture.invalid");
     writeFileSync(join(workspace, "behavior.txt"), "fabricated base\n");
     git(workspace, "add", "behavior.txt");
     git(workspace, "commit", "--quiet", "-m", "Fabricated installation integration base");

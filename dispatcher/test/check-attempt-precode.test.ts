@@ -53,7 +53,8 @@ function fixture(t: TestContext) {
   const stateDir = join(directory, "private-state");
   mkdirSync(workspace);
   git(workspace, "init", "--quiet", "--initial-branch=fixture-work");
-  for (const key of ["user.name", "user.email"]) git(workspace, "config", key, git(root, "config", key));
+  git(workspace, "config", "--local", "user.name", "Fabricated Fixture");
+  git(workspace, "config", "--local", "user.email", "fixture@fixture.invalid");
   writeFileSync(join(workspace, "behavior.txt"), "before\n");
   git(workspace, "add", "behavior.txt");
   git(workspace, "commit", "--quiet", "-m", "Fabricated base");
