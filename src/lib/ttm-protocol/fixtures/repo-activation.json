@@ -1,0 +1,130 @@
+{
+  "name": "repo-activation",
+  "fabricated": true,
+  "shows": "This board can own the repo. A competing board is refused without its name or id. The repo slug and the Git name are different fields.",
+  "wire": [
+    {
+      "role": "request",
+      "document": {
+        "protocol": "tickets-to-main.coordination",
+        "version": 1,
+        "command": "repo.activation.read",
+        "id": "fab00000000000000000000000000005",
+        "idempotency_key": null,
+        "body": {
+          "repo": {
+            "host": "example.com",
+            "owner": "fabricated-owner",
+            "name": "fabricated-repo",
+            "board_repo_id": "fabricated-board-repo"
+          }
+        }
+      }
+    },
+    {
+      "role": "response",
+      "document": {
+        "protocol": "tickets-to-main.coordination",
+        "version": 1,
+        "command": "repo.activation.read",
+        "id": "fab00000000000000000000000000005",
+        "idempotency_key": null,
+        "body": {
+          "repo": {
+            "host": "example.com",
+            "owner": "fabricated-owner",
+            "name": "fabricated-repo",
+            "board_repo_id": "fabricated-board-repo"
+          },
+          "active": true,
+          "board_id": "fabricated-board"
+        }
+      }
+    },
+    {
+      "role": "response",
+      "document": {
+        "protocol": "tickets-to-main.coordination",
+        "version": 1,
+        "command": "repo.activation.read",
+        "id": "fab00000000000000000000000000006",
+        "idempotency_key": null,
+        "body": {
+          "repo": {
+            "host": "example.com",
+            "owner": "fabricated-owner",
+            "name": "fabricated-repo",
+            "board_repo_id": "fabricated-board-repo"
+          },
+          "active": false,
+          "board_id": null
+        }
+      }
+    },
+    {
+      "role": "refusal",
+      "document": {
+        "protocol": "tickets-to-main.coordination",
+        "version": 1,
+        "command": "repo.activation.read",
+        "id": "fab00000000000000000000000000007",
+        "idempotency_key": null,
+        "error": "Another board already coordinates this repo.",
+        "code": "repo_held",
+        "field": "repo",
+        "fix": "Use the board that already coordinates it, or turn coordination off there.",
+        "then": "stop"
+      }
+    }
+  ],
+  "cases": [
+    {
+      "rule": "heldActivation",
+      "input": {
+        "id": "fab00000000000000000000000000007"
+      },
+      "expect": {
+        "protocol": "tickets-to-main.coordination",
+        "version": 1,
+        "command": "repo.activation.read",
+        "id": "fab00000000000000000000000000007",
+        "idempotency_key": null,
+        "error": "Another board already coordinates this repo.",
+        "code": "repo_held",
+        "field": "repo",
+        "fix": "Use the board that already coordinates it, or turn coordination off there.",
+        "then": "stop"
+      }
+    },
+    {
+      "rule": "activationRead",
+      "input": {
+        "id": "fab00000000000000000000000000007",
+        "caller": {
+          "connection_id": "fab00000000000000000000000000004",
+          "board_id": "fabricated-board",
+          "seat": "viewer"
+        },
+        "repo": {
+          "host": "example.com",
+          "owner": "fabricated-owner",
+          "name": "fabricated-repo",
+          "board_repo_id": "fabricated-board-repo"
+        },
+        "held_by": "fabricated-other-board"
+      },
+      "expect": {
+        "protocol": "tickets-to-main.coordination",
+        "version": 1,
+        "command": "repo.activation.read",
+        "id": "fab00000000000000000000000000007",
+        "idempotency_key": null,
+        "error": "Another board already coordinates this repo.",
+        "code": "repo_held",
+        "field": "repo",
+        "fix": "Use the board that already coordinates it, or turn coordination off there.",
+        "then": "stop"
+      }
+    }
+  ]
+}

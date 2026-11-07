@@ -1,0 +1,296 @@
+{
+  "name": "approval",
+  "fabricated": true,
+  "shows": "Only a signed-in person approves. Unavailable code stays unreviewed. Not required checks add no extra approval. Missing host evidence blocks approval.",
+  "wire": [
+    {
+      "role": "request",
+      "document": {
+        "protocol": "tickets-to-main.coordination",
+        "version": 1,
+        "command": "approval.submit",
+        "id": "fab0000000000000000000000000003c",
+        "idempotency_key": "fab-approve-1",
+        "body": {
+          "job_id": "fab00000000000000000000000000018",
+          "requirements_id": "fab0000000000000000000000000000d",
+          "policy_id": "fab0000000000000000000000000000e",
+          "expected_revision": 5,
+          "actor": "person",
+          "candidate_id": "fab0000000000000000000000000000b",
+          "reviewed_candidate_id": "fab0000000000000000000000000000b",
+          "base_id": "fab0000000000000000000000000000c",
+          "reviewed_base_id": "fab0000000000000000000000000000c",
+          "code_inspection": "unavailable",
+          "code_reviewed": false,
+          "tests_result": "not_required",
+          "host_checks": "none",
+          "explanation": "The code could not be inspected. This approval does not review it."
+        }
+      }
+    },
+    {
+      "role": "response",
+      "document": {
+        "protocol": "tickets-to-main.coordination",
+        "version": 1,
+        "command": "approval.submit",
+        "id": "fab0000000000000000000000000003c",
+        "idempotency_key": "fab-approve-1",
+        "body": {
+          "job_id": "fab00000000000000000000000000018",
+          "approved": true,
+          "candidate_id": "fab0000000000000000000000000000b",
+          "base_id": "fab0000000000000000000000000000c",
+          "requirements_id": "fab0000000000000000000000000000d",
+          "policy_id": "fab0000000000000000000000000000e",
+          "code_inspection": "unavailable",
+          "code_reviewed": false,
+          "explanation": "The code could not be inspected. This approval does not review it.",
+          "tests_result": "not_required",
+          "host_checks": "none",
+          "extra_approval": false,
+          "revision": 6
+        }
+      }
+    },
+    {
+      "role": "refusal",
+      "document": {
+        "protocol": "tickets-to-main.coordination",
+        "version": 1,
+        "command": "approval.submit",
+        "id": "fab0000000000000000000000000003d",
+        "idempotency_key": "fab-approve-2",
+        "error": "Only a signed-in person can approve.",
+        "code": "not_a_person",
+        "field": "actor",
+        "fix": "Ask a person who is allowed to approve.",
+        "then": "stop"
+      }
+    },
+    {
+      "role": "refusal",
+      "document": {
+        "protocol": "tickets-to-main.coordination",
+        "version": 1,
+        "command": "approval.submit",
+        "id": "fab0000000000000000000000000003e",
+        "idempotency_key": "fab-approve-3",
+        "error": "This approval would say the code was reviewed when it could not be inspected.",
+        "code": "false_code_review",
+        "field": "code_reviewed",
+        "fix": "Leave code reviewed off, and say the code could not be inspected.",
+        "then": "stop"
+      }
+    },
+    {
+      "role": "refusal",
+      "document": {
+        "protocol": "tickets-to-main.coordination",
+        "version": 1,
+        "command": "approval.submit",
+        "id": "fab0000000000000000000000000003f",
+        "idempotency_key": "fab-approve-4",
+        "error": "Required host evidence is still missing.",
+        "code": "host_missing",
+        "field": "host_checks",
+        "fix": "Wait for the required host evidence before approval.",
+        "then": "stop"
+      }
+    },
+    {
+      "role": "refusal",
+      "document": {
+        "protocol": "tickets-to-main.coordination",
+        "version": 1,
+        "command": "approval.submit",
+        "id": "fab00000000000000000000000000040",
+        "idempotency_key": "fab-approve-5",
+        "error": "The selected checks are not satisfied.",
+        "code": "checks_unsatisfied",
+        "field": "tests_result",
+        "fix": "Wait until the selected checks pass, or until they are Not required.",
+        "then": "stop"
+      }
+    }
+  ],
+  "cases": [
+    {
+      "rule": "approvalAllowed",
+      "input": {
+        "actor": "person",
+        "candidate_id": "fab0000000000000000000000000000b",
+        "reviewed_candidate_id": "fab0000000000000000000000000000b",
+        "base_id": "fab0000000000000000000000000000c",
+        "reviewed_base_id": "fab0000000000000000000000000000c",
+        "code_inspection": "unavailable",
+        "code_reviewed": false,
+        "tests_result": "not_required",
+        "host_checks": "none",
+        "explanation": "The code could not be inspected. This approval does not review it."
+      },
+      "expect": {
+        "ok": true,
+        "extra_approval": false
+      }
+    },
+    {
+      "rule": "approvalAllowed",
+      "input": {
+        "actor": "person",
+        "candidate_id": "fab0000000000000000000000000000b",
+        "reviewed_candidate_id": "fab0000000000000000000000000000b",
+        "base_id": "fab0000000000000000000000000000c",
+        "reviewed_base_id": "fab0000000000000000000000000000c",
+        "code_inspection": "available",
+        "code_reviewed": true,
+        "tests_result": "passed",
+        "host_checks": "satisfied",
+        "explanation": ""
+      },
+      "expect": {
+        "ok": true,
+        "extra_approval": false
+      }
+    },
+    {
+      "rule": "approvalAllowed",
+      "input": {
+        "actor": "agent",
+        "candidate_id": "fab0000000000000000000000000000b",
+        "reviewed_candidate_id": "fab0000000000000000000000000000b",
+        "base_id": "fab0000000000000000000000000000c",
+        "reviewed_base_id": "fab0000000000000000000000000000c",
+        "code_inspection": "unavailable",
+        "code_reviewed": false,
+        "tests_result": "not_required",
+        "host_checks": "none",
+        "explanation": "The code could not be inspected. This approval does not review it."
+      },
+      "expect": {
+        "ok": false,
+        "code": "not_a_person",
+        "field": "actor",
+        "error": "Only a signed-in person can approve.",
+        "fix": "Ask a person who is allowed to approve.",
+        "then": "stop"
+      }
+    },
+    {
+      "rule": "approvalAllowed",
+      "input": {
+        "actor": "person",
+        "candidate_id": "fab0000000000000000000000000000b",
+        "reviewed_candidate_id": "fab0000000000000000000000000000b",
+        "base_id": "fab0000000000000000000000000000c",
+        "reviewed_base_id": "fab0000000000000000000000000000c",
+        "code_inspection": "unavailable",
+        "code_reviewed": true,
+        "tests_result": "not_required",
+        "host_checks": "none",
+        "explanation": "The code could not be inspected. This approval does not review it."
+      },
+      "expect": {
+        "ok": false,
+        "code": "false_code_review",
+        "field": "code_reviewed",
+        "error": "This approval would say the code was reviewed when it could not be inspected.",
+        "fix": "Leave code reviewed off, and say the code could not be inspected.",
+        "then": "stop"
+      }
+    },
+    {
+      "rule": "approvalAllowed",
+      "input": {
+        "actor": "person",
+        "candidate_id": "fab0000000000000000000000000000b",
+        "reviewed_candidate_id": "fab0000000000000000000000000000b",
+        "base_id": "fab0000000000000000000000000000c",
+        "reviewed_base_id": "fab0000000000000000000000000000c",
+        "code_inspection": "unavailable",
+        "code_reviewed": false,
+        "tests_result": "not_required",
+        "host_checks": "missing",
+        "explanation": "The code could not be inspected. This approval does not review it."
+      },
+      "expect": {
+        "ok": false,
+        "code": "host_missing",
+        "field": "host_checks",
+        "error": "Required host evidence is still missing.",
+        "fix": "Wait for the required host evidence before approval.",
+        "then": "stop"
+      }
+    },
+    {
+      "rule": "approvalAllowed",
+      "input": {
+        "actor": "person",
+        "candidate_id": "fab0000000000000000000000000000b",
+        "reviewed_candidate_id": "fab0000000000000000000000000000b",
+        "base_id": "fab0000000000000000000000000000c",
+        "reviewed_base_id": "fab0000000000000000000000000000c",
+        "code_inspection": "unavailable",
+        "code_reviewed": false,
+        "tests_result": "not_required",
+        "host_checks": "unknown",
+        "explanation": "The code could not be inspected. This approval does not review it."
+      },
+      "expect": {
+        "ok": false,
+        "code": "host_missing",
+        "field": "host_checks",
+        "error": "Required host evidence is still missing.",
+        "fix": "Wait for the required host evidence before approval.",
+        "then": "stop"
+      }
+    },
+    {
+      "rule": "approvalAllowed",
+      "input": {
+        "actor": "person",
+        "candidate_id": "fab0000000000000000000000000000b",
+        "reviewed_candidate_id": "fab0000000000000000000000000000b",
+        "base_id": "fab0000000000000000000000000000c",
+        "reviewed_base_id": "fab0000000000000000000000000000c",
+        "code_inspection": "unavailable",
+        "code_reviewed": false,
+        "tests_result": "failed",
+        "host_checks": "none",
+        "explanation": "The code could not be inspected. This approval does not review it."
+      },
+      "expect": {
+        "ok": false,
+        "code": "checks_unsatisfied",
+        "field": "tests_result",
+        "error": "The selected checks are not satisfied.",
+        "fix": "Wait until the selected checks pass, or until they are Not required.",
+        "then": "stop"
+      }
+    },
+    {
+      "rule": "approvalAllowed",
+      "input": {
+        "actor": "person",
+        "candidate_id": "fab0000000000000000000000000000b",
+        "reviewed_candidate_id": "fab0000000000000000000000000001d",
+        "base_id": "fab0000000000000000000000000000c",
+        "reviewed_base_id": "fab0000000000000000000000000000c",
+        "code_inspection": "unavailable",
+        "code_reviewed": false,
+        "tests_result": "not_required",
+        "host_checks": "none",
+        "explanation": "The code could not be inspected. This approval does not review it."
+      },
+      "expect": {
+        "ok": false,
+        "code": "stale_candidate",
+        "field": "candidate_id",
+        "error": "That evidence is for a different candidate, base, requirements or policy.",
+        "fix": "Send evidence for the current candidate, base, requirements and policy.",
+        "then": "stop"
+      }
+    }
+  ]
+}

@@ -1,0 +1,21 @@
+{
+  "protocolRevision": "waiting-on-t1",
+  "serverIntegration": false,
+  "origin": "https://fixture.ticketsplease.test",
+  "computer": "fixture-computer",
+  "challenge": {
+    "device_code": "fixture-device-code-not-shown",
+    "user_code": "ABCD-EFGH",
+    "verification_uri_complete": "https://fixture.ticketsplease.test/device?code=ABCD-EFGH",
+    "expires_in": 600,
+    "interval": 5
+  },
+  "polls": [
+    { "error": "authorization_pending" },
+    {
+      "key": "tp_fixture_key_not_a_real_grant",
+      "boardName": "Fixture Board",
+      "agentName": "Runner (fixture-computer)"
+    }
+  ]
+}

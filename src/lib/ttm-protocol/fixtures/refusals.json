@@ -1,0 +1,308 @@
+{
+  "name": "refusals",
+  "fabricated": true,
+  "shows": "Every refusal code has one fabricated envelope. A held repo never names the other board.",
+  "wire": [
+    {
+      "role": "refusal",
+      "document": {
+        "protocol": "tickets-to-main.coordination",
+        "version": 1,
+        "command": "protocol.hello",
+        "id": "fab00000000000000000000000000065",
+        "idempotency_key": null,
+        "error": "This program speaks a coordination version the server does not.",
+        "code": "unsupported_protocol",
+        "field": "client_version",
+        "fix": "Update Tickets to Main and try again.",
+        "then": "stop"
+      }
+    },
+    {
+      "role": "refusal",
+      "document": {
+        "protocol": "tickets-to-main.coordination",
+        "version": 1,
+        "command": "connection.status",
+        "id": "fab00000000000000000000000000066",
+        "idempotency_key": null,
+        "error": "This connection cannot do that.",
+        "code": "unauthorized",
+        "field": null,
+        "fix": "Use a connection a person approved for this board.",
+        "then": "stop"
+      }
+    },
+    {
+      "role": "refusal",
+      "document": {
+        "protocol": "tickets-to-main.coordination",
+        "version": 1,
+        "command": "repo.activation.read",
+        "id": "fab00000000000000000000000000067",
+        "idempotency_key": null,
+        "error": "Another board already coordinates this repo.",
+        "code": "repo_held",
+        "field": "repo",
+        "fix": "Use the board that already coordinates it, or turn coordination off there.",
+        "then": "stop"
+      }
+    },
+    {
+      "role": "refusal",
+      "document": {
+        "protocol": "tickets-to-main.coordination",
+        "version": 1,
+        "command": "reservation.decide",
+        "id": "fab00000000000000000000000000068",
+        "idempotency_key": "fab-refusal-rev",
+        "error": "That changed after you read it. Nothing was saved.",
+        "code": "changed_since",
+        "field": "expected_revision",
+        "fix": "Read it again and send the version you read.",
+        "then": "retry"
+      }
+    },
+    {
+      "role": "refusal",
+      "document": {
+        "protocol": "tickets-to-main.coordination",
+        "version": 1,
+        "command": "job.admit",
+        "id": "fab00000000000000000000000000069",
+        "idempotency_key": "fab-refusal-key",
+        "error": "That Idempotency-Key was already used for a different action.",
+        "code": "idempotency_conflict",
+        "field": "idempotency_key",
+        "fix": "Repeat the original action, or use a new key for a new one.",
+        "then": "stop"
+      }
+    },
+    {
+      "role": "refusal",
+      "document": {
+        "protocol": "tickets-to-main.coordination",
+        "version": 1,
+        "command": "evidence.record",
+        "id": "fab0000000000000000000000000006a",
+        "idempotency_key": "fab-refusal-stale",
+        "error": "That evidence is for a different candidate, base, requirements or policy.",
+        "code": "stale_candidate",
+        "field": "candidate_id",
+        "fix": "Send evidence for the current candidate, base, requirements and policy.",
+        "then": "stop"
+      }
+    },
+    {
+      "role": "refusal",
+      "document": {
+        "protocol": "tickets-to-main.coordination",
+        "version": 1,
+        "command": "reservation.decide",
+        "id": "fab0000000000000000000000000006b",
+        "idempotency_key": "fab-refusal-fence",
+        "error": "A newer fence owns that work.",
+        "code": "stale_writer",
+        "field": "executor",
+        "fix": "Read the current fence. A new writer waits until the old one has stopped or is isolated.",
+        "then": "reconcile"
+      }
+    },
+    {
+      "role": "refusal",
+      "document": {
+        "protocol": "tickets-to-main.coordination",
+        "version": 1,
+        "command": "reservation.decide",
+        "id": "fab0000000000000000000000000006c",
+        "idempotency_key": "fab-refusal-stop",
+        "error": "The writer is not stopped or isolated.",
+        "code": "not_stopped",
+        "field": "writers",
+        "fix": "Stop the writer or isolate it before releasing the lane. A lease expiry does not count.",
+        "then": "stop"
+      }
+    },
+    {
+      "role": "refusal",
+      "document": {
+        "protocol": "tickets-to-main.coordination",
+        "version": 1,
+        "command": "approval.submit",
+        "id": "fab0000000000000000000000000006d",
+        "idempotency_key": "fab-refusal-person",
+        "error": "Only a signed-in person can approve.",
+        "code": "not_a_person",
+        "field": "actor",
+        "fix": "Ask a person who is allowed to approve.",
+        "then": "stop"
+      }
+    },
+    {
+      "role": "refusal",
+      "document": {
+        "protocol": "tickets-to-main.coordination",
+        "version": 1,
+        "command": "approval.submit",
+        "id": "fab0000000000000000000000000006e",
+        "idempotency_key": "fab-refusal-code",
+        "error": "This approval would say the code was reviewed when it could not be inspected.",
+        "code": "false_code_review",
+        "field": "code_reviewed",
+        "fix": "Leave code reviewed off, and say the code could not be inspected.",
+        "then": "stop"
+      }
+    },
+    {
+      "role": "refusal",
+      "document": {
+        "protocol": "tickets-to-main.coordination",
+        "version": 1,
+        "command": "approval.submit",
+        "id": "fab0000000000000000000000000006f",
+        "idempotency_key": "fab-refusal-host",
+        "error": "Required host evidence is still missing.",
+        "code": "host_missing",
+        "field": "host_checks",
+        "fix": "Wait for the required host evidence before approval.",
+        "then": "stop"
+      }
+    },
+    {
+      "role": "refusal",
+      "document": {
+        "protocol": "tickets-to-main.coordination",
+        "version": 1,
+        "command": "approval.submit",
+        "id": "fab00000000000000000000000000070",
+        "idempotency_key": "fab-refusal-checks",
+        "error": "The selected checks are not satisfied.",
+        "code": "checks_unsatisfied",
+        "field": "tests_result",
+        "fix": "Wait until the selected checks pass, or until they are Not required.",
+        "then": "stop"
+      }
+    },
+    {
+      "role": "refusal",
+      "document": {
+        "protocol": "tickets-to-main.coordination",
+        "version": 1,
+        "command": "metrics.aggregate",
+        "id": "fab00000000000000000000000000071",
+        "idempotency_key": "fab-refusal-private",
+        "error": "That total includes a private identifier.",
+        "code": "forbidden_identifier",
+        "field": "totals",
+        "fix": "Send only the anonymous total, with no person, board, ticket or address.",
+        "then": "stop"
+      }
+    },
+    {
+      "role": "refusal",
+      "document": {
+        "protocol": "tickets-to-main.coordination",
+        "version": 1,
+        "command": "metrics.aggregate",
+        "id": "fab00000000000000000000000000072",
+        "idempotency_key": "fab-refusal-unknown",
+        "error": "Unknown usage has to stay unknown.",
+        "code": "unknown_amount",
+        "field": "amount",
+        "fix": "Send a null amount for unknown usage. Do not send zero in its place.",
+        "then": "stop"
+      }
+    },
+    {
+      "role": "refusal",
+      "document": {
+        "protocol": "tickets-to-main.coordination",
+        "version": 1,
+        "command": "metrics.aggregate",
+        "id": "fab00000000000000000000000000073",
+        "idempotency_key": "fab-refusal-twice",
+        "error": "That usage was already counted.",
+        "code": "metric_conflict",
+        "field": "amount",
+        "fix": "Repeat the same amount under the same label, or leave unknown usage unknown. Do not add it twice.",
+        "then": "stop"
+      }
+    },
+    {
+      "role": "refusal",
+      "document": {
+        "protocol": "tickets-to-main.coordination",
+        "version": 1,
+        "command": "completion.record",
+        "id": "fab00000000000000000000000000074",
+        "idempotency_key": "fab-refusal-close",
+        "error": "The ticket cannot close before its completion evidence is satisfied.",
+        "code": "completion_open",
+        "field": "closed",
+        "fix": "Record the integration without closing the ticket, and wait for the configured completion evidence.",
+        "then": "stop"
+      }
+    },
+    {
+      "role": "refusal",
+      "document": {
+        "protocol": "tickets-to-main.coordination",
+        "version": 1,
+        "command": "reservation.decide",
+        "id": "fab00000000000000000000000000075",
+        "idempotency_key": "fab-refusal-lane",
+        "error": "Every lane for this repo is in use.",
+        "code": "lane_full",
+        "field": "lane_id",
+        "fix": "Wait for a lane. Admission stays queued and takes no lane.",
+        "then": "stop"
+      }
+    },
+    {
+      "role": "refusal",
+      "document": {
+        "protocol": "tickets-to-main.coordination",
+        "version": 1,
+        "command": "protocol.hello",
+        "id": "fab00000000000000000000000000076",
+        "idempotency_key": null,
+        "error": "That coordination message is not valid.",
+        "code": "invalid",
+        "field": null,
+        "fix": "Send the version 1 message for this command.",
+        "then": "stop"
+      }
+    },
+    {
+      "role": "refusal",
+      "document": {
+        "protocol": "tickets-to-main.coordination",
+        "version": 1,
+        "command": "connection.status",
+        "id": "fab00000000000000000000000000077",
+        "idempotency_key": null,
+        "error": "This coordination command is not served yet.",
+        "code": "not_served",
+        "field": null,
+        "fix": "Use the contract. The server does not answer this command yet.",
+        "then": "stop"
+      }
+    },
+    {
+      "role": "refusal",
+      "document": {
+        "protocol": "tickets-to-main.coordination",
+        "version": 1,
+        "command": "job.admit",
+        "id": "fab00000000000000000000000000078",
+        "idempotency_key": "fab-already-1",
+        "error": "That work is already queued.",
+        "code": "already_admitted",
+        "field": "members",
+        "fix": "Use the existing job. Do not admit it again.",
+        "then": "stop"
+      }
+    }
+  ],
+  "cases": []
+}

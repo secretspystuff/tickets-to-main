@@ -1,0 +1,89 @@
+{
+  "name": "hello",
+  "fabricated": true,
+  "shows": "Version 1 is accepted and says the server is not served. Any other version is refused.",
+  "wire": [
+    {
+      "role": "request",
+      "document": {
+        "protocol": "tickets-to-main.coordination",
+        "version": 1,
+        "command": "protocol.hello",
+        "id": "fab00000000000000000000000000001",
+        "idempotency_key": null,
+        "body": {
+          "client_version": 1
+        }
+      }
+    },
+    {
+      "role": "response",
+      "document": {
+        "protocol": "tickets-to-main.coordination",
+        "version": 1,
+        "command": "protocol.hello",
+        "id": "fab00000000000000000000000000001",
+        "idempotency_key": null,
+        "body": {
+          "accepted_version": 1,
+          "runtime": "not-served"
+        }
+      }
+    },
+    {
+      "role": "refusal",
+      "document": {
+        "protocol": "tickets-to-main.coordination",
+        "version": 1,
+        "command": "protocol.hello",
+        "id": "fab00000000000000000000000000002",
+        "idempotency_key": null,
+        "error": "This program speaks a coordination version the server does not.",
+        "code": "unsupported_protocol",
+        "field": "client_version",
+        "fix": "Update Tickets to Main and try again.",
+        "then": "stop"
+      }
+    }
+  ],
+  "cases": [
+    {
+      "rule": "negotiate",
+      "input": {
+        "client_version": 1
+      },
+      "expect": {
+        "ok": true,
+        "accepted_version": 1
+      }
+    },
+    {
+      "rule": "negotiate",
+      "input": {
+        "client_version": 2
+      },
+      "expect": {
+        "ok": false,
+        "code": "unsupported_protocol",
+        "field": "client_version",
+        "error": "This program speaks a coordination version the server does not.",
+        "fix": "Update Tickets to Main and try again.",
+        "then": "stop"
+      }
+    },
+    {
+      "rule": "negotiate",
+      "input": {
+        "client_version": 0
+      },
+      "expect": {
+        "ok": false,
+        "code": "unsupported_protocol",
+        "field": "client_version",
+        "error": "This program speaks a coordination version the server does not.",
+        "fix": "Update Tickets to Main and try again.",
+        "then": "stop"
+      }
+    }
+  ]
+}

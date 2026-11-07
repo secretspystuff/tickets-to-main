@@ -1,0 +1,270 @@
+{
+  "protocol": "tickets-to-main.coordination",
+  "version": 1,
+  "runtime": "not-served",
+  "no_runtime_readiness_claim": true,
+  "served": [],
+  "sharing": "Public contract and authorized fabricated fixtures. No private source, credentials or customer evidence.",
+  "connection": "Starts after the existing human-approved program connection. This protocol does not define a new sign-in.",
+  "entry": "src/lib/ttm-protocol.ts",
+  "fixtures_dir": "src/lib/ttm-protocol/fixtures",
+  "commands": {
+    "protocol.hello": {
+      "effect": "read",
+      "group": "public-contract",
+      "served": false
+    },
+    "connection.status": {
+      "effect": "read",
+      "group": "connection-settings",
+      "served": false
+    },
+    "repo.activation.read": {
+      "effect": "read",
+      "group": "connection-settings",
+      "served": false
+    },
+    "settings.effective.read": {
+      "effect": "read",
+      "group": "connection-settings",
+      "served": false
+    },
+    "job.admit": {
+      "effect": "write",
+      "group": "admission-reservations",
+      "served": false
+    },
+    "reservation.decide": {
+      "effect": "write",
+      "group": "admission-reservations",
+      "served": false
+    },
+    "evidence.record": {
+      "effect": "write",
+      "group": "candidate-approval-completion",
+      "served": false
+    },
+    "approval.submit": {
+      "effect": "write",
+      "group": "candidate-approval-completion",
+      "served": false
+    },
+    "completion.record": {
+      "effect": "write",
+      "group": "candidate-approval-completion",
+      "served": false
+    },
+    "authority.revoke": {
+      "effect": "write",
+      "group": "candidate-approval-completion",
+      "served": false
+    },
+    "metrics.aggregate": {
+      "effect": "write",
+      "group": "candidate-approval-completion",
+      "served": false
+    }
+  },
+  "groups": [
+    "public-contract",
+    "connection-settings",
+    "admission-reservations",
+    "candidate-approval-completion"
+  ],
+  "refusal_codes": [
+    "unsupported_protocol",
+    "unauthorized",
+    "repo_held",
+    "changed_since",
+    "idempotency_conflict",
+    "stale_candidate",
+    "stale_writer",
+    "not_stopped",
+    "not_a_person",
+    "false_code_review",
+    "host_missing",
+    "checks_unsatisfied",
+    "forbidden_identifier",
+    "unknown_amount",
+    "metric_conflict",
+    "completion_open",
+    "lane_full",
+    "invalid",
+    "already_admitted",
+    "not_served"
+  ],
+  "refusals": {
+    "unsupported_protocol": {
+      "error": "This program speaks a coordination version the server does not.",
+      "fix": "Update Tickets to Main and try again.",
+      "then": "stop"
+    },
+    "unauthorized": {
+      "error": "This connection cannot do that.",
+      "fix": "Use a connection a person approved for this board.",
+      "then": "stop"
+    },
+    "repo_held": {
+      "error": "Another board already coordinates this repo.",
+      "fix": "Use the board that already coordinates it, or turn coordination off there.",
+      "then": "stop"
+    },
+    "changed_since": {
+      "error": "That changed after you read it. Nothing was saved.",
+      "fix": "Read it again and send the version you read.",
+      "then": "retry"
+    },
+    "idempotency_conflict": {
+      "error": "That Idempotency-Key was already used for a different action.",
+      "fix": "Repeat the original action, or use a new key for a new one.",
+      "then": "stop"
+    },
+    "stale_candidate": {
+      "error": "That evidence is for a different candidate, base, requirements or policy.",
+      "fix": "Send evidence for the current candidate, base, requirements and policy.",
+      "then": "stop"
+    },
+    "stale_writer": {
+      "error": "A newer fence owns that work.",
+      "fix": "Read the current fence. A new writer waits until the old one has stopped or is isolated.",
+      "then": "reconcile"
+    },
+    "not_stopped": {
+      "error": "The writer is not stopped or isolated.",
+      "fix": "Stop the writer or isolate it before releasing the lane. A lease expiry does not count.",
+      "then": "stop"
+    },
+    "not_a_person": {
+      "error": "Only a signed-in person can approve.",
+      "fix": "Ask a person who is allowed to approve.",
+      "then": "stop"
+    },
+    "false_code_review": {
+      "error": "This approval would say the code was reviewed when it could not be inspected.",
+      "fix": "Leave code reviewed off, and say the code could not be inspected.",
+      "then": "stop"
+    },
+    "host_missing": {
+      "error": "Required host evidence is still missing.",
+      "fix": "Wait for the required host evidence before approval.",
+      "then": "stop"
+    },
+    "checks_unsatisfied": {
+      "error": "The selected checks are not satisfied.",
+      "fix": "Wait until the selected checks pass, or until they are Not required.",
+      "then": "stop"
+    },
+    "forbidden_identifier": {
+      "error": "That total includes a private identifier.",
+      "fix": "Send only the anonymous total, with no person, board, ticket or address.",
+      "then": "stop"
+    },
+    "unknown_amount": {
+      "error": "Unknown usage has to stay unknown.",
+      "fix": "Send a null amount for unknown usage. Do not send zero in its place.",
+      "then": "stop"
+    },
+    "metric_conflict": {
+      "error": "That usage was already counted.",
+      "fix": "Repeat the same amount under the same label, or leave unknown usage unknown. Do not add it twice.",
+      "then": "stop"
+    },
+    "completion_open": {
+      "error": "The ticket cannot close before its completion evidence is satisfied.",
+      "fix": "Record the integration without closing the ticket, and wait for the configured completion evidence.",
+      "then": "stop"
+    },
+    "lane_full": {
+      "error": "Every lane for this repo is in use.",
+      "fix": "Wait for a lane. Admission stays queued and takes no lane.",
+      "then": "stop"
+    },
+    "invalid": {
+      "error": "That coordination message is not valid.",
+      "fix": "Send the version 1 message for this command.",
+      "then": "stop"
+    },
+    "already_admitted": {
+      "error": "That work is already queued.",
+      "fix": "Use the existing job. Do not admit it again.",
+      "then": "stop"
+    },
+    "not_served": {
+      "error": "This coordination command is not served yet.",
+      "fix": "Use the contract. The server does not answer this command yet.",
+      "then": "stop"
+    }
+  },
+  "steps": [
+    "triage",
+    "plan",
+    "build",
+    "tests",
+    "main"
+  ],
+  "check_results": [
+    "passed",
+    "failed",
+    "running",
+    "unavailable",
+    "not_required"
+  ],
+  "metrics": [
+    "ttm.runs",
+    "ttm.results",
+    "ttm.tokens",
+    "ttm.cost",
+    "ttm.fallbacks"
+  ],
+  "metric_labels": {
+    "ttm.runs": [
+      "triage",
+      "plan",
+      "build",
+      "tests",
+      "main"
+    ],
+    "ttm.results": [
+      "passed",
+      "failed"
+    ],
+    "ttm.tokens": [
+      "known",
+      "unknown"
+    ],
+    "ttm.cost": [
+      "known",
+      "unknown"
+    ],
+    "ttm.fallbacks": [
+      "used",
+      "not_used"
+    ]
+  },
+  "cost_unit": "micro-usd",
+  "limits": {
+    "delay_minutes_default": 10,
+    "lanes_min": 1,
+    "lanes_max": 5,
+    "lanes_default": 1,
+    "members_max": 20,
+    "explanation_max": 240,
+    "label_max": 80,
+    "totals_max": 40
+  },
+  "fixtures": [
+    "hello.json",
+    "connection-status.json",
+    "repo-activation.json",
+    "settings-effective.json",
+    "admission.json",
+    "reservation.json",
+    "fence.json",
+    "evidence.json",
+    "approval.json",
+    "completion.json",
+    "revocation.json",
+    "metrics.json",
+    "refusals.json"
+  ]
+}

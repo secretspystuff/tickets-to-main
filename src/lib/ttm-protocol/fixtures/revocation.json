@@ -1,0 +1,38 @@
+{
+  "name": "revocation",
+  "fabricated": true,
+  "shows": "Revocation refuses new server actions. It does not claim the process stopped, and in-flight work stays uncertain until it is reconciled.",
+  "wire": [
+    {
+      "role": "request",
+      "document": {
+        "protocol": "tickets-to-main.coordination",
+        "version": 1,
+        "command": "authority.revoke",
+        "id": "fab00000000000000000000000000050",
+        "idempotency_key": "fab-revoke-1",
+        "body": {
+          "connection_id": "fab00000000000000000000000000004",
+          "expected_revision": 2
+        }
+      }
+    },
+    {
+      "role": "response",
+      "document": {
+        "protocol": "tickets-to-main.coordination",
+        "version": 1,
+        "command": "authority.revoke",
+        "id": "fab00000000000000000000000000050",
+        "idempotency_key": "fab-revoke-1",
+        "body": {
+          "connection_id": "fab00000000000000000000000000004",
+          "further_server_actions": "refused",
+          "process_stopped": false,
+          "in_flight": "uncertain"
+        }
+      }
+    }
+  ],
+  "cases": []
+}
