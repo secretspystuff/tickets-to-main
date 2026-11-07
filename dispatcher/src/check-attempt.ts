@@ -1,5 +1,6 @@
 import { closeSync, fsyncSync, mkdirSync, openSync, realpathSync, rmdirSync } from "node:fs";
-import { isAbsolute, join, resolve, sep } from "node:path";
+import { createHash } from "node:crypto";
+import { isAbsolute, join, sep } from "node:path";
 import { canonical, evidenceBinds, selectedGateSatisfied } from "../../src/lib/ttm-protocol.ts";
 import type { CommandRunner } from "./command.ts";
 import { assertPrivateDirectory } from "./fs-safety.ts";
@@ -98,11 +99,28 @@ async function currentBoundary(input: CheckAttemptInput, captured: CurrentCheckS
   }
 }
 
-async function candidateUnchanged(input: CheckAttemptInput, workspace: string, snapshot: CurrentCheckSnapshot): Promise<boolean> {
-  const run = async (args: string[]) => input.gitRunner.run(["git", "-c", "core.fsmonitor=false", "-c", "core.untrackedCache=false", ...args], {
+async function gitRead(input: CheckAttemptInput, workspace: string, args: string[]) {
+  return input.gitRunner.run(["git", "-c", "core.fsmonitor=false", "-c", "core.untrackedCache=false", ...args], {
     cwd: workspace, timeoutMs: 30000,
     env: { PATH: process.env.PATH ?? "", GIT_CONFIG_NOSYSTEM: "1", GIT_CONFIG_GLOBAL: process.platform === "win32" ? "NUL" : "/dev/null", GIT_OPTIONAL_LOCKS: "0", GIT_TERMINAL_PROMPT: "0" },
   });
+}
+
+async function workspaceEffectLock(input: CheckAttemptInput, workspace: string): Promise<string | null> {
+  try {
+    const top = await gitRead(input, workspace, ["rev-parse", "--show-toplevel"]);
+    if (top.error || top.code !== 0 || realpathSync(top.stdout.trim()) !== workspace) return null;
+    const directory = await gitRead(input, workspace, ["rev-parse", "--absolute-git-dir"]);
+    if (directory.error || directory.code !== 0 || !isAbsolute(directory.stdout.trim())) return null;
+    const identity = createHash("sha256").update(workspace).digest("hex");
+    return join(realpathSync(directory.stdout.trim()), `tickets-to-main-check-${identity}.lock`);
+  } catch {
+    return null;
+  }
+}
+
+async function candidateUnchanged(input: CheckAttemptInput, workspace: string, snapshot: CurrentCheckSnapshot): Promise<boolean> {
+  const run = (args: string[]) => gitRead(input, workspace, args);
   try {
     const top = await run(["rev-parse", "--show-toplevel"]);
     if (top.error || top.code !== 0 || realpathSync(top.stdout.trim()) !== workspace) return false;
@@ -209,9 +227,11 @@ export async function runCheckAttempt(input: CheckAttemptInput): Promise<CheckAt
   } catch {
     return outcome("unavailable");
   }
-  const lock = join(resolve(input.stateDir), "check-attempt.lock");
+  const lock = await workspaceEffectLock(input, workspace);
+  if (lock === null) return outcome("unavailable");
   try { mkdirSync(lock, { mode: 0o700 }); } catch { return outcome("held"); }
   let record: CheckAttemptRecord | null = null;
+  let containment: "not-started" | "unknown" | "observed-contained" = "not-started";
   try {
     const loaded = loadLedger(input.stateDir);
     if (!loaded.ok || !loaded.ledger.install) return outcome("unavailable");
@@ -247,6 +267,7 @@ export async function runCheckAttempt(input: CheckAttemptInput): Promise<CheckAt
       record.checks[index] = { ...check, state: "running", publicResult: "running" };
       flushRecord(input, record);
       let observed: CheckDetail;
+      containment = "unknown";
       try {
         observed = observedCheck(input, request, check, await input.executor.execute({
           attemptId: request.attemptId, checkId: selected.id, argv: [...selected.argv], cwd: workspace,
@@ -255,6 +276,7 @@ export async function runCheckAttempt(input: CheckAttemptInput): Promise<CheckAt
       } catch {
         observed = { ...check, state: "unavailable", publicResult: "unavailable" };
       }
+      if (observed.terminal?.writerCustody === "contained") containment = "observed-contained";
       const after = await currentBoundary(input, request.snapshot);
       const unchanged = await candidateUnchanged(input, workspace, request.snapshot);
       record.checks[index] = observed;
@@ -278,6 +300,9 @@ export async function runCheckAttempt(input: CheckAttemptInput): Promise<CheckAt
   } catch {
     return outcome("unavailable");
   } finally {
-    try { rmdirSync(lock); } catch { /* An unreleased lock keeps the next attempt held. */ }
+    // Returning a result cannot establish that an unobserved writer or helper has stopped.
+    if (containment !== "unknown") {
+      try { rmdirSync(lock); } catch { /* Failed cleanup must not make uncertain ownership look free. */ }
+    }
   }
 }
