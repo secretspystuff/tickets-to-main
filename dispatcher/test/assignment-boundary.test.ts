@@ -1,0 +1,389 @@
+import assert from "node:assert/strict";
+import { test, type TestContext } from "node:test";
+import fs, { mkdtempSync, mkdirSync, readFileSync, writeFileSync, chmodSync, rmSync, symlinkSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { spawn, spawnSync } from "node:child_process";
+import { syncBuiltinESMExports } from "node:module";
+import { createHash } from "node:crypto";
+import { fileURLToPath } from "node:url";
+import { runAssignment, type AssignmentRequest, type CurrentAssignment, type AssignmentTerminal } from "../src/assignment-boundary.ts";
+
+const id = (n: number) => n.toString(16).padStart(32, "0");
+function canonical(value: unknown): string {
+  if (value !== null && typeof value === "object" && !Array.isArray(value)) {
+    return "{" + Object.keys(value).sort().map((key) => JSON.stringify(key) + ":" + canonical((value as Record<string, unknown>)[key])).join(",") + "}";
+  }
+  return JSON.stringify(value);
+}
+function fixture(t: TestContext) {
+  const root = mkdtempSync(join(tmpdir(), "assignment-boundary-"));
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  const stateDir = join(root, "state");
+  const workspace = join(root, "workspace");
+  mkdirSync(stateDir, { mode: 0o700 }); mkdirSync(workspace);
+  const request: AssignmentRequest = {
+    version: 1, id: id(1), sequence: 1, operation: "native.assign", input: "Fabricated task data",
+    binding: { board: id(2), repo: id(3), activation: id(4), connection: id(5), job: id(6), claim: id(7), requirements: id(8), candidate: id(9), policy: id(10), fence: 1 },
+  };
+  const current: CurrentAssignment = { binding: structuredClone(request.binding), nextSequence: 1, authorized: true, seat: "member", confirmedWorkspace: workspace, writersContained: true };
+  const calls: unknown[] = [];
+  let reads = 0;
+  let now = 1000;
+  let effects = async (value: unknown): Promise<AssignmentTerminal> => { calls.push(value); return terminal(); };
+  let reconcile = async (): Promise<AssignmentTerminal | null> => null;
+  let observe = () => structuredClone(current);
+  let kind = "fabricated-harness";
+  const terminal = (): AssignmentTerminal => ({ id: request.id, sequence: request.sequence, result: "completed", writersContained: true });
+  const run = (raw = JSON.stringify(request)) => runAssignment({
+    stateDir, raw, secrets: ["fabricated-held-secret"], now: () => now,
+    adapter: { kind: kind as "fabricated-harness", readCurrent: async () => { reads++; return observe(); }, execute: (value) => effects(value), reconcile: () => reconcile() },
+  });
+  return { root, stateDir, workspace, request, current, calls, run, terminal,
+    get reads() { return reads; },
+    set now(value: number) { now = value; },
+    set kind(value: string) { kind = value; },
+    set effects(value: typeof effects) { effects = value; },
+    set reconcile(value: typeof reconcile) { reconcile = value; },
+    set observe(value: typeof observe) { observe = value; },
+    journal: () => readFileSync(join(stateDir, "assignment-intents.jsonl"), "utf8"),
+  };
+}
+
+function journalFlush(t: TestContext, stateDir: string, observe: () => void) {
+  const original = fs.fsyncSync;
+  fs.fsyncSync = (fd: number) => {
+    const path = join(stateDir, "assignment-intents.jsonl");
+    if (fs.existsSync(path) && fs.fstatSync(fd).ino === fs.lstatSync(path).ino) observe();
+    original(fd);
+  };
+  syncBuiltinESMExports();
+  t.after(() => { fs.fsyncSync = original; syncBuiltinESMExports(); });
+}
+
+test("flush intent before dispatch; persist only identifiers and digests, never assignment text", async (t) => {
+  const f = fixture(t);
+  let flushed = false;
+  journalFlush(t, f.stateDir, () => { flushed = true; });
+  f.effects = async (value) => {
+    assert.equal(flushed, true, "the intent file must be flushed before dispatch");
+    f.calls.push(value);
+    const journal = f.journal();
+    const intent = JSON.parse(journal.trim());
+    assert.equal(intent.kind, "intent");
+    assert.equal(intent.id, f.request.id);
+    assert.equal(intent.sequence, 1);
+    assert.match(intent.requestDigest, /^[a-f0-9]{64}$/);
+    assert.equal(intent.requestDigest, createHash("sha256").update(canonical(f.request)).digest("hex"));
+    assert.equal(journal.includes(f.request.input), false);
+    return f.terminal();
+  };
+  assert.equal((await f.run()).state, "completed");
+  assert.equal(f.calls.length, 1);
+  assert.deepEqual(Object.keys(f.calls[0] as object).sort(), ["id", "input", "sequence", "workspace"]);
+  assert.equal((f.calls[0] as { workspace: string }).workspace, f.workspace);
+  assert.equal(f.journal().trim().split("\n").length, 2);
+  const [intent, result] = f.journal().trim().split("\n").map((line) => JSON.parse(line));
+  assert.equal(result.id, intent.id);
+  assert.equal(result.requestDigest, intent.requestDigest);
+  assert.equal(result.sequence, intent.sequence);
+  assert.ok(f.reads >= 3);
+  const before = f.journal();
+  await f.run();
+  assert.equal(f.journal(), before);
+});
+
+for (const field of ["board", "repo", "activation", "connection", "job", "claim", "requirements", "candidate", "policy", "fence"] as const) {
+  test(`forged or stale ${field} never dispatches`, async (t) => {
+    const f = fixture(t);
+    if (field === "fence") f.current.binding.fence++;
+    else f.current.binding[field] = id(99);
+    assert.equal((await f.run()).state, "held");
+    assert.equal(f.calls.length, 0);
+  });
+}
+
+test("viewer, revoked consent and uncontained writers cannot execute or replay success", async (t) => {
+  for (const change of [(s: CurrentAssignment) => { s.seat = "viewer"; }, (s: CurrentAssignment) => { s.authorized = false; }, (s: CurrentAssignment) => { s.writersContained = false; }]) {
+    const f = fixture(t);
+    assert.equal((await f.run()).state, "completed");
+    change(f.current);
+    assert.equal((await f.run()).state, "held");
+    assert.equal(f.calls.length, 1);
+  }
+});
+
+test("duplicate delivery returns the recorded result; changed body and out-of-order sequence refuse", async (t) => {
+  const f = fixture(t);
+  assert.equal((await f.run()).state, "completed");
+  assert.equal((await f.run()).state, "completed");
+  f.request.input = "Changed payload";
+  assert.equal((await f.run()).state, "held");
+  f.request.id = id(11); f.request.sequence = 3;
+  assert.equal((await f.run()).state, "held");
+  f.request.sequence = 1;
+  assert.equal((await f.run()).state, "held");
+  assert.equal(f.calls.length, 1);
+});
+
+test("ticket content cannot select a command, argv, cwd, executable or path", async (t) => {
+  const f = fixture(t);
+  for (const field of ["command", "argv", "cwd", "executable", "path"]) {
+    assert.equal((await f.run(JSON.stringify({ ...f.request, [field]: "../../outside" }))).state, "refused");
+  }
+  f.request.operation = "shell.exec" as AssignmentRequest["operation"];
+  assert.equal((await f.run()).state, "refused");
+  assert.equal(f.calls.length, 0);
+});
+
+test("malformed, oversized, deep, secret-bearing and extra-key input refuses before authority lookup", async (t) => {
+  const f = fixture(t);
+  for (const raw of ["{", "null", "[]", "[".repeat(40000), JSON.stringify(f.request) + " ".repeat(32769), JSON.stringify({ ...f.request, input: "😀".repeat(5000) }), JSON.stringify({ ...f.request, extra: JSON.parse("[".repeat(40) + "0" + "]".repeat(40)) }), JSON.stringify({ ...f.request, input: "x".repeat(32769) }), JSON.stringify({ ...f.request, input: "fabricated-held-secret" }), JSON.stringify({ ...f.request, binding: { ...f.request.binding, authorized: true } }), JSON.stringify({ ...f.request, sequence: 1.5 })]) {
+    assert.equal((await f.run(raw)).state, "refused");
+  }
+  assert.equal(f.reads, 0);
+  assert.equal(f.calls.length, 0);
+});
+
+test("state nesting, missing and relative workspace mappings never reach the effect port", async (t) => {
+  const f = fixture(t);
+  for (const path of [f.stateDir, f.root, join(f.stateDir, "nested"), "../elsewhere", join(f.root, "missing")]) {
+    f.current.confirmedWorkspace = path;
+    assert.equal((await f.run()).state, "held");
+  }
+  assert.equal(f.calls.length, 0);
+});
+
+test("authority changes after intent and after effect do not publish success", async (t) => {
+  for (const at of [2, 3]) {
+    const f = fixture(t);
+    f.observe = () => { if (f.reads === at) f.current.binding.fence++; return structuredClone(f.current); };
+    assert.equal((await f.run()).state, "held");
+    assert.equal(f.calls.length, at === 2 ? 0 : 1);
+    assert.equal(f.journal().trim().split("\n").length, 1);
+  }
+});
+
+test("overlapping duplicate and next assignments cannot launch a second writer", async (t) => {
+  const f = fixture(t);
+  let unblock!: () => void;
+  const wait = new Promise<void>((resolve) => { unblock = resolve; });
+  let started!: () => void;
+  const entered = new Promise<void>((resolve) => { started = resolve; });
+  f.effects = async (value) => { f.calls.push(value); started(); await wait; return f.terminal(); };
+  const first = f.run(); await entered;
+  assert.equal((await f.run()).state, "held");
+  f.current.nextSequence = 2;
+  assert.equal((await f.run(JSON.stringify({ ...f.request, id: id(11), sequence: 2 }))).state, "held");
+  f.current.nextSequence = 1;
+  unblock(); assert.equal((await first).state, "completed");
+  assert.equal(f.calls.length, 1);
+});
+
+test("missing, foreign or uncontained terminal evidence stays uncertain and never reruns", async (t) => {
+  for (const terminal of [null, { id: id(99), sequence: 1, result: "completed", writersContained: true }, { id: id(1), sequence: 2, result: "completed", writersContained: true }, { id: id(1), sequence: 1, result: "completed", writersContained: false }]) {
+    const f = fixture(t);
+    f.effects = async (value) => { f.calls.push(value); return terminal as AssignmentTerminal; };
+    assert.equal((await f.run()).state, "held");
+    assert.equal((await f.run()).state, "held");
+    assert.equal(f.calls.length, 1);
+  }
+});
+
+test("uncertain outcomes reconcile read-only, including beyond reply retention", async (t) => {
+  const f = fixture(t);
+  f.effects = async (value) => { f.calls.push(value); throw new Error("fabricated-held-secret"); };
+  assert.equal((await f.run()).state, "held");
+  f.now = 1000 + 25 * 60 * 60 * 1000;
+  assert.equal((await f.run()).state, "held");
+  assert.equal(f.calls.length, 1);
+  f.reconcile = async () => f.terminal();
+  assert.equal((await f.run()).state, "completed");
+  assert.equal(f.calls.length, 1);
+  assert.equal(f.journal().includes("fabricated-held-secret"), false);
+});
+
+test("an unresolved assignment holds a valid next one; a contained result releases it without rewriting history", async (t) => {
+  const f = fixture(t);
+  f.effects = async (value) => { f.calls.push(value); throw new Error("uncertain"); };
+  await f.run();
+  const first = JSON.stringify(f.request);
+  const originalTerminal = f.terminal();
+  f.request.id = id(11); f.request.sequence = 2; f.current.nextSequence = 2;
+  assert.equal((await f.run()).state, "held");
+  assert.equal(f.calls.length, 1);
+  f.current.nextSequence = 1;
+  f.reconcile = async () => originalTerminal;
+  assert.equal((await f.run(first)).state, "completed");
+  const before = f.journal();
+  f.current.nextSequence = 2;
+  f.effects = async (value) => { f.calls.push(value); return f.terminal(); };
+  assert.equal((await f.run()).state, "completed");
+  assert.equal(f.calls.length, 2);
+  assert.ok(f.journal().startsWith(before));
+});
+
+test("a new valid assignment after a real controller crash cannot bypass unresolved work", async (t) => {
+  const f = fixture(t);
+  const child = spawnSync(process.execPath, [fileURLToPath(new URL("./assignment-crash-fixture.ts", import.meta.url)), f.stateDir, JSON.stringify(f.request), JSON.stringify(f.current)], { encoding: "utf8" });
+  assert.equal(child.status, 73, child.stderr);
+  f.request.id = id(11); f.request.sequence = 2; f.current.nextSequence = 2;
+  assert.equal((await f.run()).state, "held");
+  assert.equal(f.calls.length, 0);
+});
+
+test("a controller paused after reading an empty journal cannot overwrite a competing admission", async (t) => {
+  const f = fixture(t);
+  const path = join(f.stateDir, "assignment-intents.jsonl");
+  writeFileSync(path, "", { mode: 0o600 });
+  const marker = join(f.root, "effects");
+  const release = join(f.root, "release");
+  const child = spawn(process.execPath, [fileURLToPath(new URL("./assignment-race-fixture.ts", import.meta.url)), f.stateDir, JSON.stringify(f.request), JSON.stringify(f.current), marker, release], { stdio: ["ignore", "pipe", "pipe"] });
+  const done = new Promise<number | null>((resolve, reject) => { child.once("exit", resolve); child.once("error", reject); });
+  await new Promise<void>((resolve) => child.stdout.once("data", () => resolve()));
+  const other = spawnSync(process.execPath, [fileURLToPath(new URL("./assignment-crash-fixture.ts", import.meta.url)), f.stateDir, JSON.stringify(f.request), JSON.stringify(f.current)], { encoding: "utf8" });
+  writeFileSync(release, "go");
+  const firstCode = await done;
+  assert.equal([firstCode, other.status].filter((code) => code === 73).length, 1);
+  assert.equal(f.journal().trim().split("\n").length, 1);
+});
+
+test("reconciliation rechecks authority and workspace after the read-only observation", async (t) => {
+  const bindingChanges = ["board", "repo", "activation", "connection", "job", "claim", "requirements", "candidate", "policy"] as const;
+  for (const change of [(s: CurrentAssignment) => { s.authorized = false; }, (s: CurrentAssignment) => { s.seat = "viewer"; }, (s: CurrentAssignment) => { s.binding.fence++; }, (s: CurrentAssignment) => { s.confirmedWorkspace = "/changed"; }, ...bindingChanges.map((key) => (s: CurrentAssignment) => { s.binding[key] = id(99); })]) {
+    const f = fixture(t);
+    f.effects = async () => { throw new Error("uncertain"); };
+    assert.equal((await f.run()).state, "held");
+    f.reconcile = async () => { change(f.current); return f.terminal(); };
+    assert.equal((await f.run()).state, "held");
+    assert.equal(f.journal().trim().split("\n").length, 1);
+  }
+});
+
+test("foreign, malformed and uncontained reconciliation leaves the intent unresolved", async (t) => {
+  for (const terminal of [null, {}, { id: id(99), sequence: 1, result: "completed", writersContained: true }, { id: id(1), sequence: 2, result: "completed", writersContained: true }, { id: id(1), sequence: 1, result: "completed", writersContained: false }]) {
+    const f = fixture(t);
+    f.effects = async () => { throw new Error("uncertain"); };
+    await f.run();
+    f.reconcile = async () => terminal as AssignmentTerminal;
+    assert.equal((await f.run()).state, "held");
+    assert.equal(f.journal().trim().split("\n").length, 1);
+  }
+});
+
+test("intent and result flush failures never acknowledge unflushed success or repeat execution", async (t) => {
+  for (const phase of ["intent", "result"]) {
+    await t.test(phase, async (sub) => {
+      const f = fixture(sub);
+      journalFlush(sub, f.stateDir, () => { if (f.journal().includes(`"kind":"${phase}"`)) throw new Error("disk flush failed"); });
+      assert.equal((await f.run()).state, "held");
+      assert.equal(f.calls.length, phase === "intent" ? 0 : 1);
+      assert.equal((await f.run()).state, "held");
+      assert.equal(f.calls.length, phase === "intent" ? 0 : 1);
+    });
+  }
+});
+
+test("symlinked workspace and journal never redirect writes or effects", async (t) => {
+  const f = fixture(t);
+  const alias = join(f.root, "alias");
+  symlinkSync(f.stateDir, alias, "junction");
+  f.current.confirmedWorkspace = alias;
+  assert.equal((await f.run()).state, "held");
+  f.current.confirmedWorkspace = f.workspace;
+  const sentinel = join(f.root, "sentinel"); writeFileSync(sentinel, "", { mode: 0o600 });
+  symlinkSync(sentinel, join(f.stateDir, "assignment-intents.jsonl"));
+  assert.equal((await f.run()).state, "held");
+  assert.equal(readFileSync(sentinel, "utf8"), "");
+  assert.equal(f.calls.length, 0);
+});
+
+test("an existing workspace substituted between reads cannot receive the assignment", async (t) => {
+  const f = fixture(t);
+  const other = join(f.root, "other"); mkdirSync(other);
+  f.observe = () => { if (f.reads === 2) f.current.confirmedWorkspace = other; return structuredClone(f.current); };
+  assert.equal((await f.run()).state, "held");
+  assert.equal(f.calls.length, 0);
+});
+
+test("every outcome is unqualified and unpublishable; a live adapter is refused", async (t) => {
+  const f = fixture(t);
+  for (const raw of [JSON.stringify(f.request), "null"]) {
+    const result = await f.run(raw);
+    assert.equal(result.qualification, "unqualified-harness");
+    assert.equal(result.publishable, false);
+  }
+  f.kind = "served";
+  assert.equal((await f.run()).state, "refused");
+  assert.equal(f.calls.length, 1);
+});
+
+test("two real controllers racing before intent cannot both dispatch", async (t) => {
+  const f = fixture(t);
+  const marker = join(f.root, "effects");
+  const start = () => {
+    const child = spawn(process.execPath, [fileURLToPath(new URL("./assignment-crash-fixture.ts", import.meta.url)), f.stateDir, JSON.stringify(f.request), JSON.stringify(f.current), marker], { stdio: ["pipe", "pipe", "pipe"] });
+    const ready = new Promise<void>((resolve) => child.stdout.once("data", () => resolve()));
+    const done = new Promise<number | null>((resolve, reject) => { child.once("exit", resolve); child.once("error", reject); });
+    return { child, ready, done };
+  };
+  const a = start(); const b = start();
+  await Promise.all([a.ready, b.ready]);
+  a.child.stdin.end("go"); b.child.stdin.end("go");
+  const codes = await Promise.all([a.done, b.done]);
+  assert.equal(codes.filter((code) => code === 73).length, 1);
+  assert.equal(readFileSync(marker, "utf8"), "effect\n");
+  assert.equal((await f.run()).state, "held");
+  assert.equal(f.calls.length, 0);
+});
+
+test("duplicate JSON keys and encoded duplicate keys are refused", async (t) => {
+  const f = fixture(t);
+  const raw = JSON.stringify(f.request);
+  for (const key of ['"operation"', '"oper\\u0061tion"']) {
+    assert.equal((await f.run(raw.replace('"operation":', `${key}:"shell.exec","operation":`))).state, "refused");
+  }
+  assert.equal(f.reads, 0);
+});
+
+test("changed confirmed workspace, forged result digest and result without intent are held", async (t) => {
+  const f = fixture(t);
+  assert.equal((await f.run()).state, "completed");
+  const original = f.journal();
+  const rows = original.trim().split("\n").map((line) => JSON.parse(line));
+  const path = join(f.stateDir, "assignment-intents.jsonl");
+  rows[1].requestDigest = createHash("sha256").update("different request").digest("hex");
+  for (const data of [rows.map((row) => JSON.stringify(row)).join("\n") + "\n", JSON.stringify(rows[1]) + "\n", JSON.stringify(rows[0]) + "\n" + JSON.stringify({ ...rows[0], sequence: 2 }) + "\n"]) {
+    writeFileSync(path, data);
+    assert.equal((await f.run()).state, "held");
+    assert.equal(f.journal(), data);
+  }
+  writeFileSync(path, original);
+  const other = join(f.root, "other"); mkdirSync(other);
+  f.current.confirmedWorkspace = other;
+  assert.equal((await f.run()).state, "held");
+  assert.equal(f.calls.length, 1);
+});
+
+test("a malformed or truncated journal preserves all bytes and blocks execution", async (t) => {
+  const f = fixture(t);
+  const path = join(f.stateDir, "assignment-intents.jsonl");
+  writeFileSync(path, '{"kind":"intent"', { mode: 0o600 });
+  chmodSync(path, 0o600);
+  const before = readFileSync(path);
+  assert.equal((await f.run()).state, "held");
+  assert.deepEqual(readFileSync(path), before);
+  assert.equal(f.calls.length, 0);
+});
+
+test("real controller exit after the flushed intent recovers without issuing another effect", async (t) => {
+  const f = fixture(t);
+  const child = spawnSync(process.execPath, [fileURLToPath(new URL("./assignment-crash-fixture.ts", import.meta.url)), f.stateDir, JSON.stringify(f.request), JSON.stringify(f.current)], { encoding: "utf8" });
+  assert.equal(child.status, 73, child.stderr);
+  assert.equal(f.journal().trim().split("\n").length, 1);
+  assert.equal((await f.run()).state, "held");
+  assert.equal(f.calls.length, 0);
+  f.reconcile = async () => f.terminal();
+  assert.equal((await f.run()).state, "completed");
+  assert.equal(f.calls.length, 0);
+});
