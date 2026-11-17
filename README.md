@@ -21,6 +21,10 @@ Install records local state only. Startup is unregistered. Windows and macOS ins
 
 Codex CLI and app-server have separate harness contracts and local session helpers. Neither interface has completed native qualification. Other requested coding-tool integrations, signed installation, startup registration, release verification, recovery qualification, and a served coordination path remain unfinished. This candidate provides no supported installation or signed release artifact.
 
+The assignment boundary has a fabricated adapter for adverse-case tests. It binds requests to independently supplied current scope and a confirmed workspace, records flushed intents in `assignment-intents.jsonl`, and holds uncertain effects for read-only reconciliation. The journal contains identifiers and digests, not assignment text or credentials. Malformed, linked, truncated or full journals hold work without discarding history. The 32 KiB frame and 16 KiB input limits bound this harness; they are not batch or native-tool limits.
+
+This boundary is not wired to the command line, network, or native tools. Its adapter observations are fabricated, not server authorization or containment evidence, and its results are unqualified and unpublishable. Reconciliation never retries an uncertain effect, including after reply retention expires. Filesystem proof currently uses the Linux probe; Windows ACLs, PID/start-time ownership, managed-record revocation/export/erasure, real native custody, and served T1 integration remain qualification work. The local journal does not replace server claims or prevent external tools from acting independently.
+
 ## Layout
 
 - `dispatcher/`: runtime, command entry point, harness tests, and fabricated device/native fixtures.
