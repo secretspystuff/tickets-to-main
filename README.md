@@ -41,6 +41,9 @@ from `.github/scripts/repo-guard.mjs`. The reviewed path prefixes and exact path
 live in `.github/allowed-paths.txt`; private-name regular expressions live in
 `.github/private-patterns.txt`. These checks inspect committed blobs and paths,
 including ignored files that are tracked, and reject symbolic links and submodules.
+Blobs containing NUL bytes are rejected; no binary fixture paths are exempt.
+All guards run inside the required `check` job. Regression tests also verify that
+the guard commands remain enabled in that job and that its actions stay pinned.
 The hostname rules reject subdomains of the public site and hosted deployment
 domains. Additional private domains require explicit patterns in that list.
 

@@ -24,7 +24,15 @@ for (const entry of entries) {
     }
   } else {
     // Report rule numbers and paths only, never matching content.
-    const text = type === 'blob' ? git('cat-file', 'blob', oid).toString('utf8') : '';
+    const blob = type === 'blob' ? git('cat-file', 'blob', oid) : Buffer.alloc(0);
+    // No binary fixtures are currently approved. Reject NUL-bearing encodings
+    // before UTF-8 decoding, including UTF-16 text that could hide private names.
+    if (blob.includes(0)) {
+      console.error(`NUL-containing tracked blob: ${JSON.stringify(path)}`);
+      failures++;
+      continue;
+    }
+    const text = blob.toString('utf8');
     patterns.forEach((pattern, index) => {
       if (pattern.test(path) || pattern.test(text)) {
         console.error(`Private pattern ${index + 1}: ${JSON.stringify(path)}`);

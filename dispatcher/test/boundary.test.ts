@@ -24,6 +24,7 @@ test("the public surface imports no private app code and opens no network stack"
     const text = readFileSync(path, "utf8");
     assert.equal(text.includes("secretspystuff"), false, path);
     assert.equal(text.includes("ticketsplease.dev"), false, path);
+    assert.equal(text.includes(["workers", "data"].join("/")), false, path);
     assert.equal(text.includes("node:http"), false, path);
     assert.equal(text.includes("node:https"), false, path);
     assert.equal(text.includes("node:net"), false, path);

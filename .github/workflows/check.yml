@@ -6,7 +6,7 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 jobs:
-  repo-guard:
+  check:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
@@ -16,6 +16,7 @@ jobs:
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: '24.18.0'
+          cache: npm
       - name: Check tracked paths
         run: node .github/scripts/repo-guard.mjs paths
       - name: Check private names in tracked paths and contents
@@ -37,15 +38,5 @@ jobs:
       - name: Scan secrets through the complete reachable history
         if: ${{ !cancelled() }}
         run: gitleaks git --redact --no-banner --ignore-gitleaks-allow --gitleaks-ignore-path .github/secret-fixtures.ignore --log-opts=HEAD .
-  check:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          persist-credentials: false
-      - uses: actions/setup-node@v4
-        with:
-          node-version: '24.18.0'
-          cache: npm
       - run: npm ci --ignore-scripts --no-audit --no-fund
       - run: npm run check
