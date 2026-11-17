@@ -66,15 +66,21 @@ function journalFlush(t: TestContext, stateDir: string, observe: () => void) {
 test("flush intent before dispatch; persist only identifiers and digests, never assignment text", async (t) => {
   const f = fixture(t);
   let flushed = false;
-  journalFlush(t, f.stateDir, () => { flushed = true; });
+  let startFlushed = false;
+  journalFlush(t, f.stateDir, () => { flushed = true; startFlushed ||= f.journal().includes('"kind":"started"'); });
   f.effects = async (value) => {
     assert.equal(flushed, true, "the intent file must be flushed before dispatch");
+    assert.equal(startFlushed, true, "the start marker must be flushed before dispatch");
     f.calls.push(value);
     const journal = f.journal();
-    const intent = JSON.parse(journal.trim());
+    const [intent, started] = journal.trim().split("\n").map((line) => JSON.parse(line));
     assert.equal(intent.kind, "intent");
     assert.equal(intent.id, f.request.id);
     assert.equal(intent.sequence, 1);
+    assert.equal(intent.version, 2);
+    assert.equal(started.kind, "started");
+    assert.equal(started.id, intent.id);
+    assert.equal(started.requestDigest, intent.requestDigest);
     assert.match(intent.requestDigest, /^[a-f0-9]{64}$/);
     assert.equal(intent.requestDigest, createHash("sha256").update(canonical(f.request)).digest("hex"));
     assert.equal(journal.includes(f.request.input), false);
@@ -84,8 +90,8 @@ test("flush intent before dispatch; persist only identifiers and digests, never 
   assert.equal(f.calls.length, 1);
   assert.deepEqual(Object.keys(f.calls[0] as object).sort(), ["id", "input", "sequence", "workspace"]);
   assert.equal((f.calls[0] as { workspace: string }).workspace, f.workspace);
-  assert.equal(f.journal().trim().split("\n").length, 2);
-  const [intent, result] = f.journal().trim().split("\n").map((line) => JSON.parse(line));
+  assert.equal(f.journal().trim().split("\n").length, 3);
+  const [intent, , result] = f.journal().trim().split("\n").map((line) => JSON.parse(line));
   assert.equal(result.id, intent.id);
   assert.equal(result.requestDigest, intent.requestDigest);
   assert.equal(result.sequence, intent.sequence);
@@ -172,6 +178,27 @@ test("JSON escaping and percent encoding cannot hide held secrets or credential 
   assert.equal(f.calls.length, 0);
 });
 
+test("ordinary percent text reaches the adapter unchanged, including mixed escapes", async (t) => {
+  for (const input of ["Raise coverage to 90% this week", "100%", "50%-off", "ok %41", "90% and %41", "bad %FF and %E2%82%AC"]) {
+    const f = fixture(t);
+    f.request.input = input;
+    assert.equal((await f.run()).state, "completed");
+    assert.equal((f.calls[0] as { input: string }).input, input);
+  }
+});
+
+test("stray percent signs cannot hide encoded secrets and credential shapes", async (t) => {
+  const f = fixture(t);
+  const secret = "fabricated-held-secret";
+  const encoded = [...secret].map((char) => "%" + char.charCodeAt(0).toString(16)).join("");
+  for (const input of ["90% " + encoded, "%FF " + encoded, "50%-off " + encodeURIComponent(encoded), "90% %67hp_" + "x".repeat(36)]) {
+    f.request.input = input;
+    assert.equal((await f.run()).state, "refused");
+  }
+  assert.equal(f.reads, 0);
+  assert.equal(f.calls.length, 0);
+});
+
 test("duplicate journal keys, including escaped keys, hold without changing history", async (t) => {
   const f = fixture(t);
   assert.equal((await f.run()).state, "completed");
@@ -185,14 +212,130 @@ test("duplicate journal keys, including escaped keys, hold without changing hist
   assert.equal(f.calls.length, 1);
 });
 
-test("authority changes after intent and after effect do not publish success", async (t) => {
+test("authority changes after intent release unstarted work; changes after effect stay uncertain", async (t) => {
   for (const at of [2, 3]) {
     const f = fixture(t);
     f.observe = () => { if (f.reads === at) f.current.binding.fence++; return structuredClone(f.current); };
-    assert.equal((await f.run()).state, "held");
+    assert.equal((await f.run()).state, at === 2 ? "not-started" : "held");
     assert.equal(f.calls.length, at === 2 ? 0 : 1);
-    assert.equal(f.journal().trim().split("\n").length, 1);
+    const results = f.journal().trim().split("\n").map((line) => JSON.parse(line)).filter((row) => row.kind === "result");
+    assert.deepEqual(results.map((row) => row.outcome), at === 2 ? ["not-started"] : []);
+    f.request.binding = structuredClone(f.current.binding);
+    f.request.id = id(11); f.request.sequence = 2; f.current.nextSequence = 2;
+    assert.equal((await f.run()).state, at === 2 ? "completed" : "held");
+    assert.equal(f.calls.length, 1);
   }
+});
+
+test("one failed authority read records no execution, replays that fact, and releases the next assignment", async (t) => {
+  const f = fixture(t);
+  f.observe = () => { if (f.reads === 2) throw new Error("temporary network failure"); return structuredClone(f.current); };
+  assert.equal((await f.run()).state, "not-started");
+  assert.equal((await f.run()).state, "not-started");
+  assert.equal(f.calls.length, 0);
+  f.request.id = id(11); f.request.sequence = 2; f.current.nextSequence = 2;
+  assert.equal((await f.run()).state, "completed");
+  assert.equal((await f.run()).state, "completed");
+  assert.equal(f.calls.length, 1);
+});
+
+test("one workspace cannot retire another workspace's active preparation in the same process", async (t) => {
+  const f = fixture(t);
+  let release!: () => void;
+  let ready!: () => void;
+  const entered = new Promise<void>((resolve) => { ready = resolve; });
+  const waiting = new Promise<void>((resolve) => { release = resolve; });
+  let reads = 0;
+  const current = structuredClone(f.current);
+  const first = runAssignment({ stateDir: f.stateDir, raw: JSON.stringify(f.request), secrets: [], now: () => 1000,
+    adapter: { kind: "fabricated-harness", readCurrent: async () => { if (++reads === 2) { ready(); await waiting; } return current; },
+      execute: async (value) => { f.calls.push(value); return { id: id(1), sequence: 1, result: "completed", writersContained: true }; }, reconcile: async () => null } });
+  await entered;
+  const other = join(f.root, "other"); mkdirSync(other);
+  f.current.confirmedWorkspace = other; f.current.binding.connection = id(12);
+  f.request.binding = structuredClone(f.current.binding); f.request.id = id(11);
+  try { assert.equal((await f.run()).state, "completed"); }
+  finally { release(); }
+  assert.equal((await first).state, "completed");
+  assert.equal(f.calls.length, 2);
+  assert.equal(f.journal().includes('"outcome":"not-started"'), false);
+});
+
+for (const command of ["continue", "crash"]) {
+  test(`prepared controller ownership survives a competitor, then ${command} releases next work`, async (t) => {
+    const f = fixture(t);
+    const marker = join(f.root, "effects");
+    const child = spawn(process.execPath, [fileURLToPath(new URL("./assignment-prepared-fixture.ts", import.meta.url)), f.stateDir, JSON.stringify(f.request), JSON.stringify(f.current), marker], { stdio: ["pipe", "pipe", "pipe"] });
+    const done = new Promise<number | null>((resolve, reject) => { child.once("exit", resolve); child.once("error", reject); });
+    await new Promise<void>((resolve) => child.stdout.once("data", () => resolve()));
+    const before = f.journal();
+    assert.deepEqual(before.trim().split("\n").map((line) => JSON.parse(line).kind), ["intent"]);
+    try {
+      assert.equal((await f.run()).state, "held");
+      f.request.id = id(11); f.request.sequence = 2; f.current.nextSequence = 2;
+      assert.equal((await f.run()).state, "held");
+      assert.equal(f.calls.length, 0);
+      assert.equal(f.journal(), before);
+    } finally { child.stdin.end(command); }
+    assert.equal(await done, command === "crash" ? 74 : 0);
+    assert.equal((await f.run()).state, "completed");
+    assert.equal((await f.run()).state, "completed");
+    assert.equal(f.calls.length, 1);
+    assert.equal(fs.existsSync(marker), command === "continue");
+    const result = f.journal().trim().split("\n").map((line) => JSON.parse(line)).find((row) => row.id === id(1) && row.kind === "result");
+    assert.equal(result.outcome, command === "crash" ? "not-started" : "completed");
+  });
+}
+
+test("legacy intents without a start marker remain uncertain; legacy terminal records still replay", async (t) => {
+  const f = fixture(t);
+  assert.equal((await f.run()).state, "completed");
+  const [intent, , result] = f.journal().trim().split("\n").map((line) => JSON.parse(line));
+  delete intent.version;
+  const legacy = JSON.stringify(intent) + "\n";
+  const path = join(f.stateDir, "assignment-intents.jsonl");
+  writeFileSync(path, legacy + JSON.stringify(result) + "\n");
+  assert.equal((await f.run()).state, "completed");
+  writeFileSync(path, legacy);
+  assert.equal((await f.run()).state, "held");
+  f.request.id = id(11); f.request.sequence = 2; f.current.nextSequence = 2;
+  assert.equal((await f.run()).state, "held");
+  assert.equal(f.journal(), legacy);
+  assert.equal(f.calls.length, 1);
+});
+
+test("ambiguous start history and contradictory terminals preserve bytes and hold", async (t) => {
+  const f = fixture(t);
+  await f.run();
+  const [intent, started, result] = f.journal().trim().split("\n").map((line) => JSON.parse(line));
+  for (const rows of [
+    [{ ...intent, version: 3 }], [intent, result], [started],
+    [intent, { ...started, id: id(99) }], [intent, { ...started, sequence: 2 }],
+    [intent, { ...started, requestDigest: "a".repeat(64) }], [intent, { ...started, extra: true }],
+    [intent, started, started], [intent, { ...result, outcome: "not-started" }, started],
+    [intent, started, result, { ...result, outcome: "not-started" }],
+  ]) {
+    const data = rows.map((row) => JSON.stringify(row)).join("\n") + "\n";
+    writeFileSync(join(f.stateDir, "assignment-intents.jsonl"), data);
+    assert.equal((await f.run()).state, "held");
+    assert.equal(f.journal(), data);
+  }
+  assert.equal(f.calls.length, 1);
+});
+
+test("a start-marker flush failure before execute records non-execution when storage recovers", async (t) => {
+  const f = fixture(t);
+  let failed = false;
+  journalFlush(t, f.stateDir, () => {
+    if (!failed && f.journal().includes('"kind":"started"')) { failed = true; throw new Error("one failed start flush"); }
+  });
+  assert.equal((await f.run()).state, "not-started");
+  assert.equal(failed, true);
+  assert.equal(f.calls.length, 0);
+  assert.equal((await f.run()).state, "not-started");
+  f.request.id = id(11); f.request.sequence = 2; f.current.nextSequence = 2;
+  assert.equal((await f.run()).state, "completed");
+  assert.equal(f.calls.length, 1);
 });
 
 test("overlapping duplicate and next assignments cannot launch a second writer", async (t) => {
@@ -276,7 +419,7 @@ test("a controller paused after reading an empty journal cannot overwrite a comp
   writeFileSync(release, "go");
   const firstCode = await done;
   assert.equal([firstCode, other.status].filter((code) => code === 73).length, 1);
-  assert.equal(f.journal().trim().split("\n").length, 1);
+  assert.deepEqual(f.journal().trim().split("\n").map((line) => JSON.parse(line).kind), ["intent", "started"]);
 });
 
 test("reconciliation rechecks authority and workspace after the read-only observation", async (t) => {
@@ -287,7 +430,7 @@ test("reconciliation rechecks authority and workspace after the read-only observ
     assert.equal((await f.run()).state, "held");
     f.reconcile = async () => { change(f.current); return f.terminal(); };
     assert.equal((await f.run()).state, "held");
-    assert.equal(f.journal().trim().split("\n").length, 1);
+    assert.deepEqual(f.journal().trim().split("\n").map((line) => JSON.parse(line).kind), ["intent", "started"]);
   }
 });
 
@@ -298,7 +441,7 @@ test("foreign, malformed and uncontained reconciliation leaves the intent unreso
     await f.run();
     f.reconcile = async () => terminal as AssignmentTerminal;
     assert.equal((await f.run()).state, "held");
-    assert.equal(f.journal().trim().split("\n").length, 1);
+    assert.deepEqual(f.journal().trim().split("\n").map((line) => JSON.parse(line).kind), ["intent", "started"]);
   }
 });
 
@@ -306,14 +449,53 @@ test("intent and result flush failures never acknowledge unflushed success or re
   for (const phase of ["intent", "result"]) {
     await t.test(phase, async (sub) => {
       const f = fixture(sub);
-      journalFlush(sub, f.stateDir, () => { if (f.journal().includes(`"kind":"${phase}"`)) throw new Error("disk flush failed"); });
+      let broken = true;
+      journalFlush(sub, f.stateDir, () => { if (broken && f.journal().includes(`"kind":"${phase}"`)) throw new Error("disk flush failed"); });
       assert.equal((await f.run()).state, "held");
       assert.equal(f.calls.length, phase === "intent" ? 0 : 1);
       assert.equal((await f.run()).state, "held");
       assert.equal(f.calls.length, phase === "intent" ? 0 : 1);
+      broken = false;
+      assert.equal((await f.run()).state, phase === "intent" ? "not-started" : "completed");
+      assert.equal(f.calls.length, phase === "intent" ? 0 : 1);
+      f.request.id = id(11); f.request.sequence = 2; f.current.nextSequence = 2;
+      assert.equal((await f.run()).state, "completed");
+      assert.equal((await f.run()).state, "completed");
+      assert.equal(f.calls.length, phase === "intent" ? 1 : 2);
     });
   }
 });
+
+test("an intent flush failure releases the workspace for another scope when storage recovers", async (t) => {
+  const f = fixture(t);
+  let broken = true;
+  journalFlush(t, f.stateDir, () => { if (broken && f.journal().includes('"kind":"intent"')) throw new Error("flush failed"); });
+  assert.equal((await f.run()).state, "held");
+  assert.equal(f.calls.length, 0);
+  broken = false;
+  f.request.id = id(11); f.request.binding.connection = id(12);
+  f.current.binding = structuredClone(f.request.binding);
+  assert.equal((await f.run()).state, "completed");
+  assert.equal(f.calls.length, 1);
+  const rows = f.journal().trim().split("\n").map((line) => JSON.parse(line));
+  assert.equal(rows.find((row) => row.id === id(1) && row.kind === "result")?.outcome, "not-started");
+});
+
+for (const parent of [false, true]) {
+  test(`unrelated workspace link is refused: ${parent ? "linked parent" : "direct link"}`, async (t) => {
+    const f = fixture(t);
+    const target = join(f.root, "unrelated"); mkdirSync(target);
+    const child = join(target, "child"); mkdirSync(child);
+    const alias = join(f.root, "alias"); symlinkSync(target, alias, "junction");
+    f.current.confirmedWorkspace = parent ? join(alias, "child") : alias;
+    assert.equal((await f.run()).state, "held");
+    assert.equal(f.calls.length, 0);
+    assert.equal(fs.existsSync(join(f.stateDir, "assignment-intents.jsonl")), false);
+    f.current.confirmedWorkspace = parent ? child : target;
+    assert.equal((await f.run()).state, "completed", "the unrelated real directory is otherwise admissible");
+    assert.equal(f.calls.length, 1);
+  });
+}
 
 test("symlinked workspace and journal never redirect writes or effects", async (t) => {
   const f = fixture(t);
@@ -333,7 +515,7 @@ test("an existing workspace substituted between reads cannot receive the assignm
   const f = fixture(t);
   const other = join(f.root, "other"); mkdirSync(other);
   f.observe = () => { if (f.reads === 2) f.current.confirmedWorkspace = other; return structuredClone(f.current); };
-  assert.equal((await f.run()).state, "held");
+  assert.equal((await f.run()).state, "not-started");
   assert.equal(f.calls.length, 0);
 });
 
@@ -383,8 +565,8 @@ test("changed confirmed workspace, forged result digest and result without inten
   const original = f.journal();
   const rows = original.trim().split("\n").map((line) => JSON.parse(line));
   const path = join(f.stateDir, "assignment-intents.jsonl");
-  rows[1].requestDigest = createHash("sha256").update("different request").digest("hex");
-  for (const data of [rows.map((row) => JSON.stringify(row)).join("\n") + "\n", JSON.stringify(rows[1]) + "\n", JSON.stringify(rows[0]) + "\n" + JSON.stringify({ ...rows[0], sequence: 2 }) + "\n"]) {
+  rows[2].requestDigest = createHash("sha256").update("different request").digest("hex");
+  for (const data of [rows.map((row) => JSON.stringify(row)).join("\n") + "\n", JSON.stringify(rows[2]) + "\n", JSON.stringify(rows[0]) + "\n" + JSON.stringify({ ...rows[0], sequence: 2 }) + "\n"]) {
     writeFileSync(path, data);
     assert.equal((await f.run()).state, "held");
     assert.equal(f.journal(), data);
@@ -411,7 +593,7 @@ test("real controller exit after the flushed intent recovers without issuing ano
   const f = fixture(t);
   const child = spawnSync(process.execPath, [fileURLToPath(new URL("./assignment-crash-fixture.ts", import.meta.url)), f.stateDir, JSON.stringify(f.request), JSON.stringify(f.current)], { encoding: "utf8" });
   assert.equal(child.status, 73, child.stderr);
-  assert.equal(f.journal().trim().split("\n").length, 1);
+  assert.deepEqual(f.journal().trim().split("\n").map((line) => JSON.parse(line).kind), ["intent", "started"]);
   assert.equal((await f.run()).state, "held");
   assert.equal(f.calls.length, 0);
   f.reconcile = async () => f.terminal();
