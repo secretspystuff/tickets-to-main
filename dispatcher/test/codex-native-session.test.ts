@@ -166,8 +166,8 @@ test("credentials are refused before spawn and native text is redacted without l
   assert.equal(result.resultText!.includes("held-secret"), false);
   assert.equal(result.resultText!.includes("private body"), false);
   assert.equal(result.resultText!.includes("s".repeat(24)), false);
-  assert.equal(transport.calls[0]!.env.ALIAS, undefined);
-  assert.equal(transport.calls[0]!.env.TICKETS_PLEASE_TOKEN, undefined);
+  assert.equal(transport.calls[0]!["env"].ALIAS, undefined);
+  assert.equal(transport.calls[0]!["env"].TICKETS_PLEASE_TOKEN, undefined);
 });
 
 test("uninspected app-server versions and non-Windows workspaces do not start", async () => {
