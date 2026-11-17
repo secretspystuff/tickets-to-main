@@ -1,0 +1,7 @@
+# One case-insensitive JavaScript regular expression per line.
+workers[/\\]data\b
+\btp-(?:app|data|files|backup-stage)\b
+(?:^|[/\\\s"'`])\.env(?:\b|[./\\])
+\.data[/\\]
+(?:[a-z0-9-]+\.)+ticketsplease\.dev\b
+(?:[a-z0-9-]+\.)+(?:workers|pages)\.dev\b
