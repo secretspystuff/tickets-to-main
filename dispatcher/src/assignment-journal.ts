@@ -5,11 +5,13 @@ import { assertPrivateDirectory } from "./fs-safety.ts";
 import { withStateLease } from "./state-lease.ts";
 
 export type Intent = {
+  version?: 2;
   kind: "intent"; id: string; sequence: number; requestDigest: string; bindingDigest: string;
   workspaceDigest: string; scopeDigest: string; at: number; pid: number;
 };
-type Result = { kind: "result"; id: string; sequence: number; requestDigest: string; at: number; outcome: "completed" | "failed" };
-type Entry = { intent: Intent; result: Result | null };
+type Result = { kind: "result"; id: string; sequence: number; requestDigest: string; at: number; outcome: "completed" | "failed" | "not-started" };
+type Started = { kind: "started"; id: string; sequence: number; requestDigest: string; at: number };
+type Entry = { intent: Intent; started: boolean; result: Result | null };
 export const journalDigest = (value: string): string => createHash("sha256").update(value).digest("hex");
 const MAX_BYTES = 8 * 1024 * 1024;
 const opaque = (value: unknown) => typeof value === "string" && /^[a-f0-9]{32}$/.test(value);
@@ -31,27 +33,37 @@ function records(text: string): Map<string, Entry> {
     const value = row as Record<string, unknown>;
     if (!opaque(value.id) || !integer(value.sequence, 1) || !digest(value.requestDigest) || !integer(value.at, 0)) throw unavailable();
     if (value.kind === "intent") {
-      if (!exact(value, ["kind", "id", "sequence", "requestDigest", "bindingDigest", "workspaceDigest", "scopeDigest", "at", "pid"])
+      if (!exact(value, ["kind", "id", "sequence", "requestDigest", "bindingDigest", "workspaceDigest", "scopeDigest", "at", "pid", ...(Object.hasOwn(value, "version") ? ["version"] : [])])
+        || (Object.hasOwn(value, "version") && value.version !== 2)
         || !digest(value.bindingDigest) || !digest(value.workspaceDigest) || !digest(value.scopeDigest) || !integer(value.pid, 1)
         || entries.has(value.id as string)) throw unavailable();
       const intent = value as Intent;
       const prior = [...entries.values()].filter((entry) => entry.intent.scopeDigest === intent.scopeDigest);
       if (prior.some((entry) => entry.intent.sequence >= intent.sequence)
         || [...entries.values()].some((entry) => !entry.result && entry.intent.workspaceDigest === intent.workspaceDigest)) throw unavailable();
-      entries.set(intent.id, { intent, result: null });
+      // Legacy intents could execute without a start record, so their absence is not proof of non-execution.
+      entries.set(intent.id, { intent, started: intent.version !== 2, result: null });
+    } else if (value.kind === "started") {
+      if (!exact(value, ["kind", "id", "sequence", "requestDigest", "at"])) throw unavailable();
+      const entry = entries.get(value.id as string);
+      if (!entry || entry.started || entry.result || entry.intent.version !== 2
+        || entry.intent.sequence !== value.sequence || entry.intent.requestDigest !== value.requestDigest
+        || (value.at as number) < entry.intent.at) throw unavailable();
+      entry.started = true;
     } else if (value.kind === "result") {
       if (!exact(value, ["kind", "id", "sequence", "requestDigest", "at", "outcome"])
-        || (value.outcome !== "completed" && value.outcome !== "failed")) throw unavailable();
+        || !["completed", "failed", "not-started"].includes(value.outcome as string)) throw unavailable();
       const entry = entries.get(value.id as string);
       if (!entry || entry.result || entry.intent.sequence !== value.sequence || entry.intent.requestDigest !== value.requestDigest
-        || (value.at as number) < entry.intent.at) throw unavailable();
+        || (value.at as number) < entry.intent.at
+        || (value.outcome === "not-started" ? entry.intent.version !== 2 : !entry.started)) throw unavailable();
       entry.result = value as Result;
     } else throw unavailable();
   }
   return entries;
 }
 
-function transact<T>(stateDir: string, operation: (entries: Map<string, Entry>, append: (value: Intent | Result) => void) => T): T {
+function transact<T>(stateDir: string, operation: (entries: Map<string, Entry>, append: (value: Intent | Started | Result) => void) => T): T {
   assertPrivateDirectory(stateDir);
   return withStateLease(stateDir, "ledger", () => {
     const path = join(stateDir, "assignment-intents.jsonl");
@@ -94,8 +106,17 @@ function matching(left: Intent, right: Intent): boolean {
     && left.bindingDigest === right.bindingDigest && left.workspaceDigest === right.workspaceDigest && left.scopeDigest === right.scopeDigest;
 }
 
-export function reserveAssignment(stateDir: string, intent: Intent): { state: "new" | "pending" | "completed" | "failed"; owner: number } {
+export function reserveAssignment(stateDir: string, intent: Intent, ownerAlive: (pid: number) => boolean): { state: "new" | "pending" | Result["outcome"]; owner: number } {
   return transact(stateDir, (entries, append) => {
+    for (const entry of entries.values()) {
+      if (!entry.result && !entry.started && entry.intent.workspaceDigest === intent.workspaceDigest && !ownerAlive(entry.intent.pid)) {
+        if (intent.at < entry.intent.at) throw unavailable();
+        const result: Result = { kind: "result", id: entry.intent.id, sequence: entry.intent.sequence,
+          requestDigest: entry.intent.requestDigest, at: intent.at, outcome: "not-started" };
+        append(result);
+        entry.result = result;
+      }
+    }
     const previous = entries.get(intent.id);
     if (previous) {
       if (!matching(previous.intent, intent) || intent.at < previous.intent.at) throw unavailable();
@@ -110,10 +131,20 @@ export function reserveAssignment(stateDir: string, intent: Intent): { state: "n
   });
 }
 
-export function completeAssignment(stateDir: string, intent: Intent, outcome: "completed" | "failed", at: number): void {
+export function startAssignment(stateDir: string, intent: Intent, at: number): void {
+  transact(stateDir, (entries, append) => {
+    const entry = entries.get(intent.id);
+    if (!entry || !matching(entry.intent, intent) || entry.intent.version !== 2 || entry.intent.pid !== process.pid
+      || entry.started || entry.result || !integer(at, 0) || at < entry.intent.at) throw unavailable();
+    append({ kind: "started", id: intent.id, sequence: intent.sequence, requestDigest: intent.requestDigest, at });
+  });
+}
+
+export function completeAssignment(stateDir: string, intent: Intent, outcome: Result["outcome"], at: number): void {
   transact(stateDir, (entries, append) => {
     const previous = entries.get(intent.id);
     if (!previous || !matching(previous.intent, intent) || !integer(at, 0) || at < previous.intent.at) throw unavailable();
+    if (outcome === "not-started" ? previous.intent.version !== 2 || previous.intent.pid !== process.pid : !previous.started) throw unavailable();
     if (previous.result) {
       if (previous.result.outcome !== outcome) throw unavailable();
       return;
