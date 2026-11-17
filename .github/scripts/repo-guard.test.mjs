@@ -10,35 +10,81 @@ import { parse } from 'yaml';
 const script = fileURLToPath(new URL('./repo-guard.mjs', import.meta.url));
 const workflow = parse(readFileSync(new URL('../workflows/check.yml', import.meta.url), 'utf8'));
 
-test('the required check job runs every guard and uses pinned actions', () => {
-  const job = workflow.jobs.check;
+function assertWorkflowContract(candidate) {
+  const job = candidate.jobs.check;
   assert.ok(job);
-  assert.equal(job.if, undefined);
+  assert.equal(Object.hasOwn(job, 'if'), false, 'The check job has no condition');
   assert.ok(!job['continue-on-error']);
-  const steps = job.steps;
-  const commands = [
-    'node .github/scripts/repo-guard.mjs paths',
-    'node .github/scripts/repo-guard.mjs private',
-    'gitleaks git --redact --no-banner --ignore-gitleaks-allow --gitleaks-ignore-path .github/secret-fixtures.ignore --log-opts=HEAD .',
-    'npm ci --ignore-scripts --no-audit --no-fund',
-    'npm run check',
-  ];
-  for (const command of commands) {
-    const step = steps.find((entry) => entry.run === command);
-    assert.ok(step, `Required check command missing: ${command}`);
-    assert.ok(step.if === undefined || step.if === '${{ !cancelled() }}', `Disabled check command: ${command}`);
-    assert.ok(!step['continue-on-error']);
-  }
-  const checkout = steps.find((step) => step.uses?.startsWith('actions/checkout@'));
-  assert.equal(checkout?.uses, 'actions/checkout@11d5960a326750d5838078e36cf38b85af677262');
-  assert.equal(checkout.with['fetch-depth'], 0);
-  assert.equal(checkout.with['persist-credentials'], false);
-  assert.equal(steps.find((step) => step.uses?.startsWith('actions/setup-node@'))?.uses,
-    'actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020');
-  const install = steps.find((step) => step.name === 'Install Gitleaks 8.30.1');
-  assert.ok(install?.run.includes('sha256sum --check'));
-  assert.ok(install.if === undefined || install.if === '${{ !cancelled() }}');
-  assert.ok(!install['continue-on-error']);
+  // Compare complete mappings, including order, rather than selected properties.
+  // Every additional key or changed value requires updating this reviewed contract.
+  assert.deepEqual(job.steps, [
+    {
+      uses: 'actions/checkout@11d5960a326750d5838078e36cf38b85af677262',
+      with: { 'fetch-depth': 0, 'persist-credentials': false },
+    },
+    {
+      uses: 'actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020',
+      with: { 'node-version': '24.18.0', cache: 'npm' },
+    },
+    {
+      name: 'Check tracked paths',
+      run: 'node .github/scripts/repo-guard.mjs paths',
+    },
+    {
+      name: 'Check private names in tracked paths and contents',
+      if: '${{ !cancelled() }}',
+      run: 'node .github/scripts/repo-guard.mjs private',
+    },
+    {
+      name: 'Install Gitleaks 8.30.1',
+      if: '${{ !cancelled() }}',
+      shell: 'bash',
+      run: [
+        'set -euo pipefail',
+        'cd "$RUNNER_TEMP"',
+        'curl --fail --silent --show-error --location --retry 3 \\',
+        '  https://github.com/gitleaks/gitleaks/releases/download/v8.30.1/gitleaks_8.30.1_linux_x64.tar.gz \\',
+        '  --output gitleaks.tar.gz',
+        "echo '551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb  gitleaks.tar.gz' | sha256sum --check",
+        'mkdir -p gitleaks-bin',
+        'tar -xzf gitleaks.tar.gz -C gitleaks-bin gitleaks',
+        'echo "$RUNNER_TEMP/gitleaks-bin" >> "$GITHUB_PATH"',
+        '',
+      ].join('\n'),
+    },
+    {
+      name: 'Scan secrets through the complete reachable history',
+      if: '${{ !cancelled() }}',
+      run: 'gitleaks git --redact --no-banner --ignore-gitleaks-allow --gitleaks-ignore-path .github/secret-fixtures.ignore --log-opts=HEAD .',
+    },
+    { run: 'npm ci --ignore-scripts --no-audit --no-fund' },
+    { run: 'npm run check' },
+  ], 'The check steps match the complete reviewed definitions');
+}
+
+test('the required check job runs every guard and uses pinned actions', () => {
+  assertWorkflowContract(workflow);
+});
+
+for (const [label, name, edits] of [
+  ['working directory', 'Check private names in tracked paths and contents', { 'working-directory': '/tmp' }],
+  ['custom shell', 'Check private names in tracked paths and contents', { shell: 'bash {0}' }],
+  ['working directory and custom shell', 'Check private names in tracked paths and contents', { 'working-directory': '/tmp', shell: 'bash {0}' }],
+  ['secret scanner environment', 'Scan secrets through the complete reachable history', { env: { GITLEAKS_CONFIG_TOML: 'title = "override"' } }],
+  ['extra condition', 'Check tracked paths', { if: true }],
+  ['extra continue-on-error', 'Check tracked paths', { 'continue-on-error': false }],
+]) {
+  test(`workflow contract rejects ${label}`, () => {
+    const modified = structuredClone(workflow);
+    Object.assign(modified.jobs.check.steps.find((step) => step.name === name), edits);
+    assert.throws(() => assertWorkflowContract(modified), { code: 'ERR_ASSERTION' });
+  });
+}
+
+test('workflow contract rejects a job-level condition even when true', () => {
+  const modified = structuredClone(workflow);
+  modified.jobs.check.if = true;
+  assert.throws(() => assertWorkflowContract(modified), { code: 'ERR_ASSERTION' });
 });
 
 // Tree objects exercise the real committed-blob CLI without authors, credentials,
