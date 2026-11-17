@@ -2,7 +2,6 @@ import { lstatSync, realpathSync } from "node:fs";
 import { dirname, isAbsolute, relative, resolve, sep } from "node:path";
 import { assertPrivateDirectory } from "./fs-safety.ts";
 import { safeNativeText } from "./adapters/native-result.ts";
-import { unfold } from "./secret-text.ts";
 import { completeAssignment, journalDigest, reserveAssignment, type Intent } from "./assignment-journal.ts";
 
 export type AssignmentBinding = {
@@ -74,8 +73,17 @@ function decode(raw: string, secrets: readonly string[]): AssignmentRequest | nu
     if (!exact(parsed, ["version", "id", "sequence", "operation", "input", "binding"]) || parsed.version !== 1
       || !opaque(parsed.id) || !whole(parsed.sequence, 1) || parsed.operation !== "native.assign" || !binding(parsed.binding)
       || typeof parsed.input !== "string" || Buffer.byteLength(parsed.input) > 16384 || /[\u0000-\u0008\u000b\u000c\u000e-\u001f]/.test(parsed.input)) return null;
-    const decoded = unfold(canonical(parsed));
-    if (decoded === null || safeNativeText(decoded, secrets) !== decoded) return null;
+    for (const value of [...Object.values(parsed), ...Object.values(parsed.binding)].filter((value): value is string => typeof value === "string")) {
+      let decoded = value;
+      for (let depth = 0; ; depth++) {
+        if (safeNativeText(decoded, secrets) !== decoded) return null;
+        if (!decoded.includes("%")) break;
+        if (depth === 8) return null;
+        const next = decodeURIComponent(decoded);
+        if (next === decoded) break;
+        decoded = next;
+      }
+    }
     return parsed as AssignmentRequest;
   } catch { return null; }
 }

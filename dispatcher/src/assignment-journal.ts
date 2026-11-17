@@ -25,6 +25,8 @@ function records(text: string): Map<string, Entry> {
   for (const line of text.slice(0, -1).split("\n")) {
     if (Buffer.byteLength(line) > 2048) throw unavailable();
     const row: unknown = JSON.parse(line);
+    // Only the writer's exact serialization is valid history; JSON.parse alone hides duplicate keys.
+    if (JSON.stringify(row) !== line) throw unavailable();
     if (row === null || typeof row !== "object" || Array.isArray(row)) throw unavailable();
     const value = row as Record<string, unknown>;
     if (!opaque(value.id) || !integer(value.sequence, 1) || !digest(value.requestDigest) || !integer(value.at, 0)) throw unavailable();

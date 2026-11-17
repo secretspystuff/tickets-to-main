@@ -34,15 +34,17 @@ function fixture(t: TestContext) {
   let reconcile = async (): Promise<AssignmentTerminal | null> => null;
   let observe = () => structuredClone(current);
   let kind = "fabricated-harness";
+  let secrets = ["fabricated-held-secret"];
   const terminal = (): AssignmentTerminal => ({ id: request.id, sequence: request.sequence, result: "completed", writersContained: true });
   const run = (raw = JSON.stringify(request)) => runAssignment({
-    stateDir, raw, secrets: ["fabricated-held-secret"], now: () => now,
+    stateDir, raw, secrets, now: () => now,
     adapter: { kind: kind as "fabricated-harness", readCurrent: async () => { reads++; return observe(); }, execute: (value) => effects(value), reconcile: () => reconcile() },
   });
   return { root, stateDir, workspace, request, current, calls, run, terminal,
     get reads() { return reads; },
     set now(value: number) { now = value; },
     set kind(value: string) { kind = value; },
+    set secrets(value: string[]) { secrets = value; },
     set effects(value: typeof effects) { effects = value; },
     set reconcile(value: typeof reconcile) { reconcile = value; },
     set observe(value: typeof observe) { observe = value; },
@@ -152,6 +154,35 @@ test("state nesting, missing and relative workspace mappings never reach the eff
     assert.equal((await f.run()).state, "held");
   }
   assert.equal(f.calls.length, 0);
+});
+
+test("JSON escaping and percent encoding cannot hide held secrets or credential shapes", async (t) => {
+  const f = fixture(t);
+  for (const secret of ['held"value', "held\\value", "held\nvalue", "held%20value"]) {
+    f.secrets = [secret];
+    for (const input of [secret, encodeURIComponent(secret)]) {
+      f.request.input = input;
+      assert.equal((await f.run()).state, "refused");
+    }
+  }
+  f.secrets = [];
+  f.request.input = "prefix\nghp_" + "x".repeat(36);
+  assert.equal((await f.run()).state, "refused");
+  assert.equal(f.reads, 0);
+  assert.equal(f.calls.length, 0);
+});
+
+test("duplicate journal keys, including escaped keys, hold without changing history", async (t) => {
+  const f = fixture(t);
+  assert.equal((await f.run()).state, "completed");
+  const original = f.journal();
+  for (const key of ['"outcome"', '"outc\\u006fme"']) {
+    const data = original.replace('"outcome":"completed"', `${key}:"failed","outcome":"completed"`);
+    writeFileSync(join(f.stateDir, "assignment-intents.jsonl"), data);
+    assert.equal((await f.run()).state, "held");
+    assert.equal(f.journal(), data);
+  }
+  assert.equal(f.calls.length, 1);
 });
 
 test("authority changes after intent and after effect do not publish success", async (t) => {
