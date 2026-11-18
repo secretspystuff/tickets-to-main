@@ -2,9 +2,10 @@ import { closeSync, fsyncSync, lstatSync, mkdirSync, openSync, readFileSync, rea
 import { isAbsolute, join } from "node:path";
 import { randomUUID } from "node:crypto";
 import { assertPrivateDirectory, StateError } from "./fs-safety.ts";
+import { currentProcessOwner, processOwnerAlive, validProcessBirth } from "./process-identity.ts";
 
 type Namespace = "ledger" | "release";
-type Owner = { version: 1; namespace: Namespace; pid: number; nonce: string };
+type Owner = { version: 1 | 2; namespace: Namespace; pid: number; birth?: string; nonce: string };
 export type LeaseHooks = { onCheckpoint?: (phase: "observed-stale" | "claimed" | "release-marker-writing", epoch: bigint) => void };
 export type LeaseState = "none" | "released" | "active" | "dead";
 
@@ -52,11 +53,6 @@ function rootOf(stateDir: string, namespace: Namespace, create: boolean): string
   return root;
 }
 
-function alive(pid: number): boolean {
-  try { process.kill(pid, 0); return true; }
-  catch (error) { if ((error as NodeJS.ErrnoException).code === "ESRCH") return false; return true; }
-}
-
 function latest(root: string, namespace: Namespace): { epoch: bigint; state: LeaseState } {
   let epoch = -1n;
   for (const name of readdirSync(root)) {
@@ -70,7 +66,10 @@ function latest(root: string, namespace: Namespace): { epoch: bigint; state: Lea
   if (readdirSync(directory).some((name) => name !== "owner.json" && name !== "released" && name !== "released.prepared")) throw unavailable();
   const bytes = read(join(directory, "owner.json"));
   const owner = JSON.parse(bytes.toString("utf8")) as Owner;
-  if (owner === null || typeof owner !== "object" || Object.keys(owner).length !== 4 || owner.version !== 1
+  if (owner === null || typeof owner !== "object" || (owner.version !== 1 && owner.version !== 2)
+    || Object.keys(owner).length !== (Object.hasOwn(owner, "birth") ? 5 : 4)
+    || !["version", "namespace", "pid", "nonce", "birth"].every((key) => key === "birth" || Object.hasOwn(owner, key))
+    || (Object.hasOwn(owner, "birth") && (owner.version !== 2 || !validProcessBirth(owner.birth)))
     || owner.namespace !== namespace || !Number.isSafeInteger(owner.pid) || owner.pid < 1
     || typeof owner.nonce !== "string" || !/^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/.test(owner.nonce)) throw unavailable();
   const released = join(directory, "released");
@@ -78,7 +77,7 @@ function latest(root: string, namespace: Namespace): { epoch: bigint; state: Lea
     if (!read(released).equals(bytes)) throw unavailable();
     return { epoch, state: "released" };
   }
-  return { epoch, state: alive(owner.pid) ? "active" : "dead" };
+  return { epoch, state: processOwnerAlive(owner) ? "active" : "dead" };
 }
 
 export function stateLeaseStatus(stateDir: string, namespace: Namespace): LeaseState {
@@ -101,7 +100,7 @@ export function withStateLease<T>(stateDir: string, namespace: Namespace, operat
   const nonce = randomUUID();
   const candidate = join(root, `.claim-${nonce}`);
   const destination = join(root, `epoch-${epoch}`);
-  const bytes = Buffer.from(JSON.stringify({ version: 1, namespace, pid: process.pid, nonce } satisfies Owner));
+  const bytes = Buffer.from(JSON.stringify({ version: 2, namespace, ...currentProcessOwner(), nonce } satisfies Owner));
   mkdirSync(candidate, { mode: 0o700 });
   try {
     write(join(candidate, "owner.json"), bytes);

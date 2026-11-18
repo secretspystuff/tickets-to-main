@@ -3,11 +3,12 @@ import { closeSync, constants, fsyncSync, fstatSync, lstatSync, openSync, readFi
 import { join } from "node:path";
 import { assertPrivateDirectory } from "./fs-safety.ts";
 import { withStateLease } from "./state-lease.ts";
+import { currentProcessOwner, validProcessBirth, type ProcessOwner } from "./process-identity.ts";
 
 export type Intent = {
-  version?: 2;
+  version?: 2 | 3;
   kind: "intent"; id: string; sequence: number; requestDigest: string; bindingDigest: string;
-  workspaceDigest: string; scopeDigest: string; at: number; pid: number;
+  workspaceDigest: string; scopeDigest: string; at: number; pid: number; birth?: string;
 };
 type Result = { kind: "result"; id: string; sequence: number; requestDigest: string; at: number; outcome: "completed" | "failed" | "not-started" };
 type Started = { kind: "started"; id: string; sequence: number; requestDigest: string; at: number };
@@ -33,8 +34,9 @@ function records(text: string): Map<string, Entry> {
     const value = row as Record<string, unknown>;
     if (!opaque(value.id) || !integer(value.sequence, 1) || !digest(value.requestDigest) || !integer(value.at, 0)) throw unavailable();
     if (value.kind === "intent") {
-      if (!exact(value, ["kind", "id", "sequence", "requestDigest", "bindingDigest", "workspaceDigest", "scopeDigest", "at", "pid", ...(Object.hasOwn(value, "version") ? ["version"] : [])])
-        || (Object.hasOwn(value, "version") && value.version !== 2)
+      if (!exact(value, ["kind", "id", "sequence", "requestDigest", "bindingDigest", "workspaceDigest", "scopeDigest", "at", "pid", ...(Object.hasOwn(value, "version") ? ["version"] : []), ...(Object.hasOwn(value, "birth") ? ["birth"] : [])])
+        || (Object.hasOwn(value, "version") && value.version !== 2 && value.version !== 3)
+        || (Object.hasOwn(value, "birth") && (value.version !== 3 || !validProcessBirth(value.birth)))
         || !digest(value.bindingDigest) || !digest(value.workspaceDigest) || !digest(value.scopeDigest) || !integer(value.pid, 1)
         || entries.has(value.id as string)) throw unavailable();
       const intent = value as Intent;
@@ -42,11 +44,11 @@ function records(text: string): Map<string, Entry> {
       if (prior.some((entry) => entry.intent.sequence >= intent.sequence)
         || [...entries.values()].some((entry) => !entry.result && entry.intent.workspaceDigest === intent.workspaceDigest)) throw unavailable();
       // Legacy intents could execute without a start record, so their absence is not proof of non-execution.
-      entries.set(intent.id, { intent, started: intent.version !== 2, result: null });
+      entries.set(intent.id, { intent, started: intent.version === undefined, result: null });
     } else if (value.kind === "started") {
       if (!exact(value, ["kind", "id", "sequence", "requestDigest", "at"])) throw unavailable();
       const entry = entries.get(value.id as string);
-      if (!entry || entry.started || entry.result || entry.intent.version !== 2
+      if (!entry || entry.started || entry.result || entry.intent.version === undefined
         || entry.intent.sequence !== value.sequence || entry.intent.requestDigest !== value.requestDigest
         || (value.at as number) < entry.intent.at) throw unavailable();
       entry.started = true;
@@ -56,7 +58,7 @@ function records(text: string): Map<string, Entry> {
       const entry = entries.get(value.id as string);
       if (!entry || entry.result || entry.intent.sequence !== value.sequence || entry.intent.requestDigest !== value.requestDigest
         || (value.at as number) < entry.intent.at
-        || (value.outcome === "not-started" ? entry.intent.version !== 2 : !entry.started)) throw unavailable();
+        || (value.outcome === "not-started" ? entry.intent.version === undefined : !entry.started)) throw unavailable();
       entry.result = value as Result;
     } else throw unavailable();
   }
@@ -106,10 +108,14 @@ function matching(left: Intent, right: Intent): boolean {
     && left.bindingDigest === right.bindingDigest && left.workspaceDigest === right.workspaceDigest && left.scopeDigest === right.scopeDigest;
 }
 
-export function reserveAssignment(stateDir: string, intent: Intent, ownerAlive: (pid: number) => boolean): { state: "new" | "pending" | Result["outcome"]; owner: number } {
+export function reserveAssignment(stateDir: string, intent: Intent, legacyWorkspaceDigest: string, ownerAlive: (owner: ProcessOwner) => boolean): { state: "new" | "pending" | Result["outcome"]; intent: Intent } {
   return transact(stateDir, (entries, append) => {
+    const sameWorkspace = (old: Intent) => old.workspaceDigest === (old.version === 3 ? intent.workspaceDigest : legacyWorkspaceDigest);
+    const previous = entries.get(intent.id);
+    if (previous && (!sameWorkspace(previous.intent) || !matching(previous.intent, { ...intent, workspaceDigest: previous.intent.workspaceDigest })
+      || intent.at < previous.intent.at)) throw unavailable();
     for (const entry of entries.values()) {
-      if (!entry.result && !entry.started && entry.intent.workspaceDigest === intent.workspaceDigest && !ownerAlive(entry.intent.pid)) {
+      if (!entry.result && !entry.started && sameWorkspace(entry.intent) && !ownerAlive(entry.intent)) {
         if (intent.at < entry.intent.at) throw unavailable();
         const result: Result = { kind: "result", id: entry.intent.id, sequence: entry.intent.sequence,
           requestDigest: entry.intent.requestDigest, at: intent.at, outcome: "not-started" };
@@ -117,24 +123,23 @@ export function reserveAssignment(stateDir: string, intent: Intent, ownerAlive: 
         entry.result = result;
       }
     }
-    const previous = entries.get(intent.id);
     if (previous) {
-      if (!matching(previous.intent, intent) || intent.at < previous.intent.at) throw unavailable();
-      return { state: previous.result?.outcome ?? "pending", owner: previous.intent.pid };
+      return { state: previous.result?.outcome ?? "pending", intent: previous.intent };
     }
     const prior = [...entries.values()].filter((entry) => entry.intent.scopeDigest === intent.scopeDigest);
-    if ([...entries.values()].some((entry) => !entry.result && entry.intent.workspaceDigest === intent.workspaceDigest)
+    // Legacy path hashes cannot rule out an alternate spelling of this workspace.
+    if ([...entries.values()].some((entry) => !entry.result && (entry.intent.version !== 3 || sameWorkspace(entry.intent)))
       || prior.some((entry) => entry.intent.sequence >= intent.sequence)
       || (prior.length > 0 && Math.max(...prior.map((entry) => entry.intent.sequence)) + 1 !== intent.sequence)) throw unavailable();
     append(intent);
-    return { state: "new", owner: intent.pid };
+    return { state: "new", intent };
   });
 }
 
 export function startAssignment(stateDir: string, intent: Intent, at: number): void {
   transact(stateDir, (entries, append) => {
     const entry = entries.get(intent.id);
-    if (!entry || !matching(entry.intent, intent) || entry.intent.version !== 2 || entry.intent.pid !== process.pid
+    if (!entry || !matching(entry.intent, intent) || entry.intent.version === undefined || !owned(entry.intent)
       || entry.started || entry.result || !integer(at, 0) || at < entry.intent.at) throw unavailable();
     append({ kind: "started", id: intent.id, sequence: intent.sequence, requestDigest: intent.requestDigest, at });
   });
@@ -144,11 +149,16 @@ export function completeAssignment(stateDir: string, intent: Intent, outcome: Re
   transact(stateDir, (entries, append) => {
     const previous = entries.get(intent.id);
     if (!previous || !matching(previous.intent, intent) || !integer(at, 0) || at < previous.intent.at) throw unavailable();
-    if (outcome === "not-started" ? previous.intent.version !== 2 || previous.intent.pid !== process.pid : !previous.started) throw unavailable();
+    if (outcome === "not-started" ? previous.intent.version === undefined || !owned(previous.intent) : !previous.started) throw unavailable();
     if (previous.result) {
       if (previous.result.outcome !== outcome) throw unavailable();
       return;
     }
     append({ kind: "result", id: intent.id, sequence: intent.sequence, requestDigest: intent.requestDigest, at, outcome });
   });
+}
+
+function owned(intent: Intent): boolean {
+  const current = currentProcessOwner();
+  return intent.pid === current.pid && (!intent.birth || intent.birth === current.birth);
 }

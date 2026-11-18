@@ -8,6 +8,7 @@ import { syncBuiltinESMExports } from "node:module";
 import { createHash } from "node:crypto";
 import { fileURLToPath } from "node:url";
 import { runAssignment, type AssignmentRequest, type CurrentAssignment, type AssignmentTerminal } from "../src/assignment-boundary.ts";
+import { processBirth } from "../src/process-identity.ts";
 
 const id = (n: number) => n.toString(16).padStart(32, "0");
 function canonical(value: unknown): string {
@@ -77,7 +78,7 @@ test("flush intent before dispatch; persist only identifiers and digests, never 
     assert.equal(intent.kind, "intent");
     assert.equal(intent.id, f.request.id);
     assert.equal(intent.sequence, 1);
-    assert.equal(intent.version, 2);
+    assert.equal(intent.version, 3);
     assert.equal(started.kind, "started");
     assert.equal(started.id, intent.id);
     assert.equal(started.requestDigest, intent.requestDigest);
@@ -292,6 +293,8 @@ test("legacy intents without a start marker remain uncertain; legacy terminal re
   assert.equal((await f.run()).state, "completed");
   const [intent, , result] = f.journal().trim().split("\n").map((line) => JSON.parse(line));
   delete intent.version;
+  delete intent.birth;
+  intent.workspaceDigest = createHash("sha256").update(f.workspace).digest("hex");
   const legacy = JSON.stringify(intent) + "\n";
   const path = join(f.stateDir, "assignment-intents.jsonl");
   writeFileSync(path, legacy + JSON.stringify(result) + "\n");
@@ -304,12 +307,69 @@ test("legacy intents without a start marker remain uncertain; legacy terminal re
   assert.equal(f.calls.length, 1);
 });
 
+test("unresolved legacy path hashes hold a new scope even when Windows path spelling may differ", async (t) => {
+  for (const version of [undefined, 2]) {
+    const f = fixture(t);
+    await f.run();
+    const [intent] = f.journal().trim().split("\n").map((line) => JSON.parse(line));
+    delete intent.birth;
+    if (version === undefined) delete intent.version; else intent.version = version;
+    intent.workspaceDigest = createHash("sha256").update("C:\\OLD~1\\MiXeD").digest("hex");
+    const old = JSON.stringify(intent) + "\n";
+    writeFileSync(join(f.stateDir, "assignment-intents.jsonl"), old);
+    f.request.id = id(11); f.request.binding.connection = id(12); f.current.binding = structuredClone(f.request.binding);
+    assert.equal((await f.run()).state, "held");
+    assert.equal(f.journal(), old);
+    assert.equal(f.calls.length, 1);
+  }
+});
+
+test("old version-2 preparations and started results retain exact replay and recovery", async (t) => {
+  for (const phase of ["prepared", "started", "terminal"]) {
+    const f = fixture(t);
+    await f.run();
+    const [intent, started, result] = f.journal().trim().split("\n").map((line) => JSON.parse(line));
+    intent.version = 2; delete intent.birth;
+    intent.workspaceDigest = createHash("sha256").update(f.workspace).digest("hex");
+    const rows = phase === "prepared" ? [intent] : phase === "started" ? [intent, started] : [intent, started, result];
+    writeFileSync(join(f.stateDir, "assignment-intents.jsonl"), rows.map((row) => JSON.stringify(row)).join("\n") + "\n");
+    f.reconcile = async () => f.terminal();
+    assert.equal((await f.run()).state, phase === "prepared" ? "not-started" : "completed");
+    f.request.id = id(11); f.request.sequence = 2; f.current.nextSequence = 2;
+    assert.equal((await f.run()).state, "completed");
+    assert.equal(f.calls.length, 2);
+  }
+});
+
+test("reused PID retires a preparation but only reconciles a started intent", async (t) => {
+  for (const started of [false, true]) {
+    const f = fixture(t);
+    const child = spawnSync(process.execPath, [fileURLToPath(new URL("./assignment-crash-fixture.ts", import.meta.url)), f.stateDir, JSON.stringify(f.request), JSON.stringify(f.current)], { encoding: "utf8" });
+    assert.equal(child.status, 73, child.stderr);
+    const rows = f.journal().trim().split("\n").map((line) => JSON.parse(line));
+    const birth = processBirth(process.pid);
+    assert.ok(birth);
+    rows[0].pid = process.pid; rows[0].birth = birth + "0";
+    if (!started) rows.pop();
+    writeFileSync(join(f.stateDir, "assignment-intents.jsonl"), rows.map((row) => JSON.stringify(row)).join("\n") + "\n");
+    let observations = 0;
+    f.reconcile = async () => { observations++; return f.terminal(); };
+    assert.equal((await f.run()).state, started ? "completed" : "not-started");
+    assert.equal(observations, started ? 1 : 0);
+    assert.equal(f.calls.length, 0);
+    f.request.id = id(11); f.request.sequence = 2; f.current.nextSequence = 2;
+    assert.equal((await f.run()).state, "completed");
+    assert.equal((await f.run()).state, "completed");
+    assert.equal(f.calls.length, 1);
+  }
+});
+
 test("ambiguous start history and contradictory terminals preserve bytes and hold", async (t) => {
   const f = fixture(t);
   await f.run();
   const [intent, started, result] = f.journal().trim().split("\n").map((line) => JSON.parse(line));
   for (const rows of [
-    [{ ...intent, version: 3 }], [intent, result], [started],
+    [{ ...intent, version: 4 }], [{ ...intent, birth: "invalid" }], [intent, result], [started],
     [intent, { ...started, id: id(99) }], [intent, { ...started, sequence: 2 }],
     [intent, { ...started, requestDigest: "a".repeat(64) }], [intent, { ...started, extra: true }],
     [intent, started, started], [intent, { ...result, outcome: "not-started" }, started],

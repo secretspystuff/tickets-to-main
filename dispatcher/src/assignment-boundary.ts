@@ -1,6 +1,6 @@
-import { lstatSync, realpathSync } from "node:fs";
-import { dirname, isAbsolute, relative, resolve, sep } from "node:path";
 import { assertPrivateDirectory } from "./fs-safety.ts";
+import { assignmentDirectory, directoriesOverlap, type DirectoryIdentity } from "./directory-identity.ts";
+import { currentProcessOwner, processOwnerAlive, type ProcessOwner } from "./process-identity.ts";
 import { safeNativeText } from "./adapters/native-result.ts";
 import { completeAssignment, journalDigest, reserveAssignment, startAssignment, type Intent } from "./assignment-journal.ts";
 
@@ -87,41 +87,20 @@ function decode(raw: string, secrets: readonly string[]): AssignmentRequest | nu
   } catch { return null; }
 }
 
-function directory(path: string): string {
-  if (typeof path !== "string" || !isAbsolute(path) || path.length > 4096) throw new Error("Workspace unavailable.");
-  let parent = resolve(path);
-  for (;;) {
-    const stat = lstatSync(parent);
-    if (stat.isSymbolicLink() || !stat.isDirectory()) throw new Error("Workspace unavailable.");
-    const next = dirname(parent);
-    if (next === parent) break;
-    parent = next;
-  }
-  return realpathSync(path);
-}
-function within(parent: string, child: string): boolean {
-  const delta = relative(parent, child);
-  return delta === "" || (!isAbsolute(delta) && delta !== ".." && !delta.startsWith(".." + sep));
-}
-
-async function current(input: AssignmentInput, request: AssignmentRequest, stateDir: string): Promise<string | null> {
+async function current(input: AssignmentInput, request: AssignmentRequest, stateDir: DirectoryIdentity): Promise<DirectoryIdentity | null> {
   const value: unknown = structuredClone(await input.adapter.readCurrent());
   if (!exact(value, ["binding", "nextSequence", "authorized", "seat", "confirmedWorkspace", "writersContained"])
     || value.authorized !== true || !["owner", "full", "member"].includes(value.seat as string)
     || value.writersContained !== true || !binding(value.binding) || canonical(value.binding) !== canonical(request.binding)
     || value.nextSequence !== request.sequence || typeof value.confirmedWorkspace !== "string") return null;
-  const workspace = directory(value.confirmedWorkspace);
-  return within(stateDir, workspace) || within(workspace, stateDir) ? null : workspace;
+  const workspace = assignmentDirectory(value.confirmedWorkspace);
+  return directoriesOverlap(stateDir, workspace) ? null : workspace;
 }
 function terminal(value: unknown, request: AssignmentRequest): value is AssignmentTerminal {
   return exact(value, ["id", "sequence", "result", "writersContained"]) && value.id === request.id && value.sequence === request.sequence
     && (value.result === "completed" || value.result === "failed") && value.writersContained === true;
 }
-function ownerAlive(pid: number): boolean {
-  if (pid === process.pid) return false;
-  try { process.kill(pid, 0); return true; }
-  catch (error) { return (error as NodeJS.ErrnoException).code !== "ESRCH"; }
-}
+const ownerAlive = (owner: ProcessOwner) => processOwnerAlive(owner, true);
 
 export async function runAssignment(input: AssignmentInput): Promise<AssignmentResult> {
   const request = decode(input.raw, input.secrets);
@@ -129,33 +108,34 @@ export async function runAssignment(input: AssignmentInput): Promise<AssignmentR
   let lock: string | null = null;
   let unstarted: { stateDir: string; intent: Intent } | null = null;
   try {
-    const stateDir = directory(input.stateDir);
+    const state = assignmentDirectory(input.stateDir);
+    const stateDir = state.path;
     assertPrivateDirectory(stateDir);
-    const workspace = await current(input, request, stateDir);
+    const workspace = await current(input, request, state);
     if (workspace === null) return outcome("held");
-    lock = stateDir + ":" + journalDigest(workspace);
+    lock = state.identity + ":" + workspace.identity;
     if (active.has(lock)) { lock = null; return outcome("held"); }
     active.add(lock);
     const at = input.now();
     if (!whole(at, 0)) return outcome("held");
     const intent: Intent = {
-      version: 2, kind: "intent", id: request.id, sequence: request.sequence, requestDigest: journalDigest(canonical(request)),
-      bindingDigest: journalDigest(canonical(request.binding)), workspaceDigest: journalDigest(workspace),
-      scopeDigest: journalDigest(canonical({ board: request.binding.board, repo: request.binding.repo, connection: request.binding.connection })), at, pid: process.pid,
+      version: 3, kind: "intent", id: request.id, sequence: request.sequence, requestDigest: journalDigest(canonical(request)),
+      bindingDigest: journalDigest(canonical(request.binding)), workspaceDigest: journalDigest(workspace.identity),
+      scopeDigest: journalDigest(canonical({ board: request.binding.board, repo: request.binding.repo, connection: request.binding.connection })), at, ...currentProcessOwner(),
     };
-    const reserved = reserveAssignment(stateDir, intent, ownerAlive);
+    const reserved = reserveAssignment(stateDir, intent, journalDigest(workspace.legacyPath), ownerAlive);
     if (reserved.state === "new") unstarted = { stateDir, intent };
-    if (await current(input, request, stateDir) !== workspace) throw new Error("Assignment authority changed.");
+    if ((await current(input, request, state))?.identity !== workspace.identity) throw new Error("Assignment authority changed.");
     if (reserved.state === "completed" || reserved.state === "failed" || reserved.state === "not-started") return outcome(reserved.state);
-    if (reserved.state === "pending" && ownerAlive(reserved.owner)) return outcome("held");
+    if (reserved.state === "pending" && ownerAlive(reserved.intent)) return outcome("held");
     if (reserved.state === "new") startAssignment(stateDir, intent, input.now());
     unstarted = null;
     // An intent surviving its controller is uncertain at every age; only read-only evidence can resolve it.
     const observed: unknown = structuredClone(reserved.state === "pending"
-      ? await input.adapter.reconcile({ id: request.id, sequence: request.sequence, requestDigest: intent.requestDigest })
-      : await input.adapter.execute({ id: request.id, sequence: request.sequence, input: request.input, workspace }));
-    if (!terminal(observed, request) || await current(input, request, stateDir) !== workspace) return outcome("held");
-    completeAssignment(stateDir, intent, observed.result, input.now());
+      ? await input.adapter.reconcile({ id: request.id, sequence: request.sequence, requestDigest: reserved.intent.requestDigest })
+      : await input.adapter.execute({ id: request.id, sequence: request.sequence, input: request.input, workspace: workspace.path }));
+    if (!terminal(observed, request) || (await current(input, request, state))?.identity !== workspace.identity) return outcome("held");
+    completeAssignment(stateDir, reserved.intent, observed.result, input.now());
     return outcome(observed.result);
   } catch {
     if (unstarted) {
