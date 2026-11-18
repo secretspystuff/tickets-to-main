@@ -2,7 +2,7 @@ import { closeSync, fsyncSync, lstatSync, mkdirSync, openSync, readFileSync, rea
 import { dirname, isAbsolute, join, parse, resolve } from "node:path";
 import { randomUUID } from "node:crypto";
 import { withStateLease } from "./state-lease.ts";
-import { assertPrivateDirectory, writePrivateFile } from "./fs-safety.ts";
+import { assertPrivateAccess, assertPrivateDirectory, writePrivateFile } from "./fs-safety.ts";
 import { MANIFEST_FILE, MAX_MANIFEST_BYTES, SIGNATURE_FILE, releaseError, sha256, type ReleaseManifest, type ReleaseServices } from "./release-manifest.ts";
 
 export function exists(path: string): boolean {
@@ -45,7 +45,8 @@ export function writeReleaseFile(path: string, bytes: Uint8Array, executable = f
 
 export function readReleaseFile(path: string, limit: number): Buffer {
   const listed = lstatSync(path);
-  if (!listed.isFile() || listed.isSymbolicLink() || listed.nlink !== 1 || listed.size > limit || (listed.mode & 0o077) !== 0) throw releaseError();
+  if (!listed.isFile() || listed.isSymbolicLink() || listed.nlink !== 1 || listed.size > limit) throw releaseError();
+  assertPrivateAccess(path);
   return readFileSync(path);
 }
 
@@ -205,7 +206,8 @@ export function verifyPartialStage(stateDir: string, intent: OwnedStage): void {
         walk(actual, relative);
       } else {
         const limit = files.get(relative);
-        if (limit === undefined || !entry.isFile() || entry.nlink !== 1 || (entry.mode & 0o077) !== 0 || entry.size > limit) throw releaseError();
+        if (limit === undefined || !entry.isFile() || entry.nlink !== 1 || entry.size > limit) throw releaseError();
+        assertPrivateAccess(path);
       }
     }
   };

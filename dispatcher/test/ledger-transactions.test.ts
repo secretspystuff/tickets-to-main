@@ -8,7 +8,7 @@ import { loadLedger, saveLedger, updateLedger } from "../src/ledger.ts";
 import { recoverInstall } from "../src/install.ts";
 import { withStateLease, stateLeaseStatus } from "../src/state-lease.ts";
 import { processBirth } from "../src/process-identity.ts";
-import { removeDir, tempDir } from "./helpers.ts";
+import { differentBirth, removeDir, tempDir } from "./helpers.ts";
 import { assertNonInstallState, installFixture, nonInstallState, seedRetainedLedger, snapshot } from "./release-test-fixtures.ts";
 
 const ledgerModule = new URL("../src/ledger.ts", import.meta.url).href;
@@ -72,7 +72,7 @@ test("a reused live PID cannot hold a crashed owner's lease; matching and unknow
     const original = readFileSync(file, "utf8");
     const owner = JSON.parse(original);
     const birth = processBirth(process.pid);
-    assert.ok(birth, "this Linux probe must obtain a real process start identity");
+    assert.ok(birth, "the native probe must obtain a real process start identity");
     writeFileSync(file, JSON.stringify({ ...owner, version: 2, pid: process.pid, birth }));
     const held = snapshot(dir);
     assert.equal(stateLeaseStatus(dir, "release"), "active");
@@ -81,7 +81,7 @@ test("a reused live PID cannot hold a crashed owner's lease; matching and unknow
     const { birth: _birth, ...legacyOwner } = owner;
     writeFileSync(file, JSON.stringify({ ...legacyOwner, version: 1, pid: process.pid }));
     assert.equal(stateLeaseStatus(dir, "release"), "active", "legacy live PID has no proof of a different incarnation");
-    writeFileSync(file, JSON.stringify({ ...owner, version: 2, pid: process.pid, birth: birth + "0" }));
+    writeFileSync(file, JSON.stringify({ ...owner, version: 2, pid: process.pid, birth: differentBirth(birth) }));
     const stale = readFileSync(file);
     assert.equal(stateLeaseStatus(dir, "release"), "dead");
     let entered = false;

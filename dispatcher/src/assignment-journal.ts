@@ -1,14 +1,14 @@
 import { createHash } from "node:crypto";
 import { closeSync, constants, fsyncSync, fstatSync, lstatSync, openSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { assertPrivateDirectory } from "./fs-safety.ts";
+import { assertPrivateAccess, assertPrivateDirectory } from "./fs-safety.ts";
 import { withStateLease } from "./state-lease.ts";
 import { currentProcessOwner, validProcessBirth, type ProcessOwner } from "./process-identity.ts";
 
 export type Intent = {
-  version?: 2 | 3;
+  version?: 2 | 3 | 4;
   kind: "intent"; id: string; sequence: number; requestDigest: string; bindingDigest: string;
-  workspaceDigest: string; scopeDigest: string; at: number; pid: number; birth?: string;
+  workspaceDigest: string; aliasDigest?: string; scopeDigest: string; at: number; pid: number; birth?: string;
 };
 type Result = { kind: "result"; id: string; sequence: number; requestDigest: string; at: number; outcome: "completed" | "failed" | "not-started" };
 type Started = { kind: "started"; id: string; sequence: number; requestDigest: string; at: number };
@@ -34,15 +34,16 @@ function records(text: string): Map<string, Entry> {
     const value = row as Record<string, unknown>;
     if (!opaque(value.id) || !integer(value.sequence, 1) || !digest(value.requestDigest) || !integer(value.at, 0)) throw unavailable();
     if (value.kind === "intent") {
-      if (!exact(value, ["kind", "id", "sequence", "requestDigest", "bindingDigest", "workspaceDigest", "scopeDigest", "at", "pid", ...(Object.hasOwn(value, "version") ? ["version"] : []), ...(Object.hasOwn(value, "birth") ? ["birth"] : [])])
-        || (Object.hasOwn(value, "version") && value.version !== 2 && value.version !== 3)
-        || (Object.hasOwn(value, "birth") && (value.version !== 3 || !validProcessBirth(value.birth)))
+      if (!exact(value, ["kind", "id", "sequence", "requestDigest", "bindingDigest", "workspaceDigest", "scopeDigest", "at", "pid", ...(Object.hasOwn(value, "version") ? ["version"] : []), ...(Object.hasOwn(value, "birth") ? ["birth"] : []), ...(value.version === 4 ? ["aliasDigest"] : [])])
+        || (Object.hasOwn(value, "version") && value.version !== 2 && value.version !== 3 && value.version !== 4)
+        || (Object.hasOwn(value, "birth") && ((value.version !== 3 && value.version !== 4) || !validProcessBirth(value.birth)))
+        || (value.version === 4 && !digest(value.aliasDigest))
         || !digest(value.bindingDigest) || !digest(value.workspaceDigest) || !digest(value.scopeDigest) || !integer(value.pid, 1)
         || entries.has(value.id as string)) throw unavailable();
       const intent = value as Intent;
       const prior = [...entries.values()].filter((entry) => entry.intent.scopeDigest === intent.scopeDigest);
       if (prior.some((entry) => entry.intent.sequence >= intent.sequence)
-        || [...entries.values()].some((entry) => !entry.result && entry.intent.workspaceDigest === intent.workspaceDigest)) throw unavailable();
+        || [...entries.values()].some((entry) => !entry.result && overlap(entry.intent, intent))) throw unavailable();
       // Legacy intents could execute without a start record, so their absence is not proof of non-execution.
       entries.set(intent.id, { intent, started: intent.version === undefined, result: null });
     } else if (value.kind === "started") {
@@ -72,7 +73,8 @@ function transact<T>(stateDir: string, operation: (entries: Map<string, Entry>, 
     let exists = true;
     try {
       const info = lstatSync(path);
-      if (!info.isFile() || info.isSymbolicLink() || info.nlink !== 1 || (info.mode & 0o077) !== 0 || info.size > MAX_BYTES) throw unavailable();
+      if (!info.isFile() || info.isSymbolicLink() || info.nlink !== 1 || info.size > MAX_BYTES) throw unavailable();
+      assertPrivateAccess(path);
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
       exists = false;
@@ -82,7 +84,8 @@ function transact<T>(stateDir: string, operation: (entries: Map<string, Entry>, 
       const actual = fstatSync(fd);
       const listed = lstatSync(path);
       if (!actual.isFile() || listed.isSymbolicLink() || actual.ino !== listed.ino || actual.dev !== listed.dev
-        || actual.nlink !== 1 || (actual.mode & 0o077) !== 0 || actual.size > MAX_BYTES) throw unavailable();
+        || actual.nlink !== 1 || actual.size > MAX_BYTES) throw unavailable();
+      assertPrivateAccess(path);
       const text = readFileSync(fd, "utf8");
       const entries = records(text);
       // A previous process may have died after writing bytes but before their flush completed.
@@ -105,17 +108,25 @@ function transact<T>(stateDir: string, operation: (entries: Map<string, Entry>, 
 
 function matching(left: Intent, right: Intent): boolean {
   return left.id === right.id && left.sequence === right.sequence && left.requestDigest === right.requestDigest
-    && left.bindingDigest === right.bindingDigest && left.workspaceDigest === right.workspaceDigest && left.scopeDigest === right.scopeDigest;
+    && left.bindingDigest === right.bindingDigest && left.workspaceDigest === right.workspaceDigest && left.scopeDigest === right.scopeDigest
+    && left.aliasDigest === right.aliasDigest;
+}
+
+function overlap(a: Intent, b: Intent): boolean {
+  if (a.version === 4 && b.version === 4) return a.workspaceDigest === b.workspaceDigest || a.aliasDigest === b.aliasDigest;
+  return a.version === b.version && a.workspaceDigest === b.workspaceDigest;
 }
 
 export function reserveAssignment(stateDir: string, intent: Intent, legacyWorkspaceDigest: string, ownerAlive: (owner: ProcessOwner) => boolean): { state: "new" | "pending" | Result["outcome"]; intent: Intent } {
   return transact(stateDir, (entries, append) => {
-    const sameWorkspace = (old: Intent) => old.workspaceDigest === (old.version === 3 ? intent.workspaceDigest : legacyWorkspaceDigest);
+    const sameWorkspace = (old: Intent) => old.version === 4 ? overlap(old, intent)
+      : old.workspaceDigest === (old.version === 3 ? intent.aliasDigest : legacyWorkspaceDigest);
     const previous = entries.get(intent.id);
-    if (previous && (!sameWorkspace(previous.intent) || !matching(previous.intent, { ...intent, workspaceDigest: previous.intent.workspaceDigest })
+    if (previous && (!matching(previous.intent, { ...intent, workspaceDigest: previous.intent.workspaceDigest, aliasDigest: previous.intent.aliasDigest })
+      || (previous.intent.version === 4 && !sameWorkspace(previous.intent))
       || intent.at < previous.intent.at)) throw unavailable();
     for (const entry of entries.values()) {
-      if (!entry.result && !entry.started && sameWorkspace(entry.intent) && !ownerAlive(entry.intent)) {
+      if (!entry.result && !entry.started && (sameWorkspace(entry.intent) || entry === previous) && !ownerAlive(entry.intent)) {
         if (intent.at < entry.intent.at) throw unavailable();
         const result: Result = { kind: "result", id: entry.intent.id, sequence: entry.intent.sequence,
           requestDigest: entry.intent.requestDigest, at: intent.at, outcome: "not-started" };
@@ -128,7 +139,7 @@ export function reserveAssignment(stateDir: string, intent: Intent, legacyWorksp
     }
     const prior = [...entries.values()].filter((entry) => entry.intent.scopeDigest === intent.scopeDigest);
     // Legacy path hashes cannot rule out an alternate spelling of this workspace.
-    if ([...entries.values()].some((entry) => !entry.result && (entry.intent.version !== 3 || sameWorkspace(entry.intent)))
+    if ([...entries.values()].some((entry) => !entry.result && (entry.intent.version !== 4 || sameWorkspace(entry.intent)))
       || prior.some((entry) => entry.intent.sequence >= intent.sequence)
       || (prior.length > 0 && Math.max(...prior.map((entry) => entry.intent.sequence)) + 1 !== intent.sequence)) throw unavailable();
     append(intent);

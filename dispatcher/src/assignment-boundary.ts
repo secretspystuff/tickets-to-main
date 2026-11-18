@@ -87,13 +87,13 @@ function decode(raw: string, secrets: readonly string[]): AssignmentRequest | nu
   } catch { return null; }
 }
 
-async function current(input: AssignmentInput, request: AssignmentRequest, stateDir: DirectoryIdentity): Promise<DirectoryIdentity | null> {
+async function current(input: AssignmentInput, request: AssignmentRequest, stateDir: DirectoryIdentity, directory = assignmentDirectory): Promise<DirectoryIdentity | null> {
   const value: unknown = structuredClone(await input.adapter.readCurrent());
   if (!exact(value, ["binding", "nextSequence", "authorized", "seat", "confirmedWorkspace", "writersContained"])
     || value.authorized !== true || !["owner", "full", "member"].includes(value.seat as string)
     || value.writersContained !== true || !binding(value.binding) || canonical(value.binding) !== canonical(request.binding)
     || value.nextSequence !== request.sequence || typeof value.confirmedWorkspace !== "string") return null;
-  const workspace = assignmentDirectory(value.confirmedWorkspace);
+  const workspace = directory(value.confirmedWorkspace);
   return directoriesOverlap(stateDir, workspace) ? null : workspace;
 }
 function terminal(value: unknown, request: AssignmentRequest): value is AssignmentTerminal {
@@ -102,30 +102,30 @@ function terminal(value: unknown, request: AssignmentRequest): value is Assignme
 }
 const ownerAlive = (owner: ProcessOwner) => processOwnerAlive(owner, true);
 
-export async function runAssignment(input: AssignmentInput): Promise<AssignmentResult> {
+export async function runAssignment(input: AssignmentInput, directory = assignmentDirectory): Promise<AssignmentResult> {
   const request = decode(input.raw, input.secrets);
   if (!request || input.adapter.kind !== "fabricated-harness") return outcome("refused");
-  let lock: string | null = null;
+  const locks: string[] = [];
   let unstarted: { stateDir: string; intent: Intent } | null = null;
   try {
-    const state = assignmentDirectory(input.stateDir);
+    const state = directory(input.stateDir);
     const stateDir = state.path;
     assertPrivateDirectory(stateDir);
-    const workspace = await current(input, request, state);
+    const workspace = await current(input, request, state, directory);
     if (workspace === null) return outcome("held");
-    lock = state.identity + ":" + workspace.identity;
-    if (active.has(lock)) { lock = null; return outcome("held"); }
-    active.add(lock);
+    const keys = [state.identity + ":path:" + workspace.path, state.identity + ":file:" + workspace.identity];
+    if (keys.some((key) => active.has(key))) return outcome("held");
+    for (const key of keys) { active.add(key); locks.push(key); }
     const at = input.now();
     if (!whole(at, 0)) return outcome("held");
     const intent: Intent = {
-      version: 3, kind: "intent", id: request.id, sequence: request.sequence, requestDigest: journalDigest(canonical(request)),
-      bindingDigest: journalDigest(canonical(request.binding)), workspaceDigest: journalDigest(workspace.identity),
+      version: 4, kind: "intent", id: request.id, sequence: request.sequence, requestDigest: journalDigest(canonical(request)),
+      bindingDigest: journalDigest(canonical(request.binding)), workspaceDigest: journalDigest(workspace.path), aliasDigest: journalDigest(workspace.identity),
       scopeDigest: journalDigest(canonical({ board: request.binding.board, repo: request.binding.repo, connection: request.binding.connection })), at, ...currentProcessOwner(),
     };
     const reserved = reserveAssignment(stateDir, intent, journalDigest(workspace.legacyPath), ownerAlive);
     if (reserved.state === "new") unstarted = { stateDir, intent };
-    if ((await current(input, request, state))?.identity !== workspace.identity) throw new Error("Assignment authority changed.");
+    if ((await current(input, request, state, directory))?.identity !== workspace.identity) throw new Error("Assignment authority changed.");
     if (reserved.state === "completed" || reserved.state === "failed" || reserved.state === "not-started") return outcome(reserved.state);
     if (reserved.state === "pending" && ownerAlive(reserved.intent)) return outcome("held");
     if (reserved.state === "new") startAssignment(stateDir, intent, input.now());
@@ -134,7 +134,7 @@ export async function runAssignment(input: AssignmentInput): Promise<AssignmentR
     const observed: unknown = structuredClone(reserved.state === "pending"
       ? await input.adapter.reconcile({ id: request.id, sequence: request.sequence, requestDigest: reserved.intent.requestDigest })
       : await input.adapter.execute({ id: request.id, sequence: request.sequence, input: request.input, workspace: workspace.path }));
-    if (!terminal(observed, request) || (await current(input, request, state))?.identity !== workspace.identity) return outcome("held");
+    if (!terminal(observed, request) || (await current(input, request, state, directory))?.identity !== workspace.identity) return outcome("held");
     completeAssignment(stateDir, reserved.intent, observed.result, input.now());
     return outcome(observed.result);
   } catch {
@@ -146,5 +146,5 @@ export async function runAssignment(input: AssignmentInput): Promise<AssignmentR
     }
     return outcome("held");
   }
-  finally { if (lock !== null) active.delete(lock); }
+  finally { for (const key of locks) active.delete(key); }
 }

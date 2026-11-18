@@ -7,7 +7,7 @@ import { fileURLToPath } from "node:url";
 import { run } from "../src/cli.ts";
 import { MemoryCustody, TestKeychain, UnavailableCustody, BOARD_KEY_ACCOUNT, DEVICE_CODE_ACCOUNT } from "../src/custody.ts";
 import { CODEX_INTERFACE_RULE } from "../src/status.ts";
-import { harnessIo, io, removeDir, tempDir } from "./helpers.ts";
+import { assertPrivateMode, makePublic, fileSymlink, harnessIo, io, removeDir, tempDir } from "./helpers.ts";
 
 const FIXTURE = new URL("../fixtures/device-login.json", import.meta.url);
 
@@ -29,8 +29,8 @@ test("install records an early linux probe and leaves startup and installers unq
     assert.equal(ledger.install.startup, "not-registered");
     assert.equal(ledger.install.signedInstallers, "not-qualified");
     assert.equal(ledger.install.platform, "early-linux-probe");
-    assert.equal((lstatSync(dir).mode & 0o777), 0o700);
-    assert.equal((lstatSync(join(dir, "ledger.json")).mode & 0o777), 0o600);
+    assertPrivateMode(dir, 0o700);
+    assertPrivateMode(join(dir, "ledger.json"), 0o600);
   } finally {
     removeDir(dir);
   }
@@ -55,7 +55,7 @@ test("install refuses a state directory other people can read", async () => {
   const parent = tempDir();
   const dir = join(parent, "open");
   mkdirSync(dir, { mode: 0o755 });
-  chmodSync(dir, 0o755);
+  makePublic(dir);
   try {
     const context = io();
     const code = await run(["install", "--state", dir], context);
@@ -73,14 +73,14 @@ test("install does not follow a planted temporary symlink", async () => {
   const leaked = join(outside, "leaked.json");
   writeFileSync(leaked, "kept\n", { mode: 0o666 });
   chmodSync(dir, 0o700);
-  symlinkSync(leaked, join(dir, "ledger.json.tmp"));
+  fileSymlink(leaked, join(dir, "ledger.json.tmp"));
   try {
     const context = io();
     const code = await run(["install", "--state", dir], context);
     assert.equal(code, 0, context.err);
     assert.equal(readFileSync(leaked, "utf8"), "kept\n");
     assert.equal(lstatSync(join(dir, "ledger.json")).isSymbolicLink(), false);
-    assert.equal((lstatSync(join(dir, "ledger.json")).mode & 0o777), 0o600);
+    assertPrivateMode(join(dir, "ledger.json"), 0o600);
   } finally {
     removeDir(dir);
     removeDir(outside);
@@ -130,7 +130,7 @@ test("install refuses to follow a ledger symlink", async () => {
   const outside = tempDir();
   const leaked = join(outside, "leaked.json");
   writeFileSync(leaked, "{\"kept\":true}\n");
-  symlinkSync(leaked, join(dir, "ledger.json"));
+  fileSymlink(leaked, join(dir, "ledger.json"));
   try {
     const context = io();
     const code = await run(["install", "--state", dir], context);
@@ -202,7 +202,7 @@ test("fixture connect stores the key only in custody and survives a restart of t
     assert.match(signed.out, /Signed in: yes/);
     assert.match(signed.out, /Keychain: test double, unqualified/);
     assert.match(signed.out, /Ready for an assignment: no/);
-    assert.equal((lstatSync(keychain).mode & 0o777), 0o600);
+    assertPrivateMode(keychain, 0o600);
     const restarted = harnessIo({ custody: new MemoryCustody() });
     const status = await run(["status", "--state", dir], restarted);
     assert.equal(status, 0);

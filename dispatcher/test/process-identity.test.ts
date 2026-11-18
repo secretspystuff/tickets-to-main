@@ -60,6 +60,20 @@ test("Windows birth observation uses exact ticks and refuses failed or malformed
   for (const value of ["", "0", "-1", "123\n456", "not found"]) assert.equal(processBirth(42, { ...host, run: () => value }), null);
 });
 
+test("macOS second-precision ps start time releases only a definite mismatch", () => {
+  const line = "Mon Nov 16 20:54:03 2026\n";
+  const host: ProcessHost = { platform: "darwin", alive: () => true, read: () => "", run: () => line };
+  assert.equal(processBirth(42, host), "darwin:Mon Nov 16 20:54:03 2026");
+  assert.equal(processOwnerAlive({ pid: 42, birth: "darwin:Mon Nov 16 20:54:03 2026" }, false, host), true);
+  assert.equal(processOwnerAlive({ pid: 42, birth: "darwin:Mon Nov 16 20:54:02 2026" }, false, host), false);
+  for (const value of ["", "permission denied", "Mon Nov 16 20:54:03 2026\nTue Nov 17 20:54:03 2026", "Mon Nov 99 99:99:99 2026"]) {
+    assert.equal(processBirth(42, { ...host, run: () => value }), null);
+    assert.equal(processOwnerAlive({ pid: 42, birth: "darwin:Mon Nov 16 20:54:02 2026" }, false, { ...host, run: () => value }), true);
+  }
+  assert.equal(processOwnerAlive({ pid: 42, birth: "darwin:Mon Nov 16 20:54:02 2026" }, false,
+    { ...host, run: () => { throw new Error("ps failed"); } }), true);
+});
+
 test("current-process dormant ownership applies only with its matching birth identity", () => {
   const host = linux();
   assert.equal(processOwnerAlive({ pid: process.pid, birth: "linux:" + boot + ":123" }, true, host), false);

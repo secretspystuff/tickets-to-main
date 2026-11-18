@@ -1,7 +1,7 @@
 import { closeSync, fsyncSync, lstatSync, mkdirSync, openSync, readFileSync, readdirSync, renameSync, rmdirSync, unlinkSync, writeFileSync } from "node:fs";
 import { isAbsolute, join } from "node:path";
 import { randomUUID } from "node:crypto";
-import { assertPrivateDirectory, StateError } from "./fs-safety.ts";
+import { assertPrivateAccess, assertPrivateDirectory, ensurePrivateDirectory, StateError } from "./fs-safety.ts";
 import { currentProcessOwner, processOwnerAlive, validProcessBirth } from "./process-identity.ts";
 
 type Namespace = "ledger" | "release";
@@ -29,7 +29,8 @@ function write(path: string, bytes: Buffer): void {
 
 function read(path: string): Buffer {
   const listed = lstatSync(path);
-  if (!listed.isFile() || listed.isSymbolicLink() || listed.nlink !== 1 || listed.size > 1024 || (listed.mode & 0o077) !== 0) throw unavailable();
+  if (!listed.isFile() || listed.isSymbolicLink() || listed.nlink !== 1 || listed.size > 1024) throw unavailable();
+  assertPrivateAccess(path);
   return readFileSync(path);
 }
 
@@ -37,7 +38,7 @@ function rootOf(stateDir: string, namespace: Namespace, create: boolean): string
   if (!isAbsolute(stateDir) || (namespace !== "ledger" && namespace !== "release")) throw unavailable();
   if (!present(stateDir)) {
     if (!create) return null;
-    mkdirSync(stateDir, { recursive: true, mode: 0o700 });
+    ensurePrivateDirectory(stateDir);
   }
   assertPrivateDirectory(stateDir);
   const parent = join(stateDir, ".state-leases");

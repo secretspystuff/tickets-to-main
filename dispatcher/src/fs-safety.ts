@@ -1,5 +1,6 @@
 import { chmodSync, closeSync, fsyncSync, lstatSync, mkdirSync, openSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
 import { dirname } from "node:path";
+import { windowsPrivacy } from "./windows-privacy.ts";
 
 export class StateError extends Error {
   constructor(message: string) {
@@ -15,9 +16,11 @@ export function ensurePrivateDirectory(dir: string): void {
   if (listed.isSymbolicLink() || !listed.isDirectory()) {
     throw new StateError("The state directory is a link. Nothing was saved.");
   }
-  chmodSync(dir, 0o700);
+  if (process.platform === "win32") windowsPrivacy(dir, "protect");
+  else chmodSync(dir, 0o700);
   const mode = lstatSync(dir).mode & 0o777;
-  if ((mode & 0o077) !== 0) throw new StateError("The state directory is not private. Nothing was saved.");
+  if (process.platform === "win32") assertPrivateAccess(dir);
+  else if ((mode & 0o077) !== 0) throw new StateError("The state directory is not private. Nothing was saved.");
 }
 
 export function assertPrivateDirectory(dir: string): void {
@@ -25,8 +28,14 @@ export function assertPrivateDirectory(dir: string): void {
   if (listed.isSymbolicLink() || !listed.isDirectory()) {
     throw new StateError("The state directory is a link. Nothing was saved.");
   }
-  const mode = listed.mode & 0o777;
-  if ((mode & 0o077) !== 0) throw new StateError("The state directory is not private. Nothing was saved.");
+  assertPrivateAccess(dir);
+}
+
+export function assertPrivateAccess(path: string): void {
+  try {
+    if (process.platform === "win32") windowsPrivacy(path);
+    else if ((lstatSync(path).mode & 0o077) !== 0) throw new Error("not private");
+  } catch { throw new StateError("The local record is not private. Nothing was saved."); }
 }
 
 function replaceExistingLeaf(path: string): void {
@@ -67,10 +76,11 @@ export function writePrivateFile(path: string, text: string): void {
     closeSync(fd);
   }
   const created = lstatSync(temporary);
-  if (created.isSymbolicLink() || (created.mode & 0o077) !== 0) {
+  if (created.isSymbolicLink()) {
     unlinkSync(temporary);
     throw new StateError("The local record would be readable by other users. It was not saved.");
   }
+  assertPrivateAccess(temporary);
   renameSync(temporary, path);
-  chmodSync(path, 0o600);
+  if (process.platform !== "win32") chmodSync(path, 0o600);
 }
