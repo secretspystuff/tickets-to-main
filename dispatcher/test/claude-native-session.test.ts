@@ -446,7 +446,7 @@ test("credentials refuse before spawn and native results use the shared redactor
   }, ["held-secret"], LAUNCH).closed;
   const serialized = JSON.stringify(result);
   for (const forbidden of [REQUEST.prompt, "held-secret", "SYNTHETIC_PRIVATE_KEY_BODY", "s".repeat(24), "Private diagnostic"]) assert.equal(serialized.includes(forbidden), false);
-  assert.deepEqual({ ...transport.calls[0]!.env }, { NATIVE_PREFERENCE: "retained", CLAUDE_CONFIG_DIR: "C:\\fixture-native-config" });
+  assert.deepEqual({ ...transport.calls[0]!["env"] }, { NATIVE_PREFERENCE: "retained", CLAUDE_CONFIG_DIR: "C:\\fixture-native-config" });
   assert.equal(result.resultText!.includes("[assignment input omitted]"), true);
 });
 

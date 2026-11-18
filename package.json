@@ -11,13 +11,14 @@
   "scripts": {
     "build": "tsc --noEmit -p dispatcher",
     "typecheck": "tsc --noEmit -p dispatcher",
-    "test": "node --test --test-concurrency=1 --experimental-strip-types dispatcher/test/*.test.ts",
+    "test": "node --test .github/scripts/*.test.mjs && node --test --test-concurrency=1 --experimental-strip-types dispatcher/test/*.test.ts",
     "check": "npm run build && npm test",
     "start": "node dispatcher/bin/tickets-to-main.mjs"
   },
   "devDependencies": {
+    "@types/node": "22.20.2",
     "typescript": "5.9.3",
-    "@types/node": "22.20.2"
+    "yaml": "2.8.2"
   },
   "bin": {
     "tickets-to-main": "dispatcher/bin/tickets-to-main.mjs"

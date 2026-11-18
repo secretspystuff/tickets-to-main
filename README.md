@@ -34,6 +34,37 @@ This boundary is not wired to the command line, network, or native tools. Its ad
 
 Both directories are required because the runtime imports the public protocol by relative path. Package version 0.1.0 identifies this pre-release source and matches the runtime version recorded locally; it does not identify a signed release. The root package defines a pre-release npm tarball with the runtime, public protocol, manifest, and fabricated fixtures together, plus the tickets-to-main command. It has no production npm dependencies. Tests and development tooling remain in the source tree. Package the root, rather than the nested dispatcher directory. The root package stays private to prevent registry publication before release review; this does not prevent creating a local tarball. A source tarball is not a qualified installer or signed release.
 
+## Repository boundary checks
+
+Every push and pull request runs a tracked-path allowlist and a private-name check
+from `.github/scripts/repo-guard.mjs`. The reviewed path prefixes and exact paths
+live in `.github/allowed-paths.txt`; private-name regular expressions live in
+`.github/private-patterns.txt`. These checks inspect committed blobs and paths,
+including ignored files that are tracked, and reject symbolic links and submodules.
+Blobs containing NUL bytes are rejected; no binary fixture paths are exempt.
+All guards run inside the required `check` job. Regression tests also verify that
+the guard commands remain enabled in that job and that its actions stay pinned.
+The hostname rules reject subdomains of the public site and hosted deployment
+domains. Additional private domains require explicit patterns in that list.
+
+Run the tree checks after committing:
+
+```sh
+node .github/scripts/repo-guard.mjs paths
+node .github/scripts/repo-guard.mjs private
+```
+
+CI also runs Gitleaks 8.30.1, with a pinned archive checksum, over complete reachable
+history, including intermediate commits whose contents were later deleted. No
+credentials or paid service are required. Findings are redacted; inline suppression
+comments are disabled. `.github/secret-fixtures.ignore` records only exact historical
+findings from fabricated PEM redaction tests, with a reason for each exception.
+New occurrences remain subject to scanning. Run the same scan locally with:
+
+```sh
+gitleaks git --redact --no-banner --ignore-gitleaks-allow --gitleaks-ignore-path .github/secret-fixtures.ignore --log-opts=HEAD .
+```
+
 ## License
 
 Apache-2.0; see [LICENSE](LICENSE).

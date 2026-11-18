@@ -320,7 +320,7 @@ for (const { vendor, start, argv } of RECIPES) {
     const result = await handle.closed;
     for (const secret of ["held-secret", "s".repeat(24), "private body", REQUEST.prompt]) assert.equal(JSON.stringify(result).includes(secret), false);
     assert.match(result.resultText!, /\[redacted\]/);
-    const env = transport.calls[0]!.env;
+    const env = transport.calls[0]!["env"];
     for (const name of ["TICKETS_PLEASE_TOKEN", "ALIAS", "OPENAI_API_KEY", "ANTHROPIC_API_KEY", "GITHUB_TOKEN"]) assert.equal(env[name], undefined);
     assert.equal(env[ vendor === "cursor" ? "XAI_API_KEY" : "CURSOR_API_KEY" ], undefined);
     assert.equal(env[ vendor === "cursor" ? "CURSOR_API_KEY" : "XAI_API_KEY" ], vendor === "cursor" ? "cursor-native-value" : "grok-native-value");
