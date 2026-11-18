@@ -52,9 +52,9 @@ test("cli harness evidence cannot qualify app-server and never includes the prom
   assert.equal(observation.stdin, "");
   assert.equal(JSON.stringify(observation).includes("Say ready."), false);
   assert.equal(runner.calls[0]?.input.join(""), "Say ready.");
-    assert.equal(runner.calls[0]?.["env"]?.TP_KEY, undefined);
-    assert.equal(runner.calls[0]?.["env"]?.TICKETS_TO_MAIN_STATE, undefined);
-    assert.equal(runner.calls[0]?.["env"]?.HOME, "/home/fixture");
+  assert.equal(runner.calls[0]?.["env"]?.TP_KEY, undefined);
+  assert.equal(runner.calls[0]?.["env"]?.TICKETS_TO_MAIN_STATE, undefined);
+  assert.equal(runner.calls[0]?.["env"]?.HOME, "/home/fixture");
   const cli = applyHarnessEvidence(documentedCodexClaim("cli"), observation);
   assert.equal(cli.qualification, "harness-passed");
   assert.equal(cli.capabilities.assignment, "supported");

@@ -17,7 +17,7 @@ function assertWorkflowContract(candidate) {
   assert.ok(!job['continue-on-error']);
   // Compare complete mappings, including order, rather than selected properties.
   // Every additional key or changed value requires updating this reviewed contract.
-  assert.deepEqual(job.steps, [
+  const expectedSteps = [
     {
       uses: 'actions/checkout@11d5960a326750d5838078e36cf38b85af677262',
       with: { 'fetch-depth': 0, 'persist-credentials': false },
@@ -59,7 +59,23 @@ function assertWorkflowContract(candidate) {
     },
     { run: 'npm ci --ignore-scripts --no-audit --no-fund' },
     { run: 'npm run check' },
-  ], 'The check steps match the complete reviewed definitions');
+  ];
+  assert.deepEqual(job.steps, expectedSteps, 'The check steps match the complete reviewed definitions');
+  assert.deepEqual(candidate, {
+    name: 'check',
+    on: ['push', 'pull_request'],
+    permissions: { contents: 'read' },
+    concurrency: {
+      group: '${{ github.workflow }}-${{ github.ref }}',
+      'cancel-in-progress': true,
+    },
+    jobs: {
+      check: {
+        'runs-on': 'ubuntu-latest',
+        steps: expectedSteps,
+      },
+    },
+  }, 'The entire workflow matches the reviewed definition');
 }
 
 test('the required check job runs every guard and uses pinned actions', () => {
@@ -86,6 +102,25 @@ test('workflow contract rejects a job-level condition even when true', () => {
   modified.jobs.check.if = true;
   assert.throws(() => assertWorkflowContract(modified), { code: 'ERR_ASSERTION' });
 });
+
+for (const [label, mutate] of [
+  ['job environment', (value) => { value.jobs.check.env = { GITLEAKS_CONFIG_TOML: 'x' }; }],
+  ['job default working directory', (value) => { value.jobs.check.defaults = { run: { 'working-directory': '/tmp' } }; }],
+  ['job default shell', (value) => { value.jobs.check.defaults = { run: { shell: 'bash {0}' } }; }],
+  ['workflow default shell', (value) => { value.defaults = { run: { shell: 'bash {0}' } }; }],
+  ['workflow environment', (value) => { value.env = { GITLEAKS_CONFIG_TOML: 'x' }; }],
+  ['write permissions', (value) => { value.permissions.contents = 'write'; }],
+  ['job container', (value) => { value.jobs.check.container = 'node:24'; }],
+  ['job timeout', (value) => { value.jobs.check['timeout-minutes'] = 1; }],
+  ['job strategy', (value) => { value.jobs.check.strategy = { 'fail-fast': false }; }],
+  ['additional job', (value) => { value.jobs.extra = { 'runs-on': 'ubuntu-latest', steps: [] }; }],
+]) {
+  test(`workflow contract rejects ${label}`, () => {
+    const modified = structuredClone(workflow);
+    mutate(modified);
+    assert.throws(() => assertWorkflowContract(modified), { code: 'ERR_ASSERTION' });
+  });
+}
 
 // Tree objects exercise the real committed-blob CLI without authors, credentials,
 // checkout changes, or reading local environment files.
