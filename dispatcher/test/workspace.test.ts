@@ -1,3 +1,4 @@
+import { fileURLToPath } from "node:url";
 import assert from "node:assert/strict";
 import { chmodSync, lstatSync, mkdirSync, readdirSync, readFileSync, realpathSync, symlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
@@ -36,11 +37,11 @@ function persistentTool(): SecretToolRunner & { values: Map<string, string> } {
 async function approve(dir: string, custody: SecretToolCustody): Promise<void> {
   const context = harnessIo({ custody });
   await run(["install", "--state", dir], context);
-  await run(["connect", "start", "--state", dir, "--computer", "fixture-computer", "--fixture", FIXTURE.pathname], context);
+  await run(["connect", "start", "--state", dir, "--computer", "fixture-computer", "--fixture", fileURLToPath(FIXTURE)], context);
   const pending = harnessIo({ custody, now: () => Date.parse("2026-10-25T00:00:00.000Z") });
-  await run(["connect", "poll", "--state", dir, "--fixture", FIXTURE.pathname], pending);
+  await run(["connect", "poll", "--state", dir, "--fixture", fileURLToPath(FIXTURE)], pending);
   const approved = harnessIo({ custody, now: () => Date.parse("2026-10-25T00:00:06.000Z") });
-  const code = await run(["connect", "poll", "--state", dir, "--fixture", FIXTURE.pathname], approved);
+  const code = await run(["connect", "poll", "--state", dir, "--fixture", fileURLToPath(FIXTURE)], approved);
   assert.equal(code, 0, approved.err);
 }
 
@@ -93,10 +94,10 @@ test("a failed keychain clear leaves the connection waiting", async () => {
   try {
     const context = harnessIo({ custody });
     await run(["install", "--state", dir], context);
-    await run(["connect", "start", "--state", dir, "--computer", "fixture-computer", "--fixture", FIXTURE.pathname], context);
-    await run(["connect", "poll", "--state", dir, "--fixture", FIXTURE.pathname], harnessIo({ custody, now: () => Date.parse("2026-10-25T00:00:00.000Z") }));
+    await run(["connect", "start", "--state", dir, "--computer", "fixture-computer", "--fixture", fileURLToPath(FIXTURE)], context);
+    await run(["connect", "poll", "--state", dir, "--fixture", fileURLToPath(FIXTURE)], harnessIo({ custody, now: () => Date.parse("2026-10-25T00:00:00.000Z") }));
     const failed = harnessIo({ custody, now: () => Date.parse("2026-10-25T00:00:06.000Z") });
-    const code = await run(["connect", "poll", "--state", dir, "--fixture", FIXTURE.pathname], failed);
+    const code = await run(["connect", "poll", "--state", dir, "--fixture", fileURLToPath(FIXTURE)], failed);
     assert.equal(code, 1);
     assert.match(failed.err, /did not remove the secret/);
     const ledger = JSON.parse(readFileSync(join(dir, "ledger.json"), "utf8")) as { connection: { phase: string } };
@@ -130,10 +131,10 @@ test("an echoed clear during approval does not store the board key", async () =>
   try {
     const context = harnessIo({ custody });
     await run(["install", "--state", dir], context);
-    await run(["connect", "start", "--state", dir, "--computer", "fixture-computer", "--fixture", FIXTURE.pathname], context);
-    await run(["connect", "poll", "--state", dir, "--fixture", FIXTURE.pathname], harnessIo({ custody, now: () => Date.parse("2026-10-25T00:00:00.000Z") }));
+    await run(["connect", "start", "--state", dir, "--computer", "fixture-computer", "--fixture", fileURLToPath(FIXTURE)], context);
+    await run(["connect", "poll", "--state", dir, "--fixture", fileURLToPath(FIXTURE)], harnessIo({ custody, now: () => Date.parse("2026-10-25T00:00:00.000Z") }));
     const failed = harnessIo({ custody, now: () => Date.parse("2026-10-25T00:00:06.000Z") });
-    const code = await run(["connect", "poll", "--state", dir, "--fixture", FIXTURE.pathname], failed);
+    const code = await run(["connect", "poll", "--state", dir, "--fixture", fileURLToPath(FIXTURE)], failed);
     assert.equal(code, 1);
     assert.match(failed.err, /echoed a secret/);
     const ledger = JSON.parse(readFileSync(join(dir, "ledger.json"), "utf8")) as { connection: { phase: string } };

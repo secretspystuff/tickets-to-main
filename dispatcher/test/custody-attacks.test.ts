@@ -73,7 +73,8 @@ test("the local record rejects keys, device codes and secret field names", () =>
 test("openCustody uses the test double only for the explicit test switch", () => {
   const runner: SecretToolRunner = { run: () => Promise.resolve({ code: 0, stdout: "" }) };
   assert.equal(openCustody({}, false, runner).describe().kind, "unavailable");
-  assert.equal(openCustody({}, true, runner).describe().kind, "secret-tool");
+  assert.equal(openCustody({}, true, runner, "linux").describe().kind, "secret-tool");
+  assert.equal(openCustody({}, true, runner, "win32").describe().kind, "unavailable");
   assert.throws(() => openCustody({ TICKETS_TO_MAIN_TEST_CUSTODY: "yes" }, false, runner), /not valid/);
   const custody = openCustody({ TICKETS_TO_MAIN_TEST_CUSTODY: "1", TICKETS_TO_MAIN_TEST_KEYCHAIN: "/tmp/tickets-to-main-test-keychain.json" }, true, runner);
   assert.equal(custody.describe().kind, "test-double");

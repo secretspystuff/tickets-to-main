@@ -174,21 +174,21 @@ test("fixture connect stores the key only in custody and survives a restart of t
     const context = harnessIo({ custody });
     await run(["install", "--state", dir], context);
     const started = harnessIo({ custody });
-    const start = await run(["connect", "start", "--state", dir, "--computer", "fixture-computer", "--fixture", FIXTURE.pathname], started);
+    const start = await run(["connect", "start", "--state", dir, "--computer", "fixture-computer", "--fixture", fileURLToPath(FIXTURE)], started);
     assert.equal(start, 0);
     assert.match(started.out, /Open https:\/\/fixture\.ticketsplease\.test\/device\?code=ABCD-EFGH and approve code ABCD-EFGH\./);
     assert.doesNotMatch(started.out, /fixture-device-code-not-shown/);
     assert.equal(text(dir).includes("fixture-device-code-not-shown"), false);
     assert.equal(text(dir).includes("tp_"), false);
     const early = harnessIo({ custody, now: () => Date.parse("2026-10-25T00:00:00.000Z") });
-    await run(["connect", "poll", "--state", dir, "--fixture", FIXTURE.pathname], early);
+    await run(["connect", "poll", "--state", dir, "--fixture", fileURLToPath(FIXTURE)], early);
     assert.match(early.out, /Waiting for approval/);
     const tooSoon = harnessIo({ custody, now: () => Date.parse("2026-10-25T00:00:04.000Z") });
-    const waited = await run(["connect", "poll", "--state", dir, "--fixture", FIXTURE.pathname], tooSoon);
+    const waited = await run(["connect", "poll", "--state", dir, "--fixture", fileURLToPath(FIXTURE)], tooSoon);
     assert.equal(waited, 0);
     assert.match(tooSoon.out, /Wait 5 seconds/);
     const approved = harnessIo({ custody, now: () => Date.parse("2026-10-25T00:00:06.000Z") });
-    const done = await run(["connect", "poll", "--state", dir, "--fixture", FIXTURE.pathname], approved);
+    const done = await run(["connect", "poll", "--state", dir, "--fixture", fileURLToPath(FIXTURE)], approved);
     assert.equal(done, 0);
     assert.match(approved.out, /Connected to the board Fixture Board as Runner \(fixture-computer\)\./);
     assert.match(approved.out, /Connection: fixture\./);
@@ -211,7 +211,7 @@ test("fixture connect stores the key only in custody and survives a restart of t
     assert.match(restarted.out, /Keychain: secret missing/);
     assert.match(restarted.out, /Ready for an assignment: no/);
     const again = harnessIo({ custody });
-    const refused = await run(["connect", "start", "--state", dir, "--computer", "fixture-computer", "--fixture", FIXTURE.pathname], again);
+    const refused = await run(["connect", "start", "--state", dir, "--computer", "fixture-computer", "--fixture", fileURLToPath(FIXTURE)], again);
     assert.equal(refused, 1);
     assert.match(again.out, /already connected/);
     assert.equal(await custody.get(BOARD_KEY_ACCOUNT), "tp_fixture_key_not_a_real_grant");
@@ -248,7 +248,7 @@ test("poll refuses a swapped fixture and a missing keychain", async () => {
     const custody = new MemoryCustody();
     const context = harnessIo({ custody });
     await run(["install", "--state", dir], context);
-    await run(["connect", "start", "--state", dir, "--computer", "fixture-computer", "--fixture", FIXTURE.pathname], context);
+    await run(["connect", "start", "--state", dir, "--computer", "fixture-computer", "--fixture", fileURLToPath(FIXTURE)], context);
     const swapped = JSON.parse(readFileSync(FIXTURE, "utf8")) as { challenge: { user_code: string } };
     swapped.challenge.user_code = "ZZZZ-ZZZZ";
     const path = join(dir, "swapped.json");
@@ -259,7 +259,7 @@ test("poll refuses a swapped fixture and a missing keychain", async () => {
     assert.match(mismatch.out, /does not match/);
     await custody.delete(DEVICE_CODE_ACCOUNT);
     const missing = harnessIo({ custody, now: () => Date.parse("2026-10-25T00:00:20.000Z") });
-    const lost = await run(["connect", "poll", "--state", dir, "--fixture", FIXTURE.pathname], missing);
+    const lost = await run(["connect", "poll", "--state", dir, "--fixture", fileURLToPath(FIXTURE)], missing);
     assert.equal(lost, 1);
     assert.match(missing.out, /missing from the keychain/);
   } finally {
@@ -273,7 +273,7 @@ test("a fixture connection is refused unless the test switch is on", async () =>
   try {
     await run(["install", "--state", dir], io());
     const context = io({ custody });
-    const code = await run(["connect", "start", "--state", dir, "--computer", "fixture-computer", "--fixture", FIXTURE.pathname], context);
+    const code = await run(["connect", "start", "--state", dir, "--computer", "fixture-computer", "--fixture", fileURLToPath(FIXTURE)], context);
     assert.equal(code, 1);
     assert.match(context.out, /only for the test harness/);
     assert.match(context.out, /No network request was sent\./);
@@ -290,7 +290,7 @@ test("connect start refuses when the keychain is unavailable", async () => {
     const context = io({ custody: new UnavailableCustody(), secretTool: false, env: {} });
     await run(["install", "--state", dir], context);
     context.out = "";
-    const code = await run(["connect", "start", "--state", dir, "--fixture", FIXTURE.pathname], context);
+    const code = await run(["connect", "start", "--state", dir, "--fixture", fileURLToPath(FIXTURE)], context);
     assert.equal(code, 1);
     assert.match(context.out, /no key was saved to a file/);
     assert.equal(text(dir).includes("ABCD-EFGH"), false);
