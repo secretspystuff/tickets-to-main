@@ -459,6 +459,7 @@ test("foreign live PID needs a matching birth before it can retain a preparation
     else intent.birth = match === "right" ? birth : differentBirth(birth);
     const before = JSON.stringify(intent) + "\n";
     writeFileSync(join(f.stateDir, "assignment-intents.jsonl"), before);
+    f.effects = async (value) => { f.calls.push(value); return f.terminal(); };
     let reconciles = 0;
     f.reconcile = async () => { reconciles++; return f.terminal(); };
     assert.equal((await f.run()).state, match === "wrong" ? "not-started" : "held");
