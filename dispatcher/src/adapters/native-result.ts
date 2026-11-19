@@ -1,4 +1,5 @@
 import type { AssignmentObservation } from "./contract.ts";
+import { redactCredentialShapes } from "../secret-text.ts";
 
 export type NativeOutcome = "starting" | "running" | "completed" | "failed" | "interrupted" | "held" | "disconnected" | "protocol-error" | "refused";
 export type NativeObservation = AssignmentObservation & {
@@ -37,7 +38,7 @@ export function safeNativeText(value: string, secrets: readonly string[], prompt
   for (const secret of [...secrets].filter(Boolean).sort((a, b) => b.length - a.length)) {
     text = text.split(secret).join("[redacted]");
   }
-  return text.replace(/\b(?:gh[pousr]_[A-Za-z0-9]{36,}|github_pat_[A-Za-z0-9_]{22,}|(?:tp|tpj|tps)_[A-Za-z0-9_-]{20,}|(?:sk-ant-|sk-proj-|sk-|xai-)[A-Za-z0-9_-]{20,}|AIza[A-Za-z0-9_-]{35}|AKIA[A-Z0-9]{16}|xox[abprs]-[A-Za-z0-9-]{10,})/g, "[redacted]");
+  return redactCredentialShapes(text);
 }
 
 export function nativeObservation(interfaceId: "cli" | "app-server"): NativeObservation {
