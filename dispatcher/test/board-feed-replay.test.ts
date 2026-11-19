@@ -201,6 +201,7 @@ test("a failed 410 snapshot waits for an explicit wake and retires its old reque
   assert.equal(failed.state.cursor, 10);
   assert.deepEqual(failed.actions, []);
 
+  unchanged(initial, failure);
   unchanged(started.state, { ...failure, requestId: read.requestId });
   unchanged(gap.state, { ...failure, requestId: read.requestId });
   for (const scope of [otherBoard, retiredSession]) unchanged(gap.state, { ...failure, scope });
@@ -210,7 +211,13 @@ test("a failed 410 snapshot waits for an explicit wake and retires its old reque
   unchanged(failed.state, { kind: "idle", scope: currentScope() });
   unchanged(failed.state, { kind: "changes-applied", scope: currentScope(), requestId: read.requestId, next: 18, more: false });
   for (const scope of [otherBoard, retiredSession]) unchanged(failed.state, { kind: "wake", scope });
-  const hinted = stepBoardFeedReplay(failed.state, { kind: "signal", scope: currentScope(), seq: 19 });
+  const newerHello = stepBoardFeedReplay(failed.state, { kind: "hi", scope: currentScope(), seq: 17 });
+  assert.equal(newerHello.state.cursor, 10);
+  assert.deepEqual(newerHello.actions, []);
+  const olderHello = stepBoardFeedReplay(newerHello.state, { kind: "hi", scope: currentScope(), seq: 5 });
+  assert.equal(olderHello.state.cursor, 10);
+  assert.deepEqual(olderHello.actions, []);
+  const hinted = stepBoardFeedReplay(olderHello.state, { kind: "signal", scope: currentScope(), seq: 19 });
   assert.equal(hinted.state.cursor, 10);
   assert.deepEqual(hinted.actions, []);
 
@@ -228,7 +235,13 @@ test("a failed 410 snapshot waits for an explicit wake and retires its old reque
   const caught = stepBoardFeedReplay(restored.state, {
     kind: "changes-applied", scope: currentScope(), requestId: catchUp.requestId, next: 18, more: false,
   });
-  readChanges(caught, 18);
+  const finalRead = readChanges(caught, 18);
+  const completed = stepBoardFeedReplay(caught.state, {
+    kind: "changes-applied", scope: currentScope(), requestId: finalRead.requestId, next: 19, more: false,
+  });
+  assert.equal(completed.state.cursor, 19);
+  assert.deepEqual(completed.actions, []);
+  unchanged(completed.state, failure);
   for (const [code, reason, other] of [[4403, "connection-ended", 4404], [4404, "board-deleted", 4403]] as const) {
     const closed = stepBoardFeedReplay(hinted.state, { kind: "closed", scope: currentScope(), code });
     assert.equal(closed.state.terminal, reason);
