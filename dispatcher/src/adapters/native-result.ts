@@ -1,5 +1,5 @@
 import type { AssignmentObservation } from "./contract.ts";
-import { redactCredentialShapes } from "../secret-text.ts";
+import { redactCredentialShapes, redactPrivateKeys } from "../secret-text.ts";
 
 export type NativeOutcome = "starting" | "running" | "completed" | "failed" | "interrupted" | "held" | "disconnected" | "protocol-error" | "refused";
 export type NativeObservation = AssignmentObservation & {
@@ -25,10 +25,6 @@ export function opaqueId(value: unknown): value is string {
 
 export function hasHeldSecret(value: string, secrets: readonly string[]): boolean {
   return secrets.some((secret) => secret.length > 0 && value.includes(secret));
-}
-
-function redactPrivateKeys(value: string): string {
-  return value.replace(/-*\bBEGIN[^\r\n]*?PRIVATE KEY-*[^]*?(?:-*\bEND[^\r\n]*?PRIVATE KEY-*|$)/g, "[redacted]");
 }
 
 export function safeNativeText(value: string, secrets: readonly string[], prompt?: string): string {

@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import { test } from "node:test";
+import { safeNativeText } from "../src/adapters/native-result.ts";
 import { checkPushArtifacts } from "../src/push-artifact-gate.ts";
 
 const text = [{ name: "candidate.patch", bytes: Buffer.from("fictional patch: 100% ready\n") }];
@@ -37,6 +38,12 @@ test("scans the exact named plaintext artifacts, including empty files and ordin
   assert.deepEqual(artifacts.map(({ bytes }) => bytes), before);
   const wide = [{ name: "notes with spaces.txt", bytes: new TextEncoder().encode("café\t50% complete\r\n+100% and %25\n") }];
   assertOutcome(check(wide), clear);
+  for (const format of ["%02d", "%08x", "%04d", "%10s", "%1d", "%7f", "%c3", "%e9", "%e0%80", "%00", "%2502d"]) {
+    const artifact = { name: `format-${format}.c`, bytes: Buffer.from(`printf("${format}", n);`) };
+    const before = Buffer.from(artifact.bytes);
+    assertOutcome(check([artifact]), clear);
+    assert.deepEqual(artifact.bytes, before);
+  }
 });
 
 test("stops the whole batch on a held value in any outgoing name or byte payload and returns no input", () => {
@@ -60,9 +67,14 @@ test("stops the whole batch on a held value in any outgoing name or byte payload
     assert.equal(item.artifacts.some(entry => shown.includes(entry.name)), false);
     assert.deepEqual(item.artifacts.map(entry => entry.bytes), before);
   }
+  for (const value of [held, held.replace("-", "%2d"), held.replace("-", "%252d")]) {
+    const attached = `id${value}9`;
+    assertOutcome(check([{ ...second, bytes: Buffer.from(attached) }], [held]), stopped);
+    assertOutcome(check([{ ...second, name: `${attached}.txt` }], [held]), stopped);
+  }
 });
 
-test("recognizes every configured credential family and an unclosed private-key header", () => {
+test("the gate and native log redactor agree on credential boundaries", () => {
   const sample = "aB09";
   const values = [
     ...["ghp", "gho", "ghu", "ghs", "ghr"].map(mark => [mark, sample.repeat(9)].join("_")),
@@ -72,16 +84,53 @@ test("recognizes every configured credential family and an unclosed private-key 
     ["AI", "za", "aB09_-".repeat(6).slice(0, 35)].join(""),
     ["AK", "IA", "AB09".repeat(4)].join(""),
     ...["a", "b", "p", "r", "s"].map(mark => ["xox", mark, "-", "aB09-".repeat(2)].join("")),
-    ["-".repeat(5), "BEGIN", " FABRICATED PRIVATE", " KEY", "-".repeat(5)].join(""),
   ];
   for (const value of values) {
     const encoded = `%${value.charCodeAt(0).toString(16)}${value.slice(1)}`;
-    for (const form of [value, encoded]) {
-      assertOutcome(check([...text, { ...second, bytes: Buffer.from(`prefix${form}\n`) }]), stopped);
-      assertOutcome(check([{ ...second, name: `prefix${form}.txt` }]), stopped);
+    for (const [prefix, outcome] of [["", stopped], ["value=", stopped], ["prefix", clear], ["under_", clear], ["1", clear]] as const) {
+      const plain = `${prefix}${value}`;
+      assert.equal(safeNativeText(plain, []) !== plain, outcome === stopped);
+      for (const form of [value, encoded]) {
+        assertOutcome(check([{ ...second, bytes: Buffer.from(`${prefix}${form}\n`) }]), outcome);
+        assertOutcome(check([{ ...second, name: `${prefix}${form}.txt` }]), outcome);
+      }
     }
   }
-  assertOutcome(check([{ ...second, bytes: Buffer.from("normal identifiers: sk-short, TP test, and KEY documentation\n") }]), clear);
+  for (const identifier of ["http_request_handler_function", "smtp_authentication_session_timeout", "task-queue-worker-implementation", "risk-score-reporting-configuration", "disk-storage-provisioning-monitor"]) {
+    const plain = `def ${identifier}():`;
+    assert.equal(safeNativeText(plain, []), plain);
+    assertOutcome(check([{ ...second, bytes: Buffer.from(plain) }]), clear);
+    assertOutcome(check([{ ...second, name: `${identifier}.txt` }]), clear);
+  }
+  for (const short of ["value=sk-short", "value=%73k-short", "normal identifiers: sk-short, TP test, and KEY documentation"]) {
+    assert.equal(safeNativeText(short, []), short);
+    assertOutcome(check([{ ...second, bytes: Buffer.from(short) }]), clear);
+    assertOutcome(check([{ ...second, name: `${short}.txt` }]), clear);
+  }
+});
+
+test("the gate and native log redactor recognize the same private-key headers", () => {
+  const headers = [
+    ["-".repeat(5), "BEGIN", " PRIVATE", " KEY", "-".repeat(5)].join(""),
+    ["-".repeat(5), "BEGIN", " PGP PRIVATE", " KEY BLOCK", "-".repeat(5)].join(""),
+    ["-".repeat(4), " BEGIN", " SSH2 ENCRYPTED PRIVATE", " KEY ", "-".repeat(4)].join(""),
+    ["BEGIN", " OPENSSH PRIVATE", " KEY"].join(""),
+  ];
+  for (const header of headers) {
+    const plain = `before ${header}`;
+    const redactedPrefix = header.startsWith("---- ") ? "before ---- " : "before ";
+    assert.equal(safeNativeText(`${plain}\nSYNTHETIC_BODY`, []), `${redactedPrefix}[redacted]`);
+    for (const form of [header, header.replace("BEGIN", "%42EGIN")]) {
+      assertOutcome(check([{ ...second, bytes: Buffer.from(`before ${form}\nSYNTHETIC_BODY`) }]), stopped);
+      assertOutcome(check([{ ...second, name: `before ${form}.txt` }]), stopped);
+    }
+    const joined = `prefix${header.replace(/^-+ */, "")}`;
+    assert.equal(safeNativeText(joined, []), joined);
+    assertOutcome(check([{ ...second, bytes: Buffer.from(joined) }]), clear);
+  }
+  const split = "BEGIN instructions\nPRIVATE KEY reference";
+  assert.equal(safeNativeText(split, []), split);
+  assertOutcome(check([{ ...second, bytes: Buffer.from(split) }]), clear);
 });
 
 test("scans the raw and nested percent-decoded text without rewriting either artifact", () => {
@@ -96,10 +145,78 @@ test("scans the raw and nested percent-decoded text without rewriting either art
   }
   const coveredRaw = "%255f";
   assertOutcome(check([{ ...second, bytes: Buffer.from(`literal ${coveredRaw}`) }], [coveredRaw]), stopped);
-  assertOutcome(check([{ ...second, bytes: Buffer.from("occasionally %E9 is unsupported UTF-8") }]), incomplete);
-  assertOutcome(check([{ ...second, bytes: Buffer.from("opaque%00control") }]), incomplete);
+  const encodedKey = key.replace(/^t/, "%74");
+  for (const mixed of [`%02d and %E9 ${twice}`, `%E9${encodedKey}`, `%00${encodedKey}`, `%e0%80 ${encodedKey}`]) {
+    assertOutcome(check([{ ...second, bytes: Buffer.from(mixed) }]), stopped);
+    assertOutcome(check([{ ...second, name: `${mixed}.txt` }]), stopped);
+  }
+  const unicode = "fabricated-é";
+  assertOutcome(check([{ ...second, bytes: Buffer.from(`%e9 ${encodeURIComponent(unicode)}`) }], [unicode]), stopped);
+  assertOutcome(check([{ ...second, bytes: Buffer.from("%e9") }], ["\uFFFD"]), clear);
+  assertOutcome(check([{ ...second, bytes: Buffer.from("%ef%bf%bd") }], ["\uFFFD"]), stopped);
+  for (const marker of ["%00", "%e9"]) {
+    const heldSplit = held.replace("-", `${marker}-`);
+    const shapeSplit = `ghp${marker}_${"aB09".repeat(9)}`;
+    for (const split of [heldSplit, shapeSplit]) {
+      assertOutcome(check([{ ...second, bytes: Buffer.from(split) }], [held]), clear);
+      assertOutcome(check([{ ...second, name: `${split}.txt` }], [held]), clear);
+    }
+  }
+  assertOutcome(check([{ ...second, bytes: Buffer.from("literal%00control") }]), clear);
   const nested = "%" + "25".repeat(11) + "5f";
   assertOutcome(check([{ ...second, bytes: Buffer.from(nested) }]), incomplete);
+});
+
+test("a verified secret dominates incomplete artifacts in every order", () => {
+  const withSecret = { name: "verified.txt", bytes: Buffer.from(`before ${held} after`) };
+  const unreadable = { name: "opaque.bin", bytes: Buffer.of(0xff) };
+  const badClaim = { ...second, bytes: Buffer.from("changed revision\r\n") };
+  const nested = { ...second, bytes: Buffer.from("%" + "25".repeat(11) + "5f") };
+  const invalidShape = { ...second, unexamined: true };
+  const throwing = new Proxy(second, { ownKeys() { throw new Error(held); } });
+  const plan = inventory([withSecret, second]);
+  const cases: { expected: unknown[]; actual: unknown[] }[] = [
+    { expected: inventory([withSecret, unreadable]), actual: [withSecret, unreadable] },
+    { expected: inventory([withSecret, nested]), actual: [withSecret, nested] },
+    { expected: plan, actual: [withSecret, badClaim] },
+    { expected: plan, actual: [withSecret, { ...second, bytes: Buffer.alloc(second.bytes.length, 42) }] },
+    { expected: plan, actual: [withSecret, invalidShape] },
+    { expected: plan, actual: [withSecret, throwing] },
+    { expected: plan, actual: [withSecret] },
+    { expected: inventory([withSecret]), actual: [withSecret, second] },
+    { expected: [plan[0], { ...plan[1], sha256: "bad digest" }], actual: [withSecret, second] },
+    { expected: [plan[0], plan[1], plan[1]], actual: [withSecret, second, second] },
+  ];
+  for (const { expected, actual } of cases) {
+    for (const claims of [expected, [...expected].reverse()]) {
+      for (const artifacts of [actual, [...actual].reverse()]) {
+        assertOutcome(checkPushArtifacts({ expected: claims, artifacts, secrets: [held] }), stopped);
+      }
+    }
+  }
+  const shape = { name: "verified-shape.txt", bytes: Buffer.from(["ghp", "aB09".repeat(9)].join("_")) };
+  for (const artifacts of [[shape, unreadable], [unreadable, shape]]) {
+    for (const secrets of [null, []]) assertOutcome(check(artifacts, secrets), stopped);
+  }
+});
+
+test("a verified name or readable payload can stop even when the artifact is incomplete", () => {
+  const named = { name: `${held}.bin`, bytes: Buffer.of(0xff) };
+  assertOutcome(check([named], [held]), stopped);
+  assertOutcome(checkPushArtifacts({ expected: inventory([named]), artifacts: [{ ...named, bytes: zero.bytes }], secrets: [held] }), stopped);
+  assertOutcome(check([{ ...second, bytes: Buffer.from(`\0${held}`) }], [held]), stopped);
+  const shaped = ["ghp", "aB09".repeat(9)].join("_");
+  assertOutcome(check([{ ...second, bytes: Buffer.from(`\u0001${shaped}`) }]), stopped);
+  assertOutcome(check([{ ...second, bytes: Buffer.from(shaped) }], null), stopped);
+  const nested = "%" + "25".repeat(11) + "5f";
+  assertOutcome(check([{ ...second, bytes: Buffer.from(`${nested} ${held}`) }], [held]), stopped);
+  assertOutcome(check([{ ...second, bytes: Buffer.from(`${nested} ${shaped}`) }]), stopped);
+
+  const malformed = { ...second, bytes: Buffer.concat([Buffer.of(0xff), Buffer.from(held)]) };
+  assertOutcome(check([malformed], [held]), incomplete);
+  assertOutcome(checkPushArtifacts({ expected: inventory([second]), artifacts: [{ ...second, bytes: Buffer.from(held) }], secrets: [held] }), incomplete);
+  const missing = { ...second, bytes: Buffer.from(shaped) };
+  assertOutcome(checkPushArtifacts({ expected: inventory(text), artifacts: [missing], secrets: [] }), incomplete);
 });
 
 test("holds missing, extra, duplicate or malformed inventory and replaced bytes", () => {
@@ -136,7 +253,7 @@ test("holds missing, extra, duplicate or malformed inventory and replaced bytes"
 });
 
 test("holds opaque, invalid or oversized bytes and refuses an incomplete held-secret source", () => {
-  for (const bytes of [Buffer.of(0xff), Buffer.of(0xc3, 0x28), Buffer.from("binary\0content"), Buffer.from(`\0${held}`), Buffer.of(0x7f), Buffer.alloc(1_048_577, 32)]) {
+  for (const bytes of [Buffer.of(0xff), Buffer.of(0xc3, 0x28), Buffer.from("binary\0content"), Buffer.of(0x7f), Buffer.alloc(1_048_577, 32)]) {
     assertOutcome(check([{ ...second, bytes }], [held]), incomplete);
   }
   assertOutcome(check([{ ...second, name: "\ud800.txt" }]), incomplete);
