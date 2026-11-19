@@ -19,7 +19,11 @@ function message(events: NativeEvents, text = "Result.", turnId = TURN): void {
   emit(events, { method: "item/completed", params: { threadId: THREAD, turnId, item: { id: "msg-1", type: "agentMessage", text } } });
 }
 function permission(events: NativeEvents, method = "item/commandExecution/requestApproval"): void {
-  emit(events, { id: 100, method, params: { threadId: THREAD, turnId: TURN, itemId: "cmd-1", startedAtMs: 1 } });
+  const context = { threadId: THREAD, turnId: TURN, itemId: "cmd-1", startedAtMs: 1 };
+  const params = method === "item/permissions/requestApproval"
+    ? { ...context, cwd: REQUEST.workspace, permissions: { network: { enabled: true } } }
+    : context;
+  emit(events, { id: 100, method, params });
 }
 function server(
   turn: (events: NativeEvents) => void,

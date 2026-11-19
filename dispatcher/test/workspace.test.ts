@@ -1,11 +1,12 @@
 import { fileURLToPath } from "node:url";
 import assert from "node:assert/strict";
-import { chmodSync, lstatSync, mkdirSync, readdirSync, readFileSync, realpathSync, symlinkSync, writeFileSync } from "node:fs";
+import fs, { chmodSync, lstatSync, mkdirSync, readdirSync, readFileSync, realpathSync, symlinkSync, writeFileSync } from "node:fs";
+import { syncBuiltinESMExports } from "node:module";
 import { join } from "node:path";
 import { test } from "node:test";
 import { run } from "../src/cli.ts";
 import { SecretToolCustody, type SecretToolRunner, BOARD_KEY_ACCOUNT } from "../src/custody.ts";
-import { parseLedger } from "../src/ledger.ts";
+import { parseLedger, updateLedger, type ToolRecord } from "../src/ledger.ts";
 import { assertPrivateMode, harnessIo, io, removeDir, tempDir } from "./helpers.ts";
 
 const FIXTURE = new URL("../fixtures/device-login.json", import.meta.url);
@@ -192,12 +193,11 @@ test("a workspace stays outside the state directory and admits one live writer",
     const status = io({ pidAlive: (pid) => alive.has(pid) });
     await run(["status", "--state", dir], status);
     assert.match(status.out, /Workspace: prepared, unqualified/);
-    assert.match(status.out, /Writer: running/);
     assert.match(status.out, /Ready for an assignment: no/);
     alive.delete(40);
     const stopped = io({ pidAlive: () => false });
     await run(["status", "--state", dir], stopped);
-    assert.match(stopped.out, /Writer: stopped/);
+    const statusAfterRootDisappeared = stopped.out;
     const replaced = await run(["workspace", "claim", "--state", dir, "--pid", "41"], stopped);
     assert.equal(replaced, 0, stopped.err);
     stopped.out = "";
@@ -210,10 +210,255 @@ test("a workspace stays outside the state directory and admits one live writer",
     assert.equal(kept.workspace.path, realpathSync(workspace));
     assert.equal(kept.workspace.writerPid, null);
     assert.equal(kept.workspace.qualified, false);
+    assert.match(status.out, /^Writer: unknown \(including helpers\)$/m);
+    assert.match(status.out, /^Recorded writer PID: present \(process identity unverified\)$/m);
+    assert.match(statusAfterRootDisappeared, /^Writer: unknown \(including helpers\)$/m);
+    assert.match(statusAfterRootDisappeared, /^Recorded writer PID: absent$/m);
   } finally {
     removeDir(dir);
     removeDir(workspace);
     removeDir(scratch);
+  }
+});
+
+test("workspace claim and preparation require a definite absence of the recorded PID", async t => {
+  const recordedPid = 42017;
+  const candidatePid = 42018;
+  const latestPid = 42019;
+  const diagnostic = "fabricated process diagnostic";
+  const failures = {
+    EIO: Object.assign(new Error(diagnostic), { code: "EIO" }),
+    EPERM: Object.assign(new Error(diagnostic), { code: "EPERM" }),
+    ESRCH: Object.assign(new Error(diagnostic), { code: "ESRCH" }),
+    invalid: Object.assign(new Error(diagnostic), { code: "ERR_INVALID_ARG_TYPE" }),
+    unknown: Object.assign(new Error(diagnostic), { code: "UNEXPECTED_PROCESS_ERROR" }),
+    noCode: new Error(diagnostic),
+    nonError: diagnostic,
+  };
+  type Failure = keyof typeof failures;
+  type Scenario = {
+    name: string;
+    action: "claim" | "prepare";
+    observations: [Failure, ...Failure[]];
+    held: boolean;
+    changeWriter?: true;
+  };
+  const unavailable = [
+    { name: "I/O failure", failure: "EIO" },
+    { name: "invalid observation", failure: "invalid" },
+    { name: "unknown error code", failure: "unknown" },
+    { name: "error without a code", failure: "noCode" },
+    { name: "non-Error thrown value", failure: "nonError" },
+  ] as const;
+  const cases: Scenario[] = [
+    { name: "claim holds when the recorded PID is present", action: "claim", observations: ["EPERM"], held: true },
+    { name: "claim can replace a definitely absent PID", action: "claim", observations: ["ESRCH"], held: false },
+    { name: "prepare holds when the recorded PID is present", action: "prepare", observations: ["EPERM"], held: true },
+    { name: "prepare can replace an absent record after a second check", action: "prepare", observations: ["ESRCH", "ESRCH"], held: false },
+    { name: "prepare observes the changed writer under the lease", action: "prepare", observations: ["ESRCH", "EPERM"], held: true, changeWriter: true },
+    ...unavailable.flatMap(({ name, failure }): Scenario[] => [
+      { name: `claim holds on ${name}`, action: "claim", observations: [failure], held: true },
+      { name: `prepare preflight holds on ${name}`, action: "prepare", observations: [failure], held: true },
+      { name: `prepare locked recheck holds on ${name}`, action: "prepare", observations: ["ESRCH", failure], held: true },
+    ]),
+  ];
+
+  for (const entry of cases) {
+    await t.test(entry.name, async probe => {
+      const dir = tempDir();
+      const scratch = tempDir();
+      const workspace = join(scratch, "existing");
+      const candidate = join(scratch, "candidate");
+      const ledgerPath = join(dir, "ledger.json");
+      const leaseRoot = join(dir, ".state-leases", "ledger");
+      try {
+        const setup = io();
+        assert.equal(await run(["install", "--state", dir], setup), 0, setup.err);
+        assert.equal(await run(["workspace", "prepare", "--state", dir, "--workspace", workspace], setup), 0, setup.err);
+        assert.equal(await run(["workspace", "claim", "--state", dir, "--pid", String(recordedPid)], setup), 0, setup.err);
+        let ledger = readFileSync(ledgerPath);
+        assert.equal(parseLedger(ledger.toString("utf8"))?.workspace?.writerPid, recordedPid);
+        const workFile = join(workspace, "local-work.txt");
+        writeFileSync(workFile, "fabricated work to preserve\n");
+        if (entry.held && entry.observations.length === 2) mkdirSync(candidate);
+        const originalDirectories = readdirSync(scratch).sort();
+        const originalEpochs = new Set(readdirSync(leaseRoot));
+        const newEpochs = () => readdirSync(leaseRoot).filter(epoch => /^epoch-[0-9]+$/.test(epoch) && !originalEpochs.has(epoch));
+        const unreleasedOwners = () => newEpochs().flatMap(epoch => {
+          const path = join(leaseRoot, epoch);
+          const files = readdirSync(path);
+          if (!files.includes("owner.json") || files.includes("released") || files.includes("released.prepared")) return [];
+          const owner = JSON.parse(readFileSync(join(path, "owner.json"), "utf8"));
+          return [{ epoch, pid: owner.pid, namespace: owner.namespace }];
+        });
+        const writerChangeEpochs: string[] = [];
+        const calls: { pid: number; signal: unknown; unreleasedOwners: ReturnType<typeof unreleasedOwners> }[] = [];
+        const commandCommits: string[][] = [];
+        const writerChangeCommits: string[][] = [];
+        let changingWriter = false;
+        const originalRename = fs.renameSync;
+        fs.renameSync = (source, destination) => {
+          const epochs = destination === ledgerPath ? unreleasedOwners().map(owner => owner.epoch) : undefined;
+          originalRename(source, destination);
+          if (epochs) (changingWriter ? writerChangeCommits : commandCommits).push(epochs);
+        };
+        syncBuiltinESMExports();
+        probe.after(() => { fs.renameSync = originalRename; syncBuiltinESMExports(); });
+        probe.mock.method(process, "kill", (pid: number, signal: unknown) => {
+          const index = calls.length;
+          calls.push({ pid, signal, unreleasedOwners: unreleasedOwners() });
+          if (entry.changeWriter && index === 0) {
+            const beforeWriterChange = new Set(newEpochs());
+            changingWriter = true;
+            try {
+              updateLedger(dir, [], current => {
+                assert.ok(current.workspace);
+                current.workspace.writerPid = latestPid;
+              });
+            } finally {
+              changingWriter = false;
+            }
+            writerChangeEpochs.push(...newEpochs().filter(epoch => !beforeWriterChange.has(epoch)));
+            ledger = readFileSync(ledgerPath);
+          }
+          throw failures[entry.observations[index] ?? entry.observations.at(-1)!];
+        });
+        const args = entry.action === "claim" ? ["--pid", String(candidatePid)] : ["--workspace", candidate];
+        const context = io();
+        const exitCode = await run(["workspace", entry.action, "--state", dir, ...args], context);
+        assert.equal(readFileSync(workFile, "utf8"), "fabricated work to preserve\n");
+        assert.doesNotMatch(context.out + context.err, /fabricated process diagnostic/);
+
+        const commandEpochs = newEpochs().filter(epoch => !writerChangeEpochs.includes(epoch));
+        const expectedCalls = entry.observations.map((_, index) => ({
+          pid: entry.changeWriter && index > 0 ? latestPid : recordedPid,
+          signal: 0,
+          unreleasedOwners: entry.action === "claim" || index > 0
+            ? [{ epoch: commandEpochs[0], pid: process.pid, namespace: "ledger" }]
+            : [],
+        }));
+        if (entry.held) {
+          assert.deepEqual({
+            exitCode,
+            ledgerPreserved: readFileSync(ledgerPath).equals(ledger),
+            workspaceDirectories: readdirSync(scratch).sort(),
+            calls,
+            commandCommits,
+          }, {
+            exitCode: 1,
+            ledgerPreserved: true,
+            workspaceDirectories: originalDirectories,
+            calls: expectedCalls,
+            commandCommits: [],
+          });
+          assert.equal(context.out, "");
+          assert.notEqual(context.err, "");
+          if (entry.changeWriter) assert.equal(parseLedger(ledger.toString("utf8"))?.workspace?.writerPid, latestPid);
+        } else {
+          assert.deepEqual(calls, expectedCalls);
+          assert.equal(exitCode, 0, context.err);
+          assert.deepEqual(commandCommits, [[commandEpochs[0]]]);
+          assert.deepEqual(parseLedger(readFileSync(ledgerPath, "utf8"))?.workspace,
+            entry.action === "claim"
+              ? { path: realpathSync(workspace), writerPid: candidatePid, qualified: false }
+              : { path: realpathSync(candidate), writerPid: null, qualified: false });
+        }
+        assert.equal(writerChangeEpochs.length, entry.changeWriter ? 1 : 0);
+        assert.deepEqual(writerChangeCommits, entry.changeWriter ? [[writerChangeEpochs[0]]] : []);
+        const expectedEpochCount = entry.action === "claim" || entry.observations.length > 1 ? 1 : 0;
+        assert.equal(commandEpochs.length, expectedEpochCount);
+        for (const epoch of commandEpochs) {
+          const path = join(leaseRoot, epoch);
+          assert.deepEqual(readFileSync(join(path, "released")), readFileSync(join(path, "owner.json")));
+        }
+      } finally {
+        removeDir(dir);
+        removeDir(scratch);
+      }
+    });
+  }
+});
+
+test("status and health report the recorded PID separately from writer custody", async t => {
+  const dir = tempDir();
+  const workspace = tempDir();
+  const ledgerPath = join(dir, "ledger.json");
+  const writerPid = 42017;
+  try {
+    const setup = io();
+    assert.equal(await run(["install", "--state", dir], setup), 0, setup.err);
+    const installed = JSON.parse(readFileSync(ledgerPath, "utf8"));
+
+    await t.test("no prepared workspace", async probe => {
+      const observe = probe.mock.method(process, "kill", () => true);
+      for (const command of ["status", "health"]) {
+        const context = io();
+        assert.equal(await run([command, "--state", dir], context), 0, context.err);
+        assert.match(context.out, /^Workspace: none$/m);
+        assert.match(context.out, /^Writer: none$/m);
+      }
+      assert.equal(observe.mock.callCount(), 0);
+    });
+
+    const documentedCli = {
+      vendor: "codex", interfaceId: "cli", qualification: "documented", experimental: "unknown",
+      version: null, limit: "fabricated documented interface",
+    } satisfies ToolRecord;
+    const cases = [
+      { name: "no recorded PID", pid: null, error: null, observation: "none" },
+      { name: "observed PID", pid: writerPid, error: null, observation: "present (process identity unverified)" },
+      { name: "permission denied", pid: writerPid, error: "EPERM", observation: "present (process identity unverified)" },
+      { name: "absent PID", pid: writerPid, error: "ESRCH", observation: "absent" },
+      { name: "failed observation", pid: writerPid, error: "EIO", observation: "unavailable" },
+    ] as const;
+
+    for (const entry of cases) {
+      await t.test(entry.name, async probe => {
+        const bytes = Buffer.from(JSON.stringify({
+          ...installed,
+          tools: [documentedCli],
+          workspace: { path: workspace, writerPid: entry.pid, qualified: false },
+        }) + "\n");
+        writeFileSync(ledgerPath, bytes);
+        const stateEntries = readdirSync(dir);
+        const calls: [pid: number, signal: unknown][] = [];
+        probe.mock.method(process, "kill", (pid: number, signal: unknown) => {
+          calls.push([pid, signal]);
+          if (entry.error) throw Object.assign(new Error("fabricated process diagnostic"), { code: entry.error });
+          return true;
+        });
+        const lines: string[][] = [];
+        for (const command of ["status", "health"]) {
+          const context = io();
+          assert.equal(await run([command, "--state", dir], context), 0, context.err);
+          assert.equal(context.err, "");
+          lines.push(context.out.trimEnd().split("\n"));
+        }
+        assert.deepEqual(calls, entry.pid === null ? [] : [[entry.pid, 0], [entry.pid, 0]]);
+        assert.deepEqual(readFileSync(ledgerPath), bytes);
+        assert.deepEqual(readdirSync(dir), stateEntries);
+        assert.deepEqual(readdirSync(workspace), []);
+        assert.deepEqual(lines[0], lines[1]);
+        for (const output of lines) {
+          assert.ok(output.includes("Installed: yes"));
+          assert.ok(output.includes("Signed in: no"));
+          assert.ok(output.includes("Codex cli: documented"));
+          assert.ok(output.includes("Codex app-server: undiscovered"));
+          assert.ok(output.includes("Compatible: no"));
+          assert.ok(output.includes("Ready for an assignment: no"));
+          assert.ok(output.includes("Workspace: prepared, unqualified"));
+          assert.ok(output.includes("Health: local record ok"));
+          assert.ok(output.every(line => !line.includes("fabricated process diagnostic")));
+          assert.deepEqual(output.filter(line => line.startsWith("Writer:") || line.startsWith("Recorded writer PID:")), [
+            "Writer: unknown (including helpers)",
+            `Recorded writer PID: ${entry.observation}`,
+          ]);
+        }
+      });
+    }
+  } finally {
+    removeDir(dir);
+    removeDir(workspace);
   }
 });
 
