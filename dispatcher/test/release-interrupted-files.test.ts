@@ -4,6 +4,7 @@ import { createPublicKey } from "node:crypto";
 import { existsSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { test } from "node:test";
+import { isDeepStrictEqual } from "node:util";
 import { install, recoverInstall } from "../src/install.ts";
 import { loadLedger } from "../src/ledger.ts";
 import { removeDir, tempDir } from "./helpers.ts";
@@ -11,6 +12,7 @@ import { active, activeDirectory, assertNonInstallState, FILES, fixture, install
 
 const installModule = new URL("../src/install.ts", import.meta.url).href;
 const fixtureModule = new URL("./release-test-fixtures.ts", import.meta.url).href;
+const privacyModule = new URL("../src/fs-safety.ts", import.meta.url).href;
 type PublicKeyDescriptor = { keyId: string; publicKey: string };
 
 function publicDescriptor(sample: ReturnType<typeof fixture>): PublicKeyDescriptor {
@@ -37,6 +39,54 @@ function interrupted(dir: string, operation: "install" | "recover", stop: string
   assert.equal(child.error, undefined);
   assert.equal(child.status, 73, child.stderr);
   return JSON.parse(child.stdout) as PublicKeyDescriptor;
+}
+
+function recoverWithFilePrivacy(dir: string, target: string, keys: PublicKeyDescriptor[], verified: boolean): {
+  outcome: string; observed: string[];
+} {
+  const source = `
+    import { createPublicKey } from 'node:crypto';
+    import { dirname } from 'node:path';
+    import { mock } from 'node:test';
+    const [dir, target, keys, verified] = process.argv.slice(1);
+    const privacy = await import(${JSON.stringify(privacyModule)});
+    const observed = [];
+    const verifier = mock.module(${JSON.stringify(privacyModule)}, { namedExports: {
+      ...privacy,
+      assertPrivateDirectory(path) {
+        privacy.assertPrivateDirectory(path);
+        if (path === dirname(target)) observed.push('parent-verified');
+      },
+      assertPrivateAccess(path) {
+        if (path !== target) return privacy.assertPrivateAccess(path);
+        observed.push('file-checked');
+        if (verified !== 'true') throw new privacy.StateError('Fabricated privacy uncertainty.');
+      },
+    } });
+    try {
+      const { recoverInstall } = await import(${JSON.stringify(installModule)});
+      const { fixture } = await import(${JSON.stringify(fixtureModule)});
+      const sample = fixture(dir);
+      for (const key of JSON.parse(keys)) sample.services.releaseTrust.keys.set(key.keyId, createPublicKey({ key: Buffer.from(key.publicKey, 'base64'), type: 'spki', format: 'der' }));
+      sample.services.onReleaseFileCheckpoint = (phase, path) => {
+        if (phase === 'cleanup-file-deleted') observed.push(path === target ? 'file-deleted' : 'other-file-deleted');
+      };
+      let outcome = 'recovered';
+      try { recoverInstall(sample.input, sample.services); }
+      catch (error) {
+        if (error.message !== 'The release operation could not finish safely. Inspect the selected installation before retrying.') throw error;
+        outcome = 'refused';
+      }
+      process.stdout.write(JSON.stringify({ outcome, observed }));
+    } finally { verifier.restore(); }
+  `;
+  const child = spawnSync(process.execPath, ["--experimental-strip-types", "--experimental-test-module-mocks",
+    "--input-type=module", "-e", source, dir, target, JSON.stringify(keys), String(verified)], {
+    encoding: "utf8", env: { PATH: process.env.PATH ?? "", SystemRoot: process.env.SystemRoot ?? "" },
+  });
+  assert.equal(child.error, undefined);
+  assert.equal(child.status, 0, child.stderr);
+  return JSON.parse(child.stdout);
 }
 
 for (const firstInstall of [true, false]) {
@@ -93,6 +143,51 @@ test("an unrelated file inside a durably owned interrupted stage blocks cleanup 
     const before = snapshot(dir);
     assert.throws(() => recoverInstall(authority.input, authority.services));
     assert.deepEqual(snapshot(dir), before);
+    assertNonInstallState(dir, retained);
+  } finally { removeDir(dir); }
+});
+
+test("recovery requires privacy proof for the staged file even when its parent verifies", () => {
+  const dir = tempDir();
+  try {
+    const retained = seedRetainedLedger(dir);
+    const old = installFixture(dir, "0.1.0");
+    const selection = structuredClone(active(dir));
+    const keys = [publicDescriptor(old)];
+    keys.push(interrupted(dir, "install", "file-writing", keys));
+    const stages = readdirSync(join(dir, "releases")).filter(name => name.startsWith(".stage-"));
+    assert.equal(stages.length, 1);
+    const stage = join(dir, "releases", stages[0]!);
+    const target = join(stage, FILES[0]!.path);
+    const partial = readFileSync(target);
+    assert.ok(partial.length > 0 && partial.length < FILES[0]!.bytes.length);
+    const ledgerPath = join(dir, "ledger.json");
+    const ledger = readFileSync(ledgerPath);
+    const before = snapshot(dir);
+
+    const refused = recoverWithFilePrivacy(dir, target, keys, false);
+    assert.deepEqual({
+      ...refused,
+      ledgerPreserved: readFileSync(ledgerPath).equals(ledger),
+      partialPreserved: existsSync(target) && readFileSync(target).equals(partial),
+      treePreserved: isDeepStrictEqual(snapshot(dir), before),
+    }, {
+      outcome: "refused", observed: ["parent-verified", "file-checked"],
+      ledgerPreserved: true, partialPreserved: true, treePreserved: true,
+    });
+    assert.deepEqual(active(dir), selection);
+    assertNonInstallState(dir, retained);
+
+    const recovered = recoverWithFilePrivacy(dir, target, keys, true);
+    assert.equal(recovered.outcome, "recovered");
+    assert.equal(recovered.observed[0], "parent-verified");
+    assert.deepEqual(recovered.observed.filter(event => event.endsWith("-deleted")), ["file-deleted"]);
+    assert.ok(recovered.observed.lastIndexOf("file-checked") > 0);
+    assert.ok(recovered.observed.lastIndexOf("file-checked") < recovered.observed.indexOf("file-deleted"));
+    assert.equal(existsSync(stage), false);
+    assert.deepEqual(readFileSync(ledgerPath), ledger);
+    assert.deepEqual(active(dir), selection);
+    for (const file of FILES) assert.deepEqual(readFileSync(join(activeDirectory(dir), file.path)), file.bytes);
     assertNonInstallState(dir, retained);
   } finally { removeDir(dir); }
 });
