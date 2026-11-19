@@ -1,6 +1,7 @@
 import { fileURLToPath } from "node:url";
 import assert from "node:assert/strict";
-import { chmodSync, lstatSync, mkdirSync, readdirSync, readFileSync, realpathSync, symlinkSync, writeFileSync } from "node:fs";
+import fs, { chmodSync, lstatSync, mkdirSync, readdirSync, readFileSync, realpathSync, symlinkSync, writeFileSync } from "node:fs";
+import { syncBuiltinESMExports } from "node:module";
 import { join } from "node:path";
 import { test } from "node:test";
 import { run } from "../src/cli.ts";
@@ -283,24 +284,40 @@ test("workspace claim and preparation require a definite absence of the recorded
         const originalDirectories = readdirSync(scratch).sort();
         const originalEpochs = new Set(readdirSync(leaseRoot));
         const newEpochs = () => readdirSync(leaseRoot).filter(epoch => /^epoch-[0-9]+$/.test(epoch) && !originalEpochs.has(epoch));
+        const unreleasedOwners = () => newEpochs().flatMap(epoch => {
+          const path = join(leaseRoot, epoch);
+          const files = readdirSync(path);
+          if (!files.includes("owner.json") || files.includes("released") || files.includes("released.prepared")) return [];
+          const owner = JSON.parse(readFileSync(join(path, "owner.json"), "utf8"));
+          return [{ epoch, pid: owner.pid, namespace: owner.namespace }];
+        });
         const writerChangeEpochs: string[] = [];
-        const calls: { pid: number; signal: unknown; unreleasedOwners: { epoch: string; pid: unknown; namespace: unknown }[] }[] = [];
+        const calls: { pid: number; signal: unknown; unreleasedOwners: ReturnType<typeof unreleasedOwners> }[] = [];
+        const commandCommits: string[][] = [];
+        const writerChangeCommits: string[][] = [];
+        let changingWriter = false;
+        const originalRename = fs.renameSync;
+        fs.renameSync = (source, destination) => {
+          const epochs = destination === ledgerPath ? unreleasedOwners().map(owner => owner.epoch) : undefined;
+          originalRename(source, destination);
+          if (epochs) (changingWriter ? writerChangeCommits : commandCommits).push(epochs);
+        };
+        syncBuiltinESMExports();
+        probe.after(() => { fs.renameSync = originalRename; syncBuiltinESMExports(); });
         probe.mock.method(process, "kill", (pid: number, signal: unknown) => {
           const index = calls.length;
-          const unreleasedOwners = newEpochs().flatMap(epoch => {
-            const path = join(leaseRoot, epoch);
-            const files = readdirSync(path);
-            if (!files.includes("owner.json") || files.includes("released") || files.includes("released.prepared")) return [];
-            const owner = JSON.parse(readFileSync(join(path, "owner.json"), "utf8"));
-            return [{ epoch, pid: owner.pid, namespace: owner.namespace }];
-          });
-          calls.push({ pid, signal, unreleasedOwners });
+          calls.push({ pid, signal, unreleasedOwners: unreleasedOwners() });
           if (entry.changeWriter && index === 0) {
             const beforeWriterChange = new Set(newEpochs());
-            updateLedger(dir, [], current => {
-              assert.ok(current.workspace);
-              current.workspace.writerPid = latestPid;
-            });
+            changingWriter = true;
+            try {
+              updateLedger(dir, [], current => {
+                assert.ok(current.workspace);
+                current.workspace.writerPid = latestPid;
+              });
+            } finally {
+              changingWriter = false;
+            }
             writerChangeEpochs.push(...newEpochs().filter(epoch => !beforeWriterChange.has(epoch)));
             ledger = readFileSync(ledgerPath);
           }
@@ -326,11 +343,13 @@ test("workspace claim and preparation require a definite absence of the recorded
             ledgerPreserved: readFileSync(ledgerPath).equals(ledger),
             workspaceDirectories: readdirSync(scratch).sort(),
             calls,
+            commandCommits,
           }, {
             exitCode: 1,
             ledgerPreserved: true,
             workspaceDirectories: originalDirectories,
             calls: expectedCalls,
+            commandCommits: [],
           });
           assert.equal(context.out, "");
           assert.notEqual(context.err, "");
@@ -338,12 +357,14 @@ test("workspace claim and preparation require a definite absence of the recorded
         } else {
           assert.deepEqual(calls, expectedCalls);
           assert.equal(exitCode, 0, context.err);
+          assert.deepEqual(commandCommits, [[commandEpochs[0]]]);
           assert.deepEqual(parseLedger(readFileSync(ledgerPath, "utf8"))?.workspace,
             entry.action === "claim"
               ? { path: realpathSync(workspace), writerPid: candidatePid, qualified: false }
               : { path: realpathSync(candidate), writerPid: null, qualified: false });
         }
         assert.equal(writerChangeEpochs.length, entry.changeWriter ? 1 : 0);
+        assert.deepEqual(writerChangeCommits, entry.changeWriter ? [[writerChangeEpochs[0]]] : []);
         const expectedEpochCount = entry.action === "claim" || entry.observations.length > 1 ? 1 : 0;
         assert.equal(commandEpochs.length, expectedEpochCount);
         for (const epoch of commandEpochs) {
