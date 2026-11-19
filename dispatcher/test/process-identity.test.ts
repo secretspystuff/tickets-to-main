@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import childProcess from "node:child_process";
 import { syncBuiltinESMExports } from "node:module";
-import { processBirth, processOwnerAlive, type ProcessHost } from "../src/process-identity.ts";
+import { nativeProcessHost, processBirth, processOwnerAlive, type ProcessHost } from "../src/process-identity.ts";
 
 const boot = "11111111-2222-3333-4444-555555555555";
 function linux(birth = "123"): ProcessHost {
@@ -72,6 +72,28 @@ test("macOS second-precision ps start time releases only a definite mismatch", (
   }
   assert.equal(processOwnerAlive({ pid: 42, birth: "darwin:Mon Nov 16 20:54:02 2026" }, false,
     { ...host, run: () => { throw new Error("ps failed"); } }), true);
+});
+
+test("macOS native command uses fixed ps lstart arguments and an exact UTC C-locale environment", (context) => {
+  const original = childProcess.spawnSync;
+  const calls: unknown[][] = [];
+  childProcess.spawnSync = ((...args: unknown[]) => {
+    calls.push(args);
+    return { status: 0, stdout: "Mon Nov 16 20:54:03 2026\n", stderr: "" };
+  }) as typeof original;
+  syncBuiltinESMExports();
+  context.after(() => { childProcess.spawnSync = original; syncBuiltinESMExports(); });
+  const host = nativeProcessHost("darwin");
+  assert.equal(processBirth(-1, host), null);
+  assert.equal(processBirth(1.5, host), null);
+  assert.equal(processBirth(42, host), "darwin:Mon Nov 16 20:54:03 2026");
+  assert.equal(calls.length, 1);
+  const [file, argv, options] = calls[0]! as [string, string[], Record<string, unknown>];
+  assert.equal(file, "/bin/ps");
+  assert.deepEqual(argv, ["-o", "lstart=", "-p", "42"]);
+  assert.deepEqual(options.env, { LC_ALL: "C", TZ: "UTC" });
+  assert.equal(options.shell, false);
+  assert.deepEqual(options.stdio, ["ignore", "pipe", "pipe"]);
 });
 
 test("current-process dormant ownership applies only with its matching birth identity", () => {

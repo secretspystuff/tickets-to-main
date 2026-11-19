@@ -12,15 +12,15 @@ export type ProcessHost = {
   read(path: string): string;
   run(pid: number): string;
 };
-const native: ProcessHost = {
-  platform: process.platform,
+export const nativeProcessHost = (platform: NodeJS.Platform = process.platform): ProcessHost => ({
+  platform,
   alive(pid) {
     try { process.kill(pid, 0); return true; }
     catch (error) { return (error as NodeJS.ErrnoException).code !== "ESRCH"; }
   },
   read: (path) => readFileSync(path, "utf8"),
   run(pid) {
-    if (process.platform === "darwin") {
+    if (platform === "darwin") {
       const result = spawnSync("/bin/ps", ["-o", "lstart=", "-p", String(pid)], {
         encoding: "utf8", shell: false, timeout: 5000, maxBuffer: 4096,
         env: { LC_ALL: "C", TZ: "UTC" }, stdio: ["ignore", "pipe", "pipe"],
@@ -38,7 +38,8 @@ const native: ProcessHost = {
     if (result.error || result.status !== 0 || result.stderr.trim() !== "") throw new Error("Process observation unavailable.");
     return result.stdout;
   },
-};
+});
+const native = nativeProcessHost();
 
 function macStart(value: string): string | null {
   const match = /^(Sun|Mon|Tue|Wed|Thu|Fri|Sat) (Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+([0-9]{1,2}) ([0-9]{2}):([0-9]{2}):([0-9]{2}) ([0-9]{4})$/.exec(value.trim());

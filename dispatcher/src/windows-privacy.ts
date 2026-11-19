@@ -38,8 +38,9 @@ function executable(): string {
   const compiler = compilers.find(existsSync);
   if (!compiler) throw unavailable();
   run(compiler, ["/nologo", "/target:exe", "/out:" + output, source]);
-  helper = { executable: output, digest: digest(output) };
+  const candidate = { executable: output, digest: digest(output) };
   run(output, ["check", directory]);
+  helper = candidate;
   process.once("exit", () => {
     try { unlinkSync(output); unlinkSync(source); rmdirSync(directory); } catch { /* A busy helper remains private. */ }
   });
