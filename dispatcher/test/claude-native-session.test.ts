@@ -450,6 +450,47 @@ test("credentials refuse before spawn and native results use the shared redactor
   assert.equal(result.resultText!.includes("[assignment input omitted]"), true);
 });
 
+test("the launch environment omits names containing supplied credentials as well as values", async () => {
+  const held = {
+    connection: "fixture-fabricated-dispatch-value",
+    job: "fixture-fabricated-job-value",
+    git: "fixture-fabricated-git-value",
+    otherVendor: "fixture-fabricated-vendor-value",
+  };
+  const safe = {
+    PATH: "C:\\fixture-tools",
+    CLAUDE_CONFIG_DIR: "C:\\fixture-native-config",
+    CLAUDE_CODE_OAUTH_TOKEN: "fabricated-native-authentication",
+    NATIVE_PREFERENCE: "literal 100% setting",
+  };
+  const parent: NodeJS.ProcessEnv = { ...safe };
+  const names = Object.entries(held).map(([role, value]) => ({
+    role,
+    value,
+    name: role === "connection" ? value : "FIXTURE_" + value + "_SETTING",
+    alias: "FIXTURE_" + role.toUpperCase() + "_ALIAS",
+  }));
+  for (const { value, name, alias } of names) {
+    parent[name] = "ordinary environment value";
+    parent[alias] = "fixture-before-" + value + "-after";
+  }
+  const original = { ...parent };
+  const transport = cli((events, input) => emit(events, terminal(input)));
+  const result = await startClaudeCliAssignment(REQUEST, transport, parent, Object.values(held), LAUNCH).closed;
+
+  assert.equal(result.outcome, "completed");
+  assert.equal(result.writerState, "unknown");
+  assert.equal(transport.calls.length, 1);
+  const sent = transport.calls[0]!["env"];
+  for (const { role, alias } of names) {
+    assert.equal(Object.hasOwn(sent, alias), false, "held value reached launch: " + role);
+  }
+  assert.deepEqual(names.filter(({ name }) => Object.hasOwn(sent, name)).map(({ role }) => role), [],
+    "credential-bearing names reached launch");
+  assert.deepEqual({ ...sent }, safe);
+  assert.deepEqual(parent, original);
+});
+
 test("abnormal close and lost input invalidate a provisional success without claiming native authentication failure", async () => {
   for (const exit of [
     { code: 1, signal: null, error: null }, { code: null, signal: "SIGTERM", error: null },
