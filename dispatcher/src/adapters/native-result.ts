@@ -1,4 +1,5 @@
 import type { AssignmentObservation } from "./contract.ts";
+import { redactCredentialShapes, redactPrivateKeys } from "../secret-text.ts";
 
 export type NativeOutcome = "starting" | "running" | "completed" | "failed" | "interrupted" | "held" | "disconnected" | "protocol-error" | "refused";
 export type NativeObservation = AssignmentObservation & {
@@ -26,10 +27,6 @@ export function hasHeldSecret(value: string, secrets: readonly string[]): boolea
   return secrets.some((secret) => secret.length > 0 && value.includes(secret));
 }
 
-function redactPrivateKeys(value: string): string {
-  return value.replace(/-*\bBEGIN[^\r\n]*?PRIVATE KEY-*[^]*?(?:-*\bEND[^\r\n]*?PRIVATE KEY-*|$)/g, "[redacted]");
-}
-
 export function safeNativeText(value: string, secrets: readonly string[], prompt?: string): string {
   // Replacing a held header fragment first would hide the start of a private-key block.
   let text = redactPrivateKeys(value);
@@ -37,7 +34,7 @@ export function safeNativeText(value: string, secrets: readonly string[], prompt
   for (const secret of [...secrets].filter(Boolean).sort((a, b) => b.length - a.length)) {
     text = text.split(secret).join("[redacted]");
   }
-  return text.replace(/\b(?:gh[pousr]_[A-Za-z0-9]{36,}|github_pat_[A-Za-z0-9_]{22,}|(?:tp|tpj|tps)_[A-Za-z0-9_-]{20,}|(?:sk-ant-|sk-proj-|sk-|xai-)[A-Za-z0-9_-]{20,}|AIza[A-Za-z0-9_-]{35}|AKIA[A-Z0-9]{16}|xox[abprs]-[A-Za-z0-9-]{10,})/g, "[redacted]");
+  return redactCredentialShapes(text);
 }
 
 export function nativeObservation(interfaceId: "cli" | "app-server"): NativeObservation {

@@ -33,6 +33,8 @@ This boundary is not wired to the command line, network, or native tools. Its ad
 
 The [coordination read client](dispatcher/src/coordination-client.ts) takes a board ID and a callback that retrieves an existing approved device bearer. `hello()` negotiates protocol v1 and the explicit repo identity feature. `activation(repo)` negotiates first, then reads the current activation for an explicit board repo ID, stored identity and locator. A reply can report an activation generation, inactive state, or a body-free failure. The read only describes current coordination state. The development CLI uses the offline fixture path.
 
+The [local push artifact check](dispatcher/src/push-artifact-gate.ts) compares a supplied inventory with exact named UTF-8 byte snapshots. It checks names and contents against held values and supported credential shapes, stops on a match, and holds incomplete, unreadable or inconsistent scans. It returns only an unpublishable harness result. Runtime delivery still needs an authoritative inventory of all outgoing Git objects and metadata tied to the exact bytes sent, plus durable stop and resume handling.
+
 ## Layout
 
 - `dispatcher/`: runtime, command entry point, harness tests, and fabricated device/native fixtures.
