@@ -44,7 +44,11 @@ test("cli harness evidence cannot qualify app-server and never includes the prom
   const observation = await runCodexCliAssignment(
     { assignmentId: "fixture-1", prompt: "Say ready.", workspace: "/work/fixture", model: null, effort: null },
     runner,
-    { HOME: "/home/fixture", PATH: "/usr/bin", TP_KEY: "tp_fixture_key_not_a_real_grant", TICKETS_TO_MAIN_STATE: "/tmp/state" },
+    {
+      HOME: "/home/fixture", PATH: "/usr/bin", CODEX_HOME: "/home/fixture/codex",
+      TP_KEY: "tp_fixture_key_not_a_real_grant", TICKETS_TO_MAIN_STATE: "/tmp/state",
+      Tickets_Please_Token: "different-fabricated-value",
+    },
     ["tp_fixture_key_not_a_real_grant"],
   );
   assert.equal(observation.interfaceId, "cli");
@@ -54,25 +58,34 @@ test("cli harness evidence cannot qualify app-server and never includes the prom
   assert.equal(runner.calls[0]?.input.join(""), "Say ready.");
   assert.equal(runner.calls[0]?.["env"]?.TP_KEY, undefined);
   assert.equal(runner.calls[0]?.["env"]?.TICKETS_TO_MAIN_STATE, undefined);
+  assert.equal(runner.calls[0]?.["env"]?.Tickets_Please_Token, undefined);
   assert.equal(runner.calls[0]?.["env"]?.HOME, "/home/fixture");
+  assert.equal(runner.calls[0]?.["env"]?.CODEX_HOME, "/home/fixture/codex");
+  assert.equal(observation.approvalAnswered, false);
   const cli = applyHarnessEvidence(documentedCodexClaim("cli"), observation);
   assert.equal(cli.qualification, "harness-passed");
   assert.equal(cli.capabilities.assignment, "supported");
+  for (const capability of ["modelSelection", "effortSelection", "resume", "cancel", "nativeApproval", "helperCompletion"] as const) {
+    assert.equal(cli.capabilities[capability], "unknown");
+  }
   assert.equal(claimCovers({ vendor: "codex", interfaceId: "app-server", capability: "assignment" }, cli), false);
   assert.throws(() => applyHarnessEvidence(documentedCodexClaim("app-server"), observation), /Evidence for cli cannot qualify app-server/);
 });
 
-test("unknown model and effort are refused before a process starts, and secrets are not sent", async () => {
-  const runner = scriptedTransport(() => {});
-  const model = await runCodexCliAssignment(
-    { assignmentId: "fixture-1", prompt: "Say ready.", workspace: "/work/fixture", model: "gpt-6", effort: null },
-    runner,
-    {},
-    [],
-  );
-  assert.equal(model.spawned, false);
-  assert.match(model.reason ?? "", /Model selection is unknown/);
-  assert.equal(runner.calls.length, 0);
+test("the CLI helper holds explicit settings and credentials before spawn", async () => {
+  const runner = scriptedTransport(() => assert.fail("refused requests must not reach native input"));
+  for (const [model, effort, message] of [
+    ["gpt-6", null, /Model selection is unknown/],
+    ["gpt-6-luna", "low", /Model selection is unknown/],
+    [null, "low", /Effort selection is unknown/],
+  ] as const) {
+    const result = await runCodexCliAssignment(
+      { assignmentId: "fixture-1", prompt: "Say ready.", workspace: "/work/fixture", model, effort }, runner, {}, [],
+    );
+    assert.equal(result.outcome, "refused");
+    assert.equal(result.spawned, false);
+    assert.match(result.reason ?? "", message);
+  }
   const secret = await runCodexCliAssignment(
     { assignmentId: "fixture-1", prompt: "use tp_fixture_key_not_a_real_grant", workspace: "/work/fixture", model: null, effort: null },
     runner,
@@ -81,6 +94,7 @@ test("unknown model and effort are refused before a process starts, and secrets 
   );
   assert.equal(secret.spawned, false);
   assert.match(secret.reason ?? "", /Dispatcher secret/);
+  assert.equal(runner.calls.length, 0);
 });
 
 test("discovery does not read workspace instructions", () => {
