@@ -15,12 +15,14 @@ type Event = { scope: Scope } & (
   | { kind: "snapshot-applied"; requestId: RequestId; next: number }
   | { kind: "closed"; code: 4403 | 4404 }
 );
+type Hint = Extract<Event, { kind: "hi" | "signal" }>;
 type Step = { state: Replay; actions: readonly Action[] };
 
 const modulePath = "../src/board-feed-replay.ts";
-const { createBoardFeedReplay, stepBoardFeedReplay }: {
+const { createBoardFeedReplay, stepBoardFeedReplay, decodeBoardFeedHint }: {
   createBoardFeedReplay(scope: Scope, handledCursor: number): Replay;
   stepBoardFeedReplay(state: Replay, event: Event): Step;
+  decodeBoardFeedHint(input: unknown, scope: Scope): Hint | null;
 } = await import(modulePath);
 
 const currentScope = (): Scope => ({ board: "fabricated-board-a", session: "fabricated-session-2" });
@@ -234,4 +236,172 @@ test("idle stays silent and wake explicitly requests catch-up from the saved cur
   assert.equal(caught.state.cursor, 11);
   unchanged(caught.state, { kind: "idle", scope: currentScope() });
   unchanged(caught.state, { kind: "idle", scope: currentScope() });
+});
+
+test("the offline hint decoder projects only approved hints with the caller's scope", async t => {
+  assert.equal(typeof decodeBoardFeedHint, "function", "the test-first board-feed hint decoder export is pending");
+  const hello = { t: "hi", v: 1, seq: 0 };
+  const item = { seq: 11, kind: "ticket.ready", ticket: "fabricated-ticket" };
+  const lowerItem = { ...item, seq: 10 };
+  const nextItem = { seq: 12, kind: "ticket.patched", ticket: "fabricated-other-ticket" };
+  const signal = { t: "signal", seq: 12, items: [item] };
+  const lowerSignal = { ...signal, items: [lowerItem] };
+  const multiple = { ...signal, seq: 13, items: [item, nextItem] };
+  const overflow = { t: "signal", seq: 14, items: [], more: true };
+  const max = Number.MAX_SAFE_INTEGER;
+  const maxSignal = { ...signal, seq: max };
+  const maxMultiple = { ...maxSignal, items: [lowerItem, nextItem] };
+  const atLimit = { ...signal, seq: 100, items: Array.from({ length: 50 }, (_, i) => ({ ...item, seq: 20 + i })) };
+  const omit = Symbol("omit field");
+  const invalidSequence = [omit, "12", -1, 10.5, NaN, Infinity, max + 1];
+  const invalidTag = [omit, 1, "seq", "pong", "closed", "changes-applied"];
+  type Fields = readonly (readonly [string, readonly unknown[]])[];
+  const unexpected: Fields = [
+    ["board", [otherBoard.board]],
+    ["session", [retiredSession.session]],
+    ["scope", [otherBoard, retiredSession]],
+    ["author", [{ board: otherBoard.board, session: retiredSession.session }, { scope: retiredSession }]],
+    ["extra", ["fabricated-extension"]],
+  ];
+
+  function vary(
+    record: Record<string, unknown>, fields: Fields,
+    check: (changed: Record<string, unknown>, description: string) => void,
+  ) {
+    for (const [field, values] of fields) {
+      for (const [index, value] of values.entries()) {
+        const candidate = { ...record };
+        if (value === omit) delete candidate[field];
+        else candidate[field] = value;
+        check(candidate, `${field} variant ${index + 1}`);
+      }
+    }
+  }
+
+  function ignored(frame: unknown, state = createBoardFeedReplay(currentScope(), 10), description?: string) {
+    const scope = currentScope();
+    const original = structuredClone(frame);
+    const before = structuredClone(state);
+    const hint = decodeBoardFeedHint(frame, scope);
+    const result = hint === null ? { state, actions: [] } : stepBoardFeedReplay(state, hint);
+    assert.deepEqual(result.actions, [], description);
+    assert.deepEqual(result.state, before, description);
+    assert.equal(hint, null, description);
+    assert.deepEqual(scope, currentScope());
+    assert.deepEqual(state, before);
+    assert.deepEqual(frame, original);
+  }
+
+  await t.test("accepts publisher frames across the sequence and item-count boundaries", () => {
+    const cases = [
+      { frame: hello, kind: "hi", cursor: 0 },
+      { frame: { ...hello, seq: 23 }, kind: "hi", cursor: 20 },
+      { frame: { ...hello, seq: max }, kind: "hi", cursor: 10 },
+      { frame: signal, kind: "signal", cursor: 10 },
+      { frame: lowerSignal, kind: "signal", cursor: 10 },
+      { frame: { ...signal, items: [{ ...item, seq: 12 }] }, kind: "signal", cursor: 10 },
+      { frame: multiple, kind: "signal", cursor: 10 },
+      { frame: { ...multiple, seq: 14, items: [item, { ...nextItem, seq: 13 }] }, kind: "signal", cursor: 10 },
+      { frame: { ...signal, items: [{ ...item, ticket: null }] }, kind: "signal", cursor: 10 },
+      { frame: atLimit, kind: "signal", cursor: 10 },
+      { frame: maxSignal, kind: "signal", cursor: 10 },
+      { frame: maxMultiple, kind: "signal", cursor: 10 },
+      { frame: { ...maxSignal, items: [{ ...item, seq: max }] }, kind: "signal", cursor: 10 },
+      { frame: overflow, kind: "signal", cursor: 10 },
+      { frame: { ...overflow, seq: max }, kind: "signal", cursor: 10 },
+    ] as const;
+    for (const { frame, kind, cursor } of cases) {
+      const scope = currentScope();
+      const before = structuredClone(frame);
+      const state = createBoardFeedReplay(scope, cursor);
+      const hint = decodeBoardFeedHint(frame, scope);
+      assert.deepEqual(hint, { kind, seq: frame.seq, scope: currentScope() });
+      assert.ok(hint);
+      const step = stepBoardFeedReplay(state, hint);
+      readChanges(step, cursor);
+      assert.equal(step.state.cursor, cursor);
+      assert.deepEqual(frame, before);
+      assert.deepEqual(scope, currentScope());
+    }
+  });
+
+  await t.test("the same frame takes the caller's generation and a retired hint cannot wake current replay", () => {
+    const state = createBoardFeedReplay(currentScope(), 10);
+    const retired = decodeBoardFeedHint(signal, retiredSession);
+    assert.deepEqual(retired, { kind: "signal", seq: 12, scope: retiredSession });
+    assert.ok(retired);
+    unchanged(state, retired);
+    const current = decodeBoardFeedHint(signal, currentScope());
+    assert.deepEqual(current, { kind: "signal", seq: 12, scope: currentScope() });
+    assert.ok(current);
+    readChanges(stepBoardFeedReplay(state, current), 10);
+  });
+
+  await t.test("rejects malformed publisher fields one at a time", () => {
+    const state = createBoardFeedReplay(currentScope(), 10);
+    const cases: { name: string; frame: Record<string, unknown>; fields: Fields }[] = [
+      { name: "hello", frame: hello, fields: [
+        ["v", [omit, 0, 2, "1", true, null]], ["items", [[]]], ["more", [true]],
+        ["mine", [0]], ["text_connection", ["fabricated-text-connection"]], ["text_protocol", [{}]],
+      ] },
+      { name: "ordinary signal", frame: lowerSignal, fields: [
+        ["items", [omit, null, "fabricated", {}, [], [null]]], ["more", [true, false, "true"]], ["v", [1]],
+      ] },
+      { name: "overflow", frame: overflow, fields: [
+        ["items", [omit, null, "fabricated", {}, [item]]], ["more", [omit, false, "true", null, 1]], ["v", [1]],
+      ] },
+    ];
+    for (const { name, frame, fields } of cases) {
+      vary(frame, [["t", invalidTag], ["seq", invalidSequence], ...fields, ...unexpected], (candidate, description) => {
+        ignored(candidate, state, `${name} ${description}`);
+      });
+    }
+    ignored({ ...atLimit, items: [...atLimit.items, { ...item, seq: 70 }] }, state, "ordinary signal above the item limit");
+  });
+
+  await t.test("rejects malformed item fields in the first and later positions", () => {
+    const state = createBoardFeedReplay(currentScope(), 10);
+    const fields: Fields = [
+      ["seq", invalidSequence], ["kind", [omit, 1, null]], ["ticket", [omit, 1, false]], ...unexpected,
+    ];
+    vary(lowerItem, fields, (candidate, description) => {
+      ignored({ ...maxMultiple, items: [candidate, nextItem] }, state, `first item ${description}`);
+    });
+    vary(nextItem, fields, (candidate, description) => {
+      ignored({ ...maxMultiple, items: [lowerItem, candidate] }, state, `later item ${description}`);
+    });
+    ignored({ ...signal, items: [{ ...item, seq: 99 }] }, state, "first item beyond the frame tip");
+    ignored({ ...signal, items: [item, { ...nextItem, seq: 99 }] }, state, "later item beyond the frame tip");
+    ignored({ ...multiple, items: [nextItem, item] }, state, "items out of publisher order");
+    ignored({ ...multiple, items: [item, { ...nextItem, seq: 11 }] }, state, "duplicate item sequence");
+  });
+
+  await t.test("rejects non-hint shapes without issuing a read", () => {
+    for (const frame of [
+      null, "fabricated text frame", ["signal", 12], { kind: "signal", seq: 12 },
+      { t: "closed", code: 4403, seq: 12 }, { t: "changes-applied", requestId: 1, next: 12, seq: 12 },
+    ]) ignored(frame);
+  });
+
+  await t.test("complete internal events with any scope cannot enter through the hint decoder", () => {
+    const initial = createBoardFeedReplay(currentScope(), 10);
+    const pending = stepBoardFeedReplay(initial, { kind: "signal", scope: currentScope(), seq: 12 });
+    const read = readChanges(pending, 10);
+    const gap = stepBoardFeedReplay(pending.state, { kind: "changes-too-old", scope: currentScope(), requestId: read.requestId });
+    const snapshot = readSnapshot(gap);
+    for (const scope of [currentScope(), retiredSession, otherBoard]) {
+      const cases: { frame: Event; state: Replay }[] = [
+        { frame: { kind: "hi", scope, seq: 0 }, state: initial },
+        { frame: { kind: "signal", scope, seq: 12 }, state: initial },
+        { frame: { kind: "idle", scope }, state: initial },
+        { frame: { kind: "wake", scope }, state: initial },
+        { frame: { kind: "changes-applied", scope, requestId: read.requestId, next: 99, more: false }, state: pending.state },
+        { frame: { kind: "changes-too-old", scope, requestId: read.requestId }, state: pending.state },
+        { frame: { kind: "snapshot-applied", scope, requestId: snapshot.requestId, next: 99 }, state: gap.state },
+        { frame: { kind: "closed", scope, code: 4403 }, state: pending.state },
+        { frame: { kind: "closed", scope, code: 4404 }, state: gap.state },
+      ];
+      for (const { frame, state } of cases) ignored(frame, state);
+    }
+  });
 });
