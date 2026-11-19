@@ -20,6 +20,22 @@ Both binaries reported `Logged in using ChatGPT`. Both stdio servers answered `i
 
 The direct invocations establish behavior of this CLI version. The current Dispatcher CLI helper refuses explicit model or effort selection and has no resume or cancel entry point. [Dispatcher CLI helper](src/adapters/codex.ts).
 
+### Repeatable CLI contract check
+
+The [standalone Windows contract test](test/codex-cli-windows.contract.ts) uses the same pinned npm executable and the Dispatcher's process transport on its own fabricated Git checkout. Run it explicitly with an absolute path to the Windows `codex.exe` listed above and an existing local ChatGPT sign-in. It sends two fixture turns with `gpt-6-luna` and `low`. Normal fixture CI needs neither that executable nor an account.
+
+```powershell
+$npmRoot = npm root -g
+$codexCli = Join-Path $npmRoot '@openai/codex/node_modules/@openai/codex-win32-x64/vendor/x86_64-pc-windows-msvc/bin/codex.exe'
+node --experimental-strip-types dispatcher/test/codex-cli-windows.contract.ts $codexCli
+```
+
+The check requires a matching fresh and resumed thread, the expected result from each turn, and a terminal event and successful exit for both. The fixture rejects an omitted or malformed resume ID before calling Codex. A randomly generated, missing UUID receives native RPC code `-32600`, with `no rollout found for thread id <fixture-uuid>`, exit `1` and no JSONL assignment events. The check keeps the fixture session ID and native streams out of its report.
+
+In 0.163.0 the explicit UUID path passes the identifier directly to native resume. The separate no-target branch can start a fresh thread. Dispatcher resume must require a UUID bound to the current assignment, workspace and branch, and reacquire exclusive authority before any native input is delivered. Rejecting an invalid result after launch cannot supply that authority. A missing local session and a valid session under stale Dispatcher authority are different failures. The current assignment boundary is a fabricated harness and cannot authorize native resume. [Pinned resume dispatch](https://github.com/openai/codex/blob/rust-v0.163.0/codex-rs/exec/src/lib.rs#L993-L1029), [pinned UUID lookup](https://github.com/openai/codex/blob/rust-v0.163.0/codex-rs/exec/src/lib.rs#L1848-L1853), [Dispatcher assignment boundary](src/assignment-boundary.ts).
+
+The fixture tests also check that approved native configuration paths reach the subprocess, held Dispatcher values do not, and the adapter records no approval answer. Pinned CLI source rejects native command and file approval requests in `exec` mode. The contract check leaves approval recovery, effective model and effort, acknowledged CLI cancellation, and containment unresolved. [Pinned CLI approval handling](https://github.com/openai/codex/blob/rust-v0.163.0/codex-rs/exec/src/lib.rs#L1993-L2040).
+
 ## App-server stdio, npm binary 0.163.0
 
 - The Dispatcher adapter launched a new process, exchanged `initialize` and `initialized`, opened the fixture directory with `thread/start`, and sent a text item via `turn/start` with `effort: "low"`. `thread/start` reported model `gpt-6-luna`, provider `openai`, a thread-level effort of `high`, and native approval and sandbox fields. The tested turn asked for the sum and label from fabricated values in the input. The adapter delivered `25|FINCH`, correlated the thread and turn, and observed terminal `completed` and exit `0`. The turn's effective effort remained unknown. The `high` value preceded the turn request.
