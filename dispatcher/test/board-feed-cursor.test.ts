@@ -148,25 +148,96 @@ test("restart accepts a recorded zero only in its independently supplied local s
     assert.deepEqual(api.restoreBoardFeedCursor(dir, otherBinding), { kind: "scope-mismatch" });
     assert.deepEqual(api.stepBoardFeedCursor(dir, otherBinding, initial, { kind: "hi", scope: scopeOf(current), seq: 1 }), { kind: "held" });
     assert.deepEqual(readFileSync(ledgerPath(dir)), zero);
-
-    const legacy = saveFixture(dir);
-    assert.deepEqual(api.restoreBoardFeedCursor(dir, current), { kind: "missing" });
-    assert.deepEqual(readFileSync(ledgerPath(dir)), legacy);
-    const malformed = [
-      [row(-1)], [row(1.5)], [row(Number.MAX_SAFE_INTEGER + 1)],
-      [{ ...row(0), handled: "0" }], [row(0), row(1)],
-      [{ ...row(0), session: "fabricated-retired-session" }],
-    ];
-    for (const cursors of malformed) {
-      const bytes = saveFixture(dir, cursors);
-      assert.deepEqual(api.restoreBoardFeedCursor(dir, current), { kind: "invalid" });
-      assert.deepEqual(readFileSync(ledgerPath(dir)), bytes);
-    }
-    const truncated = Buffer.from('{"version":1,"boardFeedCursors":[');
-    writeFileSync(ledgerPath(dir), truncated);
-    assert.deepEqual(api.restoreBoardFeedCursor(dir, current), { kind: "invalid" });
-    assert.deepEqual(readFileSync(ledgerPath(dir)), truncated);
   } finally { removeDir(dir); }
+});
+
+test("a matching completed page cannot repair, create or borrow an unusable cursor record", async t => {
+  const current = context();
+  const scope = scopeOf(current);
+  const open = stepBoardFeedReplay(createBoardFeedReplay(scope, 0), { kind: "hi", scope, seq: 7 });
+  const event = { kind: "changes-applied", scope, requestId: read(open, current, 0), next: 7, more: false } as const;
+  assert.equal(stepBoardFeedReplay(open.state, event).state.cursor, 7);
+  const api = await checkpoint();
+
+  const cases: ReadonlyArray<{
+    name: string;
+    kind: "missing" | "invalid" | "scope-mismatch";
+    cursors?: unknown;
+    raw?: string;
+    noFile?: true;
+  }> = [
+    { name: "absent ledger file", kind: "missing", noFile: true },
+    { name: "legacy ledger without cursors", kind: "missing" },
+    { name: "empty cursor list", kind: "missing", cursors: [] },
+    { name: "absent board", kind: "missing", cursors: [row(33, otherBoard)] },
+    { name: "same board with a different binding", kind: "scope-mismatch", cursors: [row(0, otherBinding)] },
+    { name: "null cursor list", kind: "invalid", cursors: null },
+    { name: "object cursor list", kind: "invalid", cursors: {} },
+    { name: "negative cursor", kind: "invalid", cursors: [row(-1)] },
+    { name: "noninteger cursor", kind: "invalid", cursors: [row(1.5)] },
+    { name: "unsafe cursor", kind: "invalid", cursors: [row(Number.MAX_SAFE_INTEGER + 1)] },
+    { name: "string cursor", kind: "invalid", cursors: [{ ...row(0), handled: "0" }] },
+    { name: "missing board", kind: "invalid", cursors: [{ binding: current.binding, handled: 0 }] },
+    { name: "missing binding", kind: "invalid", cursors: [{ board: current.board, handled: 0 }] },
+    { name: "non-string board", kind: "invalid", cursors: [{ ...row(0), board: 1 }] },
+    { name: "non-string binding", kind: "invalid", cursors: [{ ...row(0), binding: 1 }] },
+    { name: "duplicate board", kind: "invalid", cursors: [row(0), row(1)] },
+    { name: "unexpected persisted session", kind: "invalid", cursors: [{ ...row(0), session: "fabricated-retired-session" }] },
+    { name: "truncated ledger", kind: "invalid", raw: '{"version":1,"boardFeedCursors":[' },
+  ];
+  for (const entry of cases) {
+    await t.test(entry.name, () => {
+      const dir = tempDir();
+      const path = ledgerPath(dir);
+      try {
+        if (entry.raw !== undefined) writeFileSync(path, entry.raw, { mode: 0o600 });
+        else if (!entry.noFile) saveFixture(dir, entry.cursors);
+        assert.equal(existsSync(path), !entry.noFile);
+        const before = entry.noFile ? null : readFileSync(path);
+        const replay = structuredClone(open.state);
+        assert.deepEqual(api.restoreBoardFeedCursor(dir, current), { kind: entry.kind });
+        assert.deepEqual(existsSync(path) ? readFileSync(path) : null, before);
+        assert.deepEqual(api.stepBoardFeedCursor(dir, current, replay, event), { kind: "held" });
+        assert.deepEqual(replay, open.state);
+        assert.deepEqual(existsSync(path) ? readFileSync(path) : null, before);
+      } finally { removeDir(dir); }
+    });
+  }
+});
+
+test("same-scope stale completions cannot replace a newer durable cursor", async t => {
+  const api = await checkpoint();
+  for (const [name, staleNext] of [["below the saved cursor", 7], ["above the saved cursor", 11]] as const) {
+    await t.test(name, () => {
+      const dir = tempDir();
+      try {
+        const current = context();
+        const scope = scopeOf(current);
+        saveFixture(dir, [row(5), row(33, otherBoard)]);
+        const older = restored(api.restoreBoardFeedCursor(dir, current), current, 5);
+        const stale = accepted(api.stepBoardFeedCursor(dir, current, older, { kind: "hi", scope, seq: 11 }));
+        const staleRequest = read(stale, current, 5);
+        const latest = restored(api.restoreBoardFeedCursor(dir, current), current, 5);
+        const competing = accepted(api.stepBoardFeedCursor(dir, current, latest, { kind: "hi", scope, seq: 9 }));
+        const currentRequest = read(competing, current, 5);
+        assert.equal(currentRequest, staleRequest);
+        const committed = accepted(api.stepBoardFeedCursor(dir, current, competing.state, {
+          kind: "changes-applied", scope, requestId: currentRequest, next: 9, more: false,
+        }));
+        assert.equal(committed.state.cursor, 9);
+        const before = readFileSync(ledgerPath(dir));
+        assert.deepEqual(JSON.parse(before.toString("utf8")), {
+          ...emptyLedger(), boardFeedCursors: [row(9), row(33, otherBoard)],
+        });
+
+        const late = { kind: "changes-applied", scope, requestId: staleRequest, next: staleNext, more: false } as const;
+        assert.equal(stepBoardFeedReplay(stale.state, late).state.cursor, staleNext);
+        assert.deepEqual(api.stepBoardFeedCursor(dir, current, stale.state, late), { kind: "held" });
+        assert.deepEqual(readFileSync(ledgerPath(dir)), before);
+        restored(api.restoreBoardFeedCursor(dir, current), current, 9);
+      } finally { removeDir(dir); }
+    });
+  }
 });
 
 test("hints and a retired response leave the durable cursor at the last completed page", async () => {
