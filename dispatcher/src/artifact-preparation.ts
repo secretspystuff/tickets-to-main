@@ -45,6 +45,10 @@ const digest = (value: unknown): value is string => typeof value === "string" &&
 const integer = (value: unknown, minimum: number): value is number => typeof value === "number" && Number.isSafeInteger(value) && value >= minimum;
 const exact = (value: object, keys: readonly string[]) => Reflect.ownKeys(value).length === keys.length && keys.every(key => Object.hasOwn(value, key));
 
+function workspaceDigest(workspace: DirectoryIdentity): string {
+  return journalDigest(JSON.stringify([workspace.path, workspace.identity]));
+}
+
 function requestOf(value: unknown): Request | null {
   if (!value || typeof value !== "object" || Object.getPrototypeOf(value) !== Object.prototype) return null;
   const fields = Object.getOwnPropertyDescriptors(value);
@@ -142,7 +146,7 @@ export function runArtifactPreparation(input: Input): Result {
         if (!stop) return held();
         if (request.stopSequence !== stop.marker.sequence || journalDigest(request.jobId) !== stop.intent.jobDigest) return stopped(stop.marker);
         const before = approval(input, state, request, at, stop.marker.at);
-        if (!before || journalDigest(before.workspace.path) !== stop.intent.workspaceDigest) return stopped(stop.marker);
+        if (!before || workspaceDigest(before.workspace) !== stop.intent.workspaceDigest) return stopped(stop.marker);
         if (checkPushArtifacts(input.artifacts).state !== "clear") return stopped(stop.marker);
         const completedAt = input.context.now();
         if (!integer(completedAt, at) || !isDeepStrictEqual(before, approval(input, state, request, completedAt, stop.marker.at))) {
@@ -156,7 +160,7 @@ export function runArtifactPreparation(input: Input): Result {
       const sequence = history.sequence + 1;
       if (!integer(sequence, 1)) return unavailable();
       append({ kind: "artifact.intent", sequence, at,
-        jobDigest: journalDigest(request.jobId), workspaceDigest: journalDigest(before.workspace.path) });
+        jobDigest: journalDigest(request.jobId), workspaceDigest: workspaceDigest(before.workspace) });
       const scan = checkPushArtifacts(input.artifacts);
       const completedAt = input.context.now();
       if (!integer(completedAt, at)) return unavailable();

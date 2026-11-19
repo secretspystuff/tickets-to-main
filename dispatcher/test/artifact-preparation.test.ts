@@ -1,12 +1,14 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { appendFileSync, linkSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
+import { appendFileSync, cpSync, linkSync, readFileSync, realpathSync, renameSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { test, type TestContext } from "node:test";
 import { runArtifactPreparation } from "../src/artifact-preparation.ts";
 import { runCheckAttempt, type CheckAttemptRecord } from "../src/check-attempt.ts";
 import { processRunner } from "../src/command.ts";
+import { assignmentDirectory } from "../src/directory-identity.ts";
+import { assertPrivateDirectory } from "../src/fs-safety.ts";
 import { install } from "../src/install.ts";
 import { updateLedger } from "../src/ledger.ts";
 import { prepareWorkspace } from "../src/workspace.ts";
@@ -345,6 +347,59 @@ test("only fresh same-job and same-workspace after-fix authority resumes an exac
   const freshNext = f.receipt("d", 131);
   f.setNow(140);
   assert.deepEqual(f.run(freshNext, batch(), stop, f.current(freshNext, stop)), nextStop);
+});
+
+test("a same-path replacement cannot resume the original checkout's stop", t => {
+  const f = fixture(t, true);
+  const original = assignmentDirectory(f.workspace);
+  const moved = realpathSync(tempDir());
+  t.after(() => removeDir(moved));
+  const originalLocation = join(moved, "original");
+  const replacementLocation = join(moved, "replacement");
+  const emptyReplacement = realpathSync(tempDir());
+  t.after(() => removeDir(emptyReplacement));
+  const stopped = f.run(f.receipt("a", 90), batch(unsafe));
+  assert.equal(stopped.state, "stopped");
+  assert.ok(stopped.stopSequence !== null);
+  const before = readFileSync(f.journal);
+  const work = readFileSync(join(f.workspace, "behavior.txt"));
+  function assertCheckout(path: string, identity: string) {
+    assert.equal(assignmentDirectory(path).identity, identity);
+    assert.equal(git(path, "rev-parse", "HEAD"), f.first.snapshot.candidateCommit);
+    assert.equal(git(path, "status", "--porcelain"), "");
+    assert.equal(git(path, "remote"), "");
+    assert.deepEqual(readFileSync(join(path, "behavior.txt")), work);
+  }
+  assertCheckout(f.workspace, original.identity);
+
+  renameSync(f.workspace, originalLocation);
+  renameSync(emptyReplacement, f.workspace);
+  cpSync(join(originalLocation, ".git"), join(f.workspace, ".git"), { recursive: true, errorOnExist: true, force: false });
+  cpSync(join(originalLocation, "behavior.txt"), join(f.workspace, "behavior.txt"), { errorOnExist: true, force: false });
+  const replacement = assignmentDirectory(f.workspace);
+  assert.equal(replacement.path, original.path);
+  assert.notEqual(replacement.identity, original.identity);
+  assertPrivateDirectory(f.workspace);
+  assertCheckout(f.workspace, replacement.identity);
+  const fresh = f.receipt("b", 105);
+  const authority = f.current(fresh, stopped.stopSequence);
+  const recovery = f.request(fresh, stopped.stopSequence);
+  const attempted = child(f.stateDir, recovery, authority, false, 120);
+  assert.equal(attempted.status, 0);
+  assert.deepEqual(JSON.parse(attempted.stdout), stopped);
+  assert.deepEqual(readFileSync(f.journal), before);
+  assertCheckout(originalLocation, original.identity);
+  assertCheckout(f.workspace, replacement.identity);
+
+  renameSync(f.workspace, replacementLocation);
+  renameSync(originalLocation, f.workspace);
+  assert.deepEqual(assignmentDirectory(f.workspace), original);
+  const restored = child(f.stateDir, recovery, authority, false, 120);
+  assert.equal(restored.status, 0);
+  assert.equal(JSON.parse(restored.stdout).state, "resumed");
+  assert.deepEqual(events(f.journal).map(row => row.kind), ["artifact.intent", "runner.stopped", "runner.resumed"]);
+  assertCheckout(f.workspace, original.identity);
+  assertCheckout(replacementLocation, replacement.identity);
 });
 
 test("a fresh process holds an interrupted scan before preparing anything else", t => {
