@@ -207,7 +207,7 @@ export function verifyPartialStage(stateDir: string, intent: OwnedStage): void {
       } else {
         const limit = files.get(relative);
         if (limit === undefined || !entry.isFile() || entry.nlink !== 1 || entry.size > limit) throw releaseError();
-        assertPrivateAccess(path);
+        assertPrivateAccess(actual);
       }
     }
   };
