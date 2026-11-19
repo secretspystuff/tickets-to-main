@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { existsSync, readFileSync, writeFileSync } from "node:fs";
+import fs, { existsSync, readFileSync, writeFileSync } from "node:fs";
+import { syncBuiltinESMExports } from "node:module";
 import { test } from "node:test";
 import { createBoardFeedReplay, stepBoardFeedReplay } from "../src/board-feed-replay.ts";
 import { emptyLedger, ledgerPath, loadLedger } from "../src/ledger.ts";
@@ -182,6 +183,8 @@ test("a matching completed page cannot repair, create or borrow an unusable curs
     { name: "non-string board", kind: "invalid", cursors: [{ ...row(0), board: 1 }] },
     { name: "non-string binding", kind: "invalid", cursors: [{ ...row(0), binding: 1 }] },
     { name: "duplicate board", kind: "invalid", cursors: [row(0), row(1)] },
+    { name: "conflicting bindings with the current row first", kind: "invalid", cursors: [row(0), row(0, otherBinding)] },
+    { name: "conflicting bindings with the current row last", kind: "invalid", cursors: [row(0, otherBinding), row(0)] },
     { name: "unexpected persisted session", kind: "invalid", cursors: [{ ...row(0), session: "fabricated-retired-session" }] },
     { name: "truncated ledger", kind: "invalid", raw: '{"version":1,"boardFeedCursors":[' },
   ];
@@ -205,7 +208,7 @@ test("a matching completed page cannot repair, create or borrow an unusable curs
   }
 });
 
-test("same-scope stale completions cannot replace a newer durable cursor", async t => {
+test("same-scope completions require an exact match with the durable prior cursor", async t => {
   const api = await checkpoint();
   for (const [name, staleNext] of [["below the saved cursor", 7], ["above the saved cursor", 11]] as const) {
     await t.test(name, () => {
@@ -238,6 +241,34 @@ test("same-scope stale completions cannot replace a newer durable cursor", async
       } finally { removeDir(dir); }
     });
   }
+
+  await t.test("replay starts above the saved cursor", probe => {
+    const dir = tempDir();
+    try {
+      const current = context();
+      const scope = scopeOf(current);
+      const path = ledgerPath(dir);
+      const before = saveFixture(dir, [row(5), row(33, otherBoard)]);
+      restored(api.restoreBoardFeedCursor(dir, current), current, 5);
+      const open = stepBoardFeedReplay(createBoardFeedReplay(scope, 7), { kind: "hi", scope, seq: 12 });
+      const event = { kind: "changes-applied", scope, requestId: read(open, current, 7), next: 9, more: false } as const;
+      assert.equal(stepBoardFeedReplay(open.state, event).state.cursor, 9);
+
+      let replacements = 0;
+      const rename = fs.renameSync;
+      fs.renameSync = (source, destination) => {
+        if (destination === path) replacements++;
+        rename(source, destination);
+      };
+      syncBuiltinESMExports();
+      probe.after(() => { fs.renameSync = rename; syncBuiltinESMExports(); });
+
+      assert.deepEqual(api.stepBoardFeedCursor(dir, current, open.state, event), { kind: "held" });
+      assert.equal(replacements, 0);
+      assert.deepEqual(readFileSync(path), before);
+      restored(api.restoreBoardFeedCursor(dir, current), current, 5);
+    } finally { removeDir(dir); }
+  });
 });
 
 test("hints and a retired response leave the durable cursor at the last completed page", async () => {
