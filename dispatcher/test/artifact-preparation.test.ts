@@ -252,6 +252,56 @@ test("an incomplete scan also stops and no normal retry can clear it", t => {
   assert.deepEqual(readFileSync(f.journal), before);
 });
 
+test("incomplete supplied inventories preserve the artifact stop and pending after-fix authority", t => {
+  const f = fixture(t);
+  const stopped = f.run(f.receipt("a", 90), batch(unsafe));
+  assert.equal(stopped.state, "stopped");
+  assert.ok(stopped.stopSequence !== null);
+  const fresh = f.receipt("b", 105);
+  const request = f.request(fresh, stopped.stopSequence);
+  const authority = f.current(fresh, stopped.stopSequence);
+  const savedAuthority = structuredClone(authority);
+  const savedJournal = readFileSync(f.journal);
+  const ledgerPath = join(f.stateDir, "ledger.json");
+  const savedLedger = readFileSync(ledgerPath);
+  const workPath = join(f.workspace, "behavior.txt");
+  const savedWork = readFileSync(workPath);
+  const inventory = batch("fabricated checked bytes");
+  const [entry] = inventory.expected;
+  const [artifact] = inventory.artifacts;
+  assert.ok(entry && artifact);
+  const replacedBytes = Buffer.from("fabricated changed bytes");
+  assert.equal(replacedBytes.byteLength, artifact.bytes.byteLength);
+  assert.notDeepEqual(replacedBytes, artifact.bytes);
+
+  const cases = [
+    { name: "missing inventory", value: undefined },
+    { name: "missing entry", value: { ...inventory, artifacts: [] } },
+    { name: "mismatched size", value: { ...inventory, expected: [{ ...entry, size: entry.size + 1 }] } },
+    { name: "same-sized replacement", value: { ...inventory, artifacts: [{ ...artifact, bytes: replacedBytes }] } },
+  ];
+  const context: Input["context"] = { kind: "fabricated-harness", now: () => 120, readCurrent: () => authority };
+  for (const { name, value } of cases) {
+    const before = structuredClone(value);
+    const result = runArtifactPreparation({ stateDir: f.stateDir, request, artifacts: value, context });
+    assert.deepEqual(result, stopped, name);
+    assert.deepEqual(readFileSync(f.journal), savedJournal, name);
+    assert.deepEqual(readFileSync(ledgerPath), savedLedger, name);
+    assert.deepEqual(readFileSync(workPath), savedWork, name);
+    assert.deepEqual(authority, savedAuthority, name);
+    assert.deepEqual(structuredClone(value), before, name);
+  }
+
+  const result = runArtifactPreparation({ stateDir: f.stateDir, request, artifacts: inventory, context });
+  assertResult(result);
+  assert.equal(result.state, "resumed");
+  assert.deepEqual(events(f.journal).map(row => row.kind), ["artifact.intent", "runner.stopped", "runner.resumed"]);
+  assert.deepEqual(readFileSync(f.journal).subarray(0, savedJournal.length), savedJournal);
+  assert.deepEqual(readFileSync(ledgerPath), savedLedger);
+  assert.deepEqual(readFileSync(workPath), savedWork);
+  assert.deepEqual(authority, savedAuthority);
+});
+
 test("only fresh same-job and same-workspace after-fix authority resumes an exact stop", t => {
   const f = fixture(t);
   const queued = f.receipt("a", 90);
