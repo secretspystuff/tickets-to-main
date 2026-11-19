@@ -259,10 +259,17 @@ test("the offline hint decoder projects only approved hints with the caller's sc
     assert.deepEqual(frame, original);
   }
 
-  await t.test("v1 hello at zero and ordinary and overflow signals are tip hints", () => {
+  await t.test("v1 hello and ordinary and overflow signals are tip hints across the valid sequence range", () => {
     const cases = [
       { frame: hello, kind: "hi", seq: 0, cursor: 0 },
+      { frame: { ...hello, seq: 23 }, kind: "hi", seq: 23, cursor: 20 },
+      { frame: { ...hello, seq: Number.MAX_SAFE_INTEGER }, kind: "hi", seq: Number.MAX_SAFE_INTEGER, cursor: 10 },
       { frame: signal, kind: "signal", seq: 12, cursor: 10 },
+      { frame: { ...signal, items: [{ ...item, seq: 12 }] }, kind: "signal", seq: 12, cursor: 10 },
+      {
+        frame: { ...signal, seq: 13, items: [item, { seq: 12, kind: "ticket.patched", ticket: "fabricated-other-ticket" }] },
+        kind: "signal", seq: 13, cursor: 10,
+      },
       { frame: overflow, kind: "signal", seq: 14, cursor: 10 },
       { frame: { ...signal, seq: Number.MAX_SAFE_INTEGER }, kind: "signal", seq: Number.MAX_SAFE_INTEGER, cursor: 10 },
     ] as const;
@@ -304,7 +311,7 @@ test("the offline hint decoder projects only approved hints with the caller's sc
       { t: "hi", v: 1 }, { t: "signal" },
     ];
     for (const seq of ["12", -1, 10.5, NaN, Infinity, Number.MAX_SAFE_INTEGER + 1]) {
-      invalidFrames.push({ ...hello, seq }, { ...signal, seq });
+      invalidFrames.push({ ...hello, seq }, { ...signal, seq }, { ...overflow, seq });
     }
     for (const frame of [hello, signal, overflow]) {
       invalidFrames.push(
