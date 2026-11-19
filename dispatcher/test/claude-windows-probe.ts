@@ -7,8 +7,11 @@ const VERSION = "2.1.326";
 const MODEL = "claude-haiku-5-5";
 const EFFORT = "low";
 const FIXTURE_RESULT = "T3-FIXTURE-OK";
+const RESUME_MARKER = "T3-RESUME-MARKER-61";
+const RESUME_PROMPT = "Fabricated text test. Use no tools, files, commands, MCP or helpers. Reply with only the marker from the previous turn.";
 const FIXTURE_PROMPTS = {
-  fresh: "Fabricated text test. Use no tools, files, commands, MCP or helpers. Reply with exactly T3-FIXTURE-OK.",
+  fresh: "Fabricated text test. Use no tools, files, commands, MCP or helpers. Remember " + RESUME_MARKER +
+    " for the next fabricated turn. Reply with exactly T3-FIXTURE-OK.",
   interrupt: "Fabricated text test. Use no tools, files, commands, MCP or helpers. List 40 fictional one-word windmill names.",
 };
 const FIXTURE_ENV = new Set([
@@ -29,6 +32,7 @@ type ProbeOutcome = "refused" | "held" | "protocol-error" | "disconnected" | "fa
 type ProbeObservation = {
   scope: "fabricated";
   version: typeof VERSION;
+  execution: "fresh" | "explicit-resume";
   outcome: ProbeOutcome;
   requestedModel: typeof MODEL;
   initialModel: string | null;
@@ -39,6 +43,11 @@ type ProbeObservation = {
   helperActivity: "unknown" | "observed";
   interrupt: "not-requested" | "unconfirmed" | "acknowledged";
   resultMatches: boolean | null;
+};
+
+type ProbeHandle = {
+  closed: Promise<ProbeObservation>;
+  resumeFixture(): ProbeHandle | null;
 };
 
 function localAbsolute(path: string): boolean {
@@ -53,23 +62,28 @@ function isRoot(frame: Record<string, unknown>): boolean {
   return frame.agent_id === undefined && (frame.parent_tool_use_id === undefined || frame.parent_tool_use_id === null);
 }
 
-export function startClaudeWindowsProbe(options: ClaudeWindowsProbeOptions, transport: NativeTransport): {
-  closed: Promise<ProbeObservation>;
-} {
+export function startClaudeWindowsProbe(options: ClaudeWindowsProbeOptions, transport: NativeTransport): ProbeHandle {
+  return startFixtureTurn({ ...options, env: { ...options.env } }, { start: transport.start.bind(transport) }, null);
+}
+
+function startFixtureTurn(options: ClaudeWindowsProbeOptions, transport: NativeTransport, resumeSession: string | null): ProbeHandle {
   const { executable, version, workspace, planOnlyVerified, env, mode } = options;
   const evidence: ProbeObservation = {
-    scope: "fabricated", version: VERSION, outcome: "refused", requestedModel: MODEL, initialModel: null, observedModel: null,
+    scope: "fabricated", version: VERSION, execution: resumeSession === null ? "fresh" : "explicit-resume",
+    outcome: "refused", requestedModel: MODEL, initialModel: null, observedModel: null,
     requestedEffort: EFFORT, effectiveEffort: "unknown", writerState: "unknown", helperActivity: "unknown",
     interrupt: "not-requested", resultMatches: null,
   };
   if (version !== VERSION || planOnlyVerified !== true || !localAbsolute(executable) || !localAbsolute(workspace)
     || win32.basename(executable).toLowerCase() !== "claude.exe"
     || Object.keys(env).some(name => !FIXTURE_ENV.has(name.toLowerCase()))) {
-    return { closed: Promise.resolve(evidence) };
+    return { closed: Promise.resolve(evidence), resumeFixture: () => null };
   }
 
-  const sessionId = randomUUID();
+  const sessionId = resumeSession ?? randomUUID();
   const inputId = randomUUID();
+  const expectedResult = resumeSession === null ? FIXTURE_RESULT : RESUME_MARKER;
+  let resumeAvailable = false;
   let initialized = false;
   let spawned = false;
   let ending = false;
@@ -103,10 +117,16 @@ export function startClaudeWindowsProbe(options: ClaudeWindowsProbeOptions, tran
       && (inputs === undefined || (Array.isArray(inputs) && inputs.length === 1 && inputs[0] === inputId));
   }
 
+  function hasUnrelatedTurn(frame: Record<string, unknown>): boolean {
+    return frame.origin !== undefined || frame.resume_reason !== undefined
+      || ((frame.user_message_uuid !== undefined || frame.user_message_uuids !== undefined) && !correlate(frame));
+  }
+
   function receive(value: unknown): void {
     if (failure) return;
     const frame = record(value);
     if (!frame || typeof frame.type !== "string" || terminal) { stop("protocol-error"); return; }
+    if (resumeSession !== null && hasUnrelatedTurn(frame)) { stop("protocol-error"); return; }
     if (frame.type === "control_response" || frame.type === "control_request") {
       if (!isRoot(frame) || (frame.session_id !== undefined && frame.session_id !== sessionId)) {
         stop("protocol-error"); return;
@@ -146,8 +166,7 @@ export function startClaudeWindowsProbe(options: ClaudeWindowsProbeOptions, tran
       else stop("protocol-error");
     } else if (frame.type === "stream_event") {
       if (frame.parent_tool_use_id !== null || !isRoot(frame)) return;
-      if (!initialized || frame.origin !== undefined || frame.resume_reason !== undefined
-        || ((frame.user_message_uuid !== undefined || frame.user_message_uuids !== undefined) && !correlate(frame))) {
+      if (!initialized || hasUnrelatedTurn(frame)) {
         stop("protocol-error"); return;
       }
       if (correlate(frame)) rootStreamBound = true;
@@ -157,7 +176,7 @@ export function startClaudeWindowsProbe(options: ClaudeWindowsProbeOptions, tran
       }
     } else if (frame.type === "assistant") {
       if (!isRoot(frame)) { evidence.helperActivity = "observed"; return; }
-      if (!initialized || (frame.user_message_uuid !== undefined && !correlate(frame))) {
+      if (!initialized || hasUnrelatedTurn(frame)) {
         stop("protocol-error"); return;
       }
       if (frame.error !== undefined) { stop("held"); return; }
@@ -178,7 +197,7 @@ export function startClaudeWindowsProbe(options: ClaudeWindowsProbeOptions, tran
         && frame.local_command === undefined && frame.deferred_tool_use === undefined
         && (frame.terminal_reason === undefined || frame.terminal_reason === "completed")
         && frame.num_turns === 1 && evidence.observedModel !== null) {
-        evidence.resultMatches = typeof frame.result === "string" && frame.result.trim() === FIXTURE_RESULT;
+        evidence.resultMatches = typeof frame.result === "string" && frame.result.trim() === expectedResult;
         terminal = evidence.resultMatches ? "root-result" : "failed";
       } else if (mode === "interrupt" && frame.subtype === "error_during_execution" && frame.is_error
         && (frame.stop_reason === null || frame.stop_reason === undefined) && receiptSeen && lifecycle === "cancelled") {
@@ -199,9 +218,9 @@ export function startClaudeWindowsProbe(options: ClaudeWindowsProbeOptions, tran
 
   const parser = new JsonLines(receive, () => stop("protocol-error"));
   const argv = [executable, "--print", "--input-format", "stream-json", "--output-format", "stream-json", "--verbose",
-    "--session-id", sessionId, "--model=" + MODEL, "--effort=" + EFFORT];
+    resumeSession === null ? "--session-id" : "--resume", sessionId, "--model=" + MODEL, "--effort=" + EFFORT];
   if (mode === "interrupt") argv.push("--include-partial-messages");
-  child = transport.start(argv, { cwd: workspace, env }, {
+  child = transport.start(argv, { cwd: workspace, env: Object.assign({}, env) }, {
     spawned() { spawned = true; },
     stdout(chunk) {
       if (transportClosed) return;
@@ -225,13 +244,21 @@ export function startClaudeWindowsProbe(options: ClaudeWindowsProbeOptions, tran
       else evidence.outcome = terminal === "failed" ? "failed" : "disconnected";
       evidence.interrupt = evidence.outcome === "root-interrupted" ? "acknowledged" : interruptId ? "unconfirmed" : "not-requested";
       if (evidence.outcome !== "root-result") evidence.resultMatches = null;
+      resumeAvailable = resumeSession === null && evidence.outcome === "root-result";
       finish(evidence);
     },
   });
   if (ending) child.endInput();
   else if (!child.write(JSON.stringify({
     type: "user", uuid: inputId, session_id: sessionId, parent_tool_use_id: null, client_composed: true,
-    message: { role: "user", content: FIXTURE_PROMPTS[mode] },
+    message: { role: "user", content: resumeSession === null ? FIXTURE_PROMPTS[mode] : RESUME_PROMPT },
   }) + "\n")) stop("disconnected");
-  return { closed };
+  return {
+    closed,
+    resumeFixture() {
+      if (!resumeAvailable) return null;
+      resumeAvailable = false;
+      return startFixtureTurn(options, transport, sessionId);
+    },
+  };
 }
