@@ -7,17 +7,18 @@ import { loadLedger } from "../src/ledger.ts";
 import { claimWorkspace, prepareWorkspace, processAlive, releaseWorkspace } from "../src/workspace.ts";
 
 const root = realpathSync(fileURLToPath(new URL("../../", import.meta.url)));
-const [action, requested] = process.argv.slice(2);
+const [action, requested, controller] = process.argv.slice(2);
 
 function run(): string {
-  if (process.platform !== "win32" || process.argv.length !== 4 || !requested) throw new Error("Unavailable.");
+  const owner = Number(controller);
+  if (process.platform !== "win32" || process.argv.length !== 5 || !requested
+    || !Number.isSafeInteger(owner) || owner <= 0 || process.ppid !== owner) throw new Error("Unavailable.");
   const fixture = realpathSync(requested);
   if (dirname(fixture) !== root || !basename(fixture).startsWith("ttm-job-drain-") || realpathSync(process.cwd()) !== fixture) {
     throw new Error("Outside fixture.");
   }
   const state = join(fixture, "state");
   const workspace = join(fixture, "workspace");
-  const owner = process.ppid;
   const writer = () => {
     const loaded = loadLedger(state);
     if (!loaded.ok || loaded.ledger.workspace?.path !== workspace || loaded.ledger.workspace.qualified) throw new Error("Wrong workspace.");

@@ -153,14 +153,17 @@ def verify_member(process, pid, job, stage):
 
 
 def workspace_probe(node, fixture, action):
-    result = subprocess.run(
-        [str(node), "--disable-warning=ExperimentalWarning",
-         str(SCRIPT.with_name("windows-job-claim.fixture.ts")), action, str(fixture)],
-        cwd=fixture, env={"SystemRoot": os.environ["SystemRoot"],
-                          "TEMP": str(fixture / "tmp"), "TMP": str(fixture / "tmp")},
-        stdin=subprocess.DEVNULL, capture_output=True, text=True, check=False,
-        creationflags=subprocess.CREATE_NO_WINDOW,
-    )
+    try:
+        result = subprocess.run(
+            [str(node), "--disable-warning=ExperimentalWarning",
+             str(SCRIPT.with_name("windows-job-claim.fixture.ts")), action, str(fixture), str(os.getpid())],
+            cwd=fixture, env={"SystemRoot": os.environ["SystemRoot"],
+                              "TEMP": str(fixture / "tmp"), "TMP": str(fixture / "tmp")},
+            stdin=subprocess.DEVNULL, capture_output=True, text=True, check=False,
+            creationflags=subprocess.CREATE_NO_WINDOW, timeout=45,
+        )
+    except subprocess.TimeoutExpired:
+        raise Held("workspace probe did not answer: " + action) from None
     require(result.returncode == 0, "workspace probe failed: " + action)
     try:
         payload = json.loads(result.stdout)
@@ -174,11 +177,10 @@ def release_if_drained(active_members, release):
     try:
         active = active_members()
     except Held:
-        return False
-    if active != 0:
-        return False
-    require(release() == "released", "workspace release was not recorded")
-    return True
+        return None
+    if active == 0:
+        require(release() == "released", "workspace release was not recorded")
+    return active
 
 
 def unavailable_members():
@@ -253,6 +255,9 @@ def run_fixture(fixture, node):
     ledger = fixture / "state" / "ledger.json"
     require(workspace_probe(node, fixture, "prepare") == "owner-recorded", "controller was not recorded")
     owner_receipt = ledger.read_bytes()
+    require(json.loads(owner_receipt).get("workspace") == {
+        "path": str(workspace.resolve(strict=True)), "writerPid": os.getpid(), "qualified": False,
+    }, "ledger did not record the fixture controller")
     job = check_os(create_job(None, None), "create unnamed job")
     handles = []
     try:
@@ -286,12 +291,23 @@ def run_fixture(fixture, node):
         require(only_writer_active == 1 and wait(writer, 0) == WAIT_TIMEOUT, "writer did not survive alone in the job")
         require(not sentinel.exists(), "sentinel appeared before writer release")
 
-        release = lambda: workspace_probe(node, fixture, "release")
+        def live_writer():
+            active = members(job)
+            require(active == 1 and member_ids(job) == {writer_pid} and wait(writer, 0) == WAIT_TIMEOUT,
+                    "same job did not report the live writer")
+            return active
+
+        def release():
+            return workspace_probe(node, fixture, "release")
+
         claims = []
-        for observe in (lambda: members(job), unavailable_members):
-            require(not release_if_drained(observe, release), "workspace released before verified drain")
+        release_observations = []
+        for observe, expected in ((live_writer, 1), (unavailable_members, None)):
+            release_observations.append(release_if_drained(observe, release))
+            require(release_observations[-1] == expected, "wrong pre-drain observation")
             claims.append(workspace_probe(node, fixture, "claim"))
             require(claims[-1] == "held", "another claimant acquired the occupied workspace")
+            require(live_writer() == 1, "the observed writer did not remain active")
             require(ledger.read_bytes() == owner_receipt and not list(workspace.iterdir()),
                     "held claim changed the workspace or ledger")
 
@@ -304,7 +320,7 @@ def run_fixture(fixture, node):
         require(list(workspace.iterdir()) == [sentinel] and sentinel.read_bytes() == SENTINEL,
                 "fixture did not contain exactly the expected late write")
         require(ledger.read_bytes() == owner_receipt, "ownership changed while the writer finished")
-        require(release_if_drained(lambda: members(job), release), "verified drain still held the workspace")
+        require(release_if_drained(lambda: members(job), release) == 0, "verified drain still held the workspace")
         claims.append(workspace_probe(node, fixture, "claim"))
         require(claims == ["held", "held", "claimed"], "workspace did not transfer exactly once")
         require(list(workspace.iterdir()) == [sentinel] and sentinel.read_bytes() == SENTINEL,
@@ -313,6 +329,7 @@ def run_fixture(fixture, node):
                 "rootMember": True, "writerMemberAfterRootExit": True,
                 "activeCounts": [both_active, only_writer_active, drained], "rootExit": parent_exit,
                 "writerExit": writer_exit, "lateSentinelWrites": 1,
+                "releaseObservationsBeforeDrain": release_observations,
                 "claimOutcomes": claims, "heldLedgerAndWorkspacePreserved": True}
     finally:
         (control / "abort").touch()
@@ -343,4 +360,7 @@ if __name__ == "__main__":
         main()
     except Held as error:
         print(json.dumps({"status": "held", "stage": error.stage, "winerror": error.winerror}))
+        raise SystemExit(1)
+    except (OSError, ValueError):
+        print(json.dumps({"status": "held", "stage": "fixture input or I/O was unavailable"}))
         raise SystemExit(1)
