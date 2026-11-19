@@ -11,7 +11,7 @@ type Event = { scope: Scope } & (
   { kind: "hi" | "signal"; seq: number }
   | { kind: "idle" | "wake" }
   | { kind: "changes-applied"; requestId: RequestId; next: number; more: boolean }
-  | { kind: "changes-too-old"; requestId: RequestId }
+  | { kind: "changes-too-old" | "snapshot-read-failed"; requestId: RequestId }
   | { kind: "snapshot-applied"; requestId: RequestId; next: number }
   | { kind: "closed"; code: 4403 | 4404 }
 );
@@ -65,6 +65,7 @@ function terminalIgnoresEvents(state: Replay, requestId: RequestId, laterClose: 
     { kind: "wake", scope: currentScope() },
     { kind: "changes-applied", scope: currentScope(), requestId, next: 99, more: false },
     { kind: "changes-too-old", scope: currentScope(), requestId },
+    { kind: "snapshot-read-failed", scope: currentScope(), requestId },
     { kind: "snapshot-applied", scope: currentScope(), requestId, next: 99 },
     { kind: "closed", scope: currentScope(), code: laterClose },
   ];
@@ -186,6 +187,55 @@ test("a matching 410 snapshot can reset a cursor above the restored board's late
   assert.equal(done.state.cursor, 24);
   assert.deepEqual(done.actions, []);
   assert.equal(initial.cursor, 100);
+});
+
+test("a failed 410 snapshot waits for an explicit wake and retires its old request", () => {
+  const initial = createBoardFeedReplay(currentScope(), 10);
+  const started = stepBoardFeedReplay(initial, { kind: "hi", scope: currentScope(), seq: 12 });
+  const read = readChanges(started, 10);
+  const gap = stepBoardFeedReplay(started.state, { kind: "changes-too-old", scope: currentScope(), requestId: read.requestId });
+  const snapshot = readSnapshot(gap);
+  const failure = { kind: "snapshot-read-failed", scope: currentScope(), requestId: snapshot.requestId } as const;
+  const failed = stepBoardFeedReplay(gap.state, failure);
+  assert.ok(failed, "a caller-reported failure must retire the matching snapshot");
+  assert.equal(failed.state.cursor, 10);
+  assert.deepEqual(failed.actions, []);
+
+  unchanged(started.state, { ...failure, requestId: read.requestId });
+  unchanged(gap.state, { ...failure, requestId: read.requestId });
+  for (const scope of [otherBoard, retiredSession]) unchanged(gap.state, { ...failure, scope });
+  const lateSnapshot = { kind: "snapshot-applied", scope: currentScope(), requestId: snapshot.requestId, next: 14 } as const;
+  unchanged(failed.state, lateSnapshot);
+  unchanged(failed.state, failure);
+  unchanged(failed.state, { kind: "idle", scope: currentScope() });
+  unchanged(failed.state, { kind: "changes-applied", scope: currentScope(), requestId: read.requestId, next: 18, more: false });
+  for (const scope of [otherBoard, retiredSession]) unchanged(failed.state, { kind: "wake", scope });
+  const hinted = stepBoardFeedReplay(failed.state, { kind: "signal", scope: currentScope(), seq: 19 });
+  assert.equal(hinted.state.cursor, 10);
+  assert.deepEqual(hinted.actions, []);
+
+  const waking = stepBoardFeedReplay(hinted.state, { kind: "wake", scope: currentScope() });
+  const retry = readSnapshot(waking);
+  assert.notEqual(retry.requestId, snapshot.requestId);
+  assert.equal(waking.state.cursor, 10);
+  unchanged(waking.state, { kind: "wake", scope: currentScope() });
+  unchanged(waking.state, failure);
+  unchanged(waking.state, lateSnapshot);
+
+  const restored = stepBoardFeedReplay(waking.state, { ...lateSnapshot, requestId: retry.requestId });
+  assert.equal(restored.state.cursor, 14);
+  const catchUp = readChanges(restored, 14);
+  const caught = stepBoardFeedReplay(restored.state, {
+    kind: "changes-applied", scope: currentScope(), requestId: catchUp.requestId, next: 18, more: false,
+  });
+  readChanges(caught, 18);
+  for (const [code, reason, other] of [[4403, "connection-ended", 4404], [4404, "board-deleted", 4403]] as const) {
+    const closed = stepBoardFeedReplay(hinted.state, { kind: "closed", scope: currentScope(), code });
+    assert.equal(closed.state.terminal, reason);
+    assert.equal(closed.state.cursor, 10);
+    assert.deepEqual(closed.actions, []);
+    terminalIgnoresEvents(closed.state, snapshot.requestId, other);
+  }
 });
 
 test("another board or retired session cannot affect current scope or consume a current request", () => {
@@ -380,6 +430,7 @@ test("the offline hint decoder projects only approved hints with the caller's sc
     for (const frame of [
       null, "fabricated text frame", ["signal", 12], { kind: "signal", seq: 12 },
       { t: "closed", code: 4403, seq: 12 }, { t: "changes-applied", requestId: 1, next: 12, seq: 12 },
+      { t: "snapshot-read-failed", requestId: 1, seq: 12 },
     ]) ignored(frame);
   });
 
@@ -397,6 +448,7 @@ test("the offline hint decoder projects only approved hints with the caller's sc
         { frame: { kind: "wake", scope }, state: initial },
         { frame: { kind: "changes-applied", scope, requestId: read.requestId, next: 99, more: false }, state: pending.state },
         { frame: { kind: "changes-too-old", scope, requestId: read.requestId }, state: pending.state },
+        { frame: { kind: "snapshot-read-failed", scope, requestId: snapshot.requestId }, state: gap.state },
         { frame: { kind: "snapshot-applied", scope, requestId: snapshot.requestId, next: 99 }, state: gap.state },
         { frame: { kind: "closed", scope, code: 4403 }, state: pending.state },
         { frame: { kind: "closed", scope, code: 4404 }, state: gap.state },
