@@ -26,7 +26,7 @@ export function toolEnv(parent: NodeJS.ProcessEnv, secrets: readonly string[]): 
   for (const [name, value] of Object.entries(parent)) {
     if (value === undefined) continue;
     if (BLOCKED_NAMES.test(name)) continue;
-    if (hidden.some((secret) => value.includes(secret))) continue;
+    if (hidden.some((secret) => name.includes(secret) || value.includes(secret))) continue;
     env[name] = value;
   }
   return env;
