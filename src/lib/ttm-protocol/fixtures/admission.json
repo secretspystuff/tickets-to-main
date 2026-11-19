@@ -13,16 +13,20 @@
         "idempotency_key": "fab-admit-1",
         "body": {
           "repo": {
-            "host": "example.com",
-            "owner": "fabricated-owner",
-            "name": "fabricated-repo",
-            "board_repo_id": "fabricated-board-repo"
+            "identity_id": "fab0Ab1Ab1Ab1Ab1Ab1Ab1Ab1Ab1Ab12",
+            "board_repo_id": "fabricated-board-repo",
+            "locator": {
+              "host": "example.com",
+              "owner": "fabricated-owner",
+              "name": "fabricated-repo"
+            }
           },
           "members": [
             "fab00000000000000000000000000016",
             "fab00000000000000000000000000017"
           ],
-          "expected_revision": null
+          "expected_revision": null,
+          "activation_id": "fab00000000000000000000000000081"
         }
       }
     },
@@ -71,16 +75,20 @@
           "idempotency_key": "fab-admit-1",
           "body": {
             "repo": {
-              "host": "example.com",
-              "owner": "fabricated-owner",
-              "name": "fabricated-repo",
-              "board_repo_id": "fabricated-board-repo"
+              "identity_id": "fab0Ab1Ab1Ab1Ab1Ab1Ab1Ab1Ab1Ab12",
+              "board_repo_id": "fabricated-board-repo",
+              "locator": {
+                "host": "example.com",
+                "owner": "fabricated-owner",
+                "name": "fabricated-repo"
+              }
             },
             "members": [
               "fab00000000000000000000000000016",
               "fab00000000000000000000000000017"
             ],
-            "expected_revision": null
+            "expected_revision": null,
+            "activation_id": "fab00000000000000000000000000081"
           }
         }
       },
@@ -100,11 +108,15 @@
             ],
             "expected_revision": null,
             "repo": {
-              "host": "example.com",
-              "owner": "fabricated-owner",
-              "name": "fabricated-repo",
-              "board_repo_id": "fabricated-board-repo"
-            }
+              "identity_id": "fab0Ab1Ab1Ab1Ab1Ab1Ab1Ab1Ab1Ab12",
+              "board_repo_id": "fabricated-board-repo",
+              "locator": {
+                "host": "example.com",
+                "owner": "fabricated-owner",
+                "name": "fabricated-repo"
+              }
+            },
+            "activation_id": "fab00000000000000000000000000081"
           },
           "job_id": "fab00000000000000000000000000018"
         },
@@ -112,16 +124,20 @@
           "idempotency_key": "fab-admit-1",
           "body": {
             "repo": {
-              "host": "example.com",
-              "owner": "fabricated-owner",
-              "name": "fabricated-repo",
-              "board_repo_id": "fabricated-board-repo"
+              "identity_id": "fab0Ab1Ab1Ab1Ab1Ab1Ab1Ab1Ab1Ab12",
+              "board_repo_id": "fabricated-board-repo",
+              "locator": {
+                "host": "example.com",
+                "owner": "fabricated-owner",
+                "name": "fabricated-repo"
+              }
             },
             "members": [
               "fab00000000000000000000000000016",
               "fab00000000000000000000000000017"
             ],
-            "expected_revision": null
+            "expected_revision": null,
+            "activation_id": "fab00000000000000000000000000081"
           }
         }
       },
@@ -137,16 +153,20 @@
           "idempotency_key": "fab-admit-1",
           "body": {
             "repo": {
-              "host": "example.com",
-              "owner": "fabricated-owner",
-              "name": "fabricated-repo",
-              "board_repo_id": "fabricated-board-repo"
+              "identity_id": "fab0Ab1Ab1Ab1Ab1Ab1Ab1Ab1Ab1Ab12",
+              "board_repo_id": "fabricated-board-repo",
+              "locator": {
+                "host": "example.com",
+                "owner": "fabricated-owner",
+                "name": "fabricated-repo"
+              }
             },
             "members": [
               "fab00000000000000000000000000016",
               "fab00000000000000000000000000017"
             ],
-            "expected_revision": null
+            "expected_revision": null,
+            "activation_id": "fab00000000000000000000000000081"
           },
           "job_id": "fab00000000000000000000000000018"
         },
@@ -154,15 +174,19 @@
           "idempotency_key": "fab-admit-1",
           "body": {
             "repo": {
-              "host": "example.com",
-              "owner": "fabricated-owner",
-              "name": "fabricated-repo",
-              "board_repo_id": "fabricated-board-repo"
+              "identity_id": "fab0Ab1Ab1Ab1Ab1Ab1Ab1Ab1Ab1Ab12",
+              "board_repo_id": "fabricated-board-repo",
+              "locator": {
+                "host": "example.com",
+                "owner": "fabricated-owner",
+                "name": "fabricated-repo"
+              }
             },
             "members": [
               "fab00000000000000000000000000016"
             ],
-            "expected_revision": null
+            "expected_revision": null,
+            "activation_id": "fab00000000000000000000000000081"
           }
         }
       },

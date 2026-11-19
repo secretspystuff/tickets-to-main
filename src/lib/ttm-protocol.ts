@@ -2,7 +2,8 @@
 
 export const PROTOCOL = "tickets-to-main.coordination";
 export const PROTOCOL_VERSION = 1;
-export const RUNTIME = "not-served" as "not-served" | "served";
+export const REPO_IDENTITY_FEATURE = "explicit_repo_identity_v1";
+export const RUNTIME = "served" as "not-served" | "served";
 
 export const CODE_UNAVAILABLE_EXPLANATION = "The code could not be inspected. This approval does not review it.";
 
@@ -48,11 +49,11 @@ export const COMMAND_GROUPS = [
 ] as const;
 export type CommandGroup = (typeof COMMAND_GROUPS)[number];
 
-/** Every command is specified. None is served until a later milestone flips `served` and `RUNTIME` together. */
+/** Serving a read does not grant execution authority or claim a native runtime is ready. */
 export const COMMAND_CATALOG = {
-  "protocol.hello": { effect: "read", group: "public-contract", served: false },
+  "protocol.hello": { effect: "read", group: "public-contract", served: true },
   "connection.status": { effect: "read", group: "connection-settings", served: false },
-  "repo.activation.read": { effect: "read", group: "connection-settings", served: false },
+  "repo.activation.read": { effect: "read", group: "connection-settings", served: true },
   "settings.effective.read": { effect: "read", group: "connection-settings", served: false },
   "job.admit": { effect: "write", group: "admission-reservations", served: false },
   "reservation.decide": { effect: "write", group: "admission-reservations", served: false },
@@ -209,6 +210,13 @@ export type ProtocolFailure = {
 
 export type WireRole = "request" | "response" | "refusal";
 
+export type RepoLocator = { host: string; owner: string; name: string };
+export type ExplicitRepoReference = { identity_id: string; board_repo_id: string; locator: RepoLocator | null };
+export type LegacyRepoReference = RepoLocator & { board_repo_id: string };
+export type RepoReference = ExplicitRepoReference | LegacyRepoReference;
+type RepoHolder = { identity_id: string; board_id: string; board_repo_id: string; activation_id: string };
+type Negotiated = { ok: true; accepted_version: 1; accepted_features?: string[] };
+
 export type WireRefusal = {
   protocol: typeof PROTOCOL;
   version: typeof PROTOCOL_VERSION;
@@ -228,6 +236,9 @@ const HOST = /^(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,24}$/;
 const KEY = /^[A-Za-z0-9_-]{8,80}$/;
 const SECRET = /bearer\s|^sk-|ghp_|xox[baprs]-/i;
 const CONTROLS = /[\u0000-\u001f\u007f]/;
+const LOCATOR_PART_MAX = 300;
+const LOCATOR_CONTROLS = /[\u0000-\u001f\u007f-\u009f]/;
+const LOCATOR_SECRET = /(?:gh[pousr]_[A-Za-z0-9]{36,}|github_pat_[A-Za-z0-9_]{22,}|(?:tp|tpj|tps)_[A-Za-z0-9_-]{20,}|(?:sk-ant-|sk-proj-|sk-|xai-)[A-Za-z0-9_-]{20,}|AIza[A-Za-z0-9_-]{35}|AKIA[A-Z0-9]{16}|xox[abprs]-[A-Za-z0-9-]{10,})/i;
 const COUNT_METRICS = new Set<MetricName>(["ttm.runs", "ttm.results", "ttm.fallbacks"]);
 const USAGE_METRICS = new Set<MetricName>(["ttm.tokens", "ttm.cost"]);
 const FORBIDDEN_KEYS = new Set([
@@ -267,7 +278,7 @@ export function runtimeClaimConsistent(): boolean {
   return served.length > 0;
 }
 
-/** The three connection and settings reads are not served. */
+/** The connection/settings group needs native observations and persisted settings before it is fully served. */
 export function connectionSettingsServed(): false {
   return false;
 }
@@ -287,7 +298,7 @@ export function catalog() {
     protocol: PROTOCOL,
     version: PROTOCOL_VERSION,
     runtime: RUNTIME,
-    no_runtime_readiness_claim: RUNTIME === "not-served",
+    no_runtime_readiness_claim: !COMMAND_CATALOG["connection.status"].served,
     served: COMMANDS.filter((command) => COMMAND_CATALOG[command].served),
     sharing: "Public contract and authorized fabricated fixtures. No private source, credentials or customer evidence.",
     connection: "Starts after the existing human-approved program connection. This protocol does not define a new sign-in.",
@@ -399,15 +410,43 @@ export function areaRequired(step: unknown): boolean | ProtocolFailure {
   return step === "build" || step === "tests" || step === "main";
 }
 
-export function negotiate(input: { client_version: unknown }): { ok: true; accepted_version: 1 } | ProtocolFailure {
-  if (!plain(input) || !exactKeys(input, ["client_version"])) return fail("client_version");
+function helloRequest(input: unknown): input is { client_version: number; required_features?: string[] } {
+  if (!plain(input)) return false;
+  if (!exactKeys(input, Object.hasOwn(input, "required_features") ? ["client_version", "required_features"] : ["client_version"])) return false;
+  if (typeof input.client_version !== "number" || !Number.isFinite(input.client_version)) return false;
+  if (!Object.hasOwn(input, "required_features")) return true;
+  const features = input.required_features;
+  return Array.isArray(features) && features.length > 0 && features.length <= 32
+    && features.every(feature => typeof feature === "string" && /^[a-z][a-z0-9_-]{0,79}$/.test(feature))
+    && new Set(features).size === features.length;
+}
+
+export function negotiate(input: { client_version: unknown; required_features?: unknown }): Negotiated | ProtocolFailure {
+  if (!helloRequest(input)) return fail("client_version");
   if (input.client_version !== PROTOCOL_VERSION) return fail("client_version", "unsupported_protocol");
+  if (input.required_features !== undefined) {
+    if (input.required_features.some(feature => feature !== REPO_IDENTITY_FEATURE)) return fail("client_version", "unsupported_protocol");
+    return { ok: true, accepted_version: PROTOCOL_VERSION, accepted_features: [...input.required_features] };
+  }
   return { ok: true, accepted_version: PROTOCOL_VERSION };
+}
+
+export function confirmNegotiation(input: unknown): Negotiated | ProtocolFailure {
+  const unsupported = () => fail("client_version", "unsupported_protocol");
+  if (!plain(input) || !exactKeys(input, ["request", "response"]) || !plain(input.request) || !plain(input.response)) return unsupported();
+  const request = input.request;
+  const response = input.response;
+  if (!validateWire(request, "request").ok || !validateWire(response, "response").ok
+    || request.command !== "protocol.hello" || response.command !== "protocol.hello" || response.id !== request.id
+    || !plain(request.body) || !plain(response.body)) return unsupported();
+  const agreed = negotiate(request.body as { client_version: unknown; required_features?: unknown });
+  if (!agreed.ok || !sameBody(agreed.accepted_features ?? null, response.body.accepted_features ?? null)) return unsupported();
+  return agreed;
 }
 
 export function heldActivation(input: { id: string }): WireRefusal | ProtocolFailure {
   if (!plain(input) || !exactKeys(input, ["id"]) || !isOpaqueId(input.id)) return fail("id");
-  // A string on a property named code would join the live refusal list (218). This code is specified and not served.
+  // Literal code properties would join the live refusal list while this command remains unserved.
   const code = "repo_held" satisfies RefusalCode;
   return wireRefusal({
     command: "repo.activation.read",
@@ -638,15 +677,59 @@ export function privacyFindings(value: unknown, mode: "shared" | "metrics" | "he
   return found;
 }
 
-function walk(value: unknown, mode: "shared" | "metrics" | "held", found: string[], path: string): void {
+function locatorForms(value: string): string[] {
+  const forms = [value];
+  if (value.length > LOCATOR_PART_MAX) return forms;
+  // Each decoded pass shortens the bounded input, so nested escapes cannot hide a credential.
+  for (let pass = 0; pass < value.length; pass += 1) {
+    const last = forms[forms.length - 1]!;
+    let decoded: string;
+    try { decoded = decodeURIComponent(last); }
+    catch {
+      decoded = last.replace(/%(?:[cd][0-9a-f]%[89ab][0-9a-f]|e[0-9a-f](?:%[89ab][0-9a-f]){2}|f[0-7](?:%[89ab][0-9a-f]){3}|[0-9a-f]{2})/gi, run => {
+        try { return decodeURIComponent(run); }
+        catch { return run.replace(/%([a-f0-9]{2})/gi, (_match, hex: string) => String.fromCharCode(parseInt(hex, 16))); }
+      });
+    }
+    if (decoded === last) break;
+    forms.push(decoded);
+  }
+  return forms;
+}
+
+function privateLocator(value: string, allowBareAt: boolean): boolean {
+  return locatorForms(value).some(form => LOCATOR_SECRET.test(form) || SECRET.test(form)
+    || /eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+/.test(form)
+    || /\bBEGIN[^\r\n]*PRIVATE KEY\b/i.test(form)
+    || /(?:token|password|credential|secret|api[_-]?key|access[_-]?token|refresh[_-]?token|authorization)\s*[:=]/i.test(form)
+    || /[?&](?:token|access_token|key|password|secret)=/i.test(form)
+    || /[^\s/@:]+@[^\s/@:]+\.[^\s/@:]+/u.test(form)
+    || /(?:^|[\/\s])[^\/@\s:]+:[^\/@\s]+@/.test(form)
+    || /\b[a-z][a-z0-9+.-]*:\/\/[^\/\s]*@/i.test(form)
+    || /[^\/@\s]+@[^\/@\s:]+:[^\s]+/.test(form)
+    || (!allowBareAt && form.includes("@")));
+}
+
+function explicitRepoShape(value: unknown): value is Record<string, unknown> & ExplicitRepoReference {
+  return plain(value) && exactKeys(value, ["identity_id", "board_repo_id", "locator"])
+    && isOpaqueId(value.identity_id) && slug(value.board_repo_id);
+}
+
+function locatorShape(value: unknown): value is RepoLocator {
+  return plain(value) && exactKeys(value, ["host", "owner", "name"])
+    && typeof value.host === "string" && typeof value.owner === "string" && typeof value.name === "string"
+    && [value.host, value.owner, value.name].every(part => part.length > 0 && part.length <= LOCATOR_PART_MAX);
+}
+
+function walk(value: unknown, mode: "shared" | "metrics" | "held", found: string[], path: string, locatorScope = false, allowBareAt = false, depth = 0): void {
   if (typeof value === "string") {
-    if (value.includes("@") || SECRET.test(value)) found.push(path || "value");
+    if (locatorScope ? privateLocator(value, allowBareAt) : value.includes("@") || SECRET.test(value)) found.push(path || "value");
     if (mode === "metrics" && OPAQUE_ID.test(value)) found.push(path || "value");
     if (mode === "held" && path !== "id" && path !== "idempotency_key" && (OPAQUE_ID.test(value) || value.startsWith("fabricated-") || value.includes("example.com"))) found.push(path || "value");
     return;
   }
   if (Array.isArray(value)) {
-    value.forEach((item, index) => walk(item, mode, found, `${path}[${index}]`));
+    value.forEach((item, index) => walk(item, mode, found, `${path}[${index}]`, locatorScope, false, depth + 1));
     return;
   }
   if (!plain(value)) return;
@@ -655,7 +738,19 @@ function walk(value: unknown, mode: "shared" | "metrics" | "held", found: string
     if (key === "__proto__" || key === "constructor" || key === "prototype" || FORBIDDEN_KEYS.has(key)) found.push(next);
     if (mode === "metrics" && (key.endsWith("_id") || key === "attempt" || key === "members")) found.push(next);
     if (mode === "held" && key !== "id" && key !== "idempotency_key" && (key.endsWith("_id") || key === "repo" || key === "body")) found.push(next);
-    walk(value[key], mode, found, next);
+    const item = value[key];
+    if (key === "locator" && (depth === 0 || depth === 1 && path === "repo") && explicitRepoShape(value)) {
+      if (item === null) continue;
+      if (!locatorShape(item)) {
+        found.push(next);
+        continue;
+      }
+      for (const part of ["host", "owner", "name"] as const) {
+        walk(item[part], mode, found, next + "." + part, true, part !== "host", depth + 2);
+      }
+      continue;
+    }
+    walk(item, mode, found, next, locatorScope, false, depth + 1);
   }
 }
 
@@ -666,6 +761,7 @@ export function validateWire(document: unknown, role: WireRole): { ok: true } | 
   if ("ok" in envelope && envelope.ok === false) return envelope;
   const body = document.body;
   if (!plain(body)) return fail("body");
+  if (explicitRepoShape(body.repo) && body.repo.locator !== null && !locatorShape(body.repo.locator)) return fail("repo");
   const privacy = privacyFindings(body, "shared");
   if (privacy.length) return fail(privacy[0] ?? "body", "forbidden_identifier");
   const command = document.command as CommandName;
@@ -721,8 +817,7 @@ function validateRefusal(document: Record<string, unknown>): { ok: true } | Prot
 
 function validateRequest(command: CommandName, body: Record<string, unknown>): { ok: true } | ProtocolFailure {
   if (command === "protocol.hello") {
-    if (!exactKeys(body, ["client_version"]) || typeof body.client_version !== "number" || !Number.isFinite(body.client_version)) return fail("client_version");
-    return { ok: true };
+    return helloRequest(body) ? { ok: true } : fail("client_version");
   }
   if (command === "connection.status") return exactKeys(body, []) ? { ok: true } : fail("body");
   if (command === "repo.activation.read" || command === "settings.effective.read") {
@@ -744,7 +839,10 @@ function validateRequest(command: CommandName, body: Record<string, unknown>): {
 
 function validateResponse(command: CommandName, body: Record<string, unknown>): { ok: true } | ProtocolFailure {
   if (command === "protocol.hello") {
-    return exactKeys(body, ["accepted_version", "runtime"]) && body.accepted_version === PROTOCOL_VERSION && body.runtime === RUNTIME
+    const hasFeatures = Object.hasOwn(body, "accepted_features");
+    return exactKeys(body, hasFeatures ? ["accepted_version", "runtime", "accepted_features"] : ["accepted_version", "runtime"])
+      && (!hasFeatures || Array.isArray(body.accepted_features) && body.accepted_features.length === 1 && body.accepted_features[0] === REPO_IDENTITY_FEATURE)
+      && body.accepted_version === PROTOCOL_VERSION && (body.runtime === "not-served" || body.runtime === "served")
       ? { ok: true }
       : fail("runtime");
   }
@@ -762,6 +860,12 @@ function validateResponse(command: CommandName, body: Record<string, unknown>): 
 }
 
 function readRepo(value: unknown): { ok: true } | ProtocolFailure {
+  if (explicitRepoShape(value)) {
+    if (value.locator === null) return { ok: true };
+    if (!locatorShape(value.locator) || !Object.values(value.locator).every(part => locatorForms(part).every(form => !LOCATOR_CONTROLS.test(form)))) return fail("repo");
+    if (locatorForms(value.locator.host).some(form => /[@/?#\\\s]/.test(form))) return fail("repo");
+    return { ok: true };
+  }
   if (!plain(value) || !exactKeys(value, ["host", "owner", "name", "board_repo_id"])) return fail("repo");
   if (typeof value.host !== "string" || !HOST.test(value.host)) return fail("host");
   if (!slug(value.owner) || !slug(value.name) || !slug(value.board_repo_id)) return fail("board_repo_id");
@@ -780,7 +884,10 @@ function validateConnection(body: Record<string, unknown>): { ok: true } | Proto
 }
 
 function validateActivation(body: Record<string, unknown>): { ok: true } | ProtocolFailure {
-  if (!exactKeys(body, ["repo", "active", "board_id"]) || !readRepo(body.repo).ok || typeof body.active !== "boolean") return fail("repo");
+  const explicit = explicitRepoShape(body.repo);
+  if (!exactKeys(body, explicit ? ["repo", "active", "board_id", "activation_id"] : ["repo", "active", "board_id"])
+    || !readRepo(body.repo).ok || typeof body.active !== "boolean") return fail("repo");
+  if (explicit && (body.active ? !isOpaqueId(body.activation_id) : body.activation_id !== null)) return fail("repo");
   if (body.active) return isBoardId(body.board_id) ? { ok: true } : fail("board_id");
   return body.board_id === null ? { ok: true } : fail("board_id");
 }
@@ -847,7 +954,9 @@ function hexList(value: unknown): boolean {
 }
 
 function validateAdmitRequest(body: Record<string, unknown>): { ok: true } | ProtocolFailure {
-  if (!exactKeys(body, ["repo", "members", "expected_revision"])) return fail("body");
+  const explicit = explicitRepoShape(body.repo);
+  if (!exactKeys(body, explicit ? ["repo", "members", "expected_revision", "activation_id"] : ["repo", "members", "expected_revision"])) return fail("repo");
+  if (explicit && !isOpaqueId(body.activation_id)) return fail("repo");
   if (!readRepo(body.repo).ok || !hexList(body.members) || body.expected_revision !== null) return fail("members");
   return { ok: true };
 }
@@ -1008,6 +1117,14 @@ function readAnswer(command: (typeof READ_COMMANDS)[number], id: string, body: R
   return { protocol: PROTOCOL, version: PROTOCOL_VERSION, command, id, idempotency_key: null as null, body };
 }
 
+function repoHolderMatches(repo: ExplicitRepoReference, boardId: string, value: unknown): { ok: true; holder: RepoHolder } | ProtocolFailure {
+  if (!plain(value) || !exactKeys(value, ["identity_id", "board_id", "board_repo_id", "activation_id"])
+    || !isOpaqueId(value.identity_id) || !isBoardId(value.board_id) || !slug(value.board_repo_id) || !isOpaqueId(value.activation_id)) return fail("repo");
+  if (value.identity_id !== repo.identity_id) return fail("repo", "unauthorized");
+  if (value.board_id !== boardId || value.board_repo_id !== repo.board_repo_id) return fail("repo", "repo_held");
+  return { ok: true, holder: value as RepoHolder };
+}
+
 /** The caller's own connection. Another connection is refused without its id. */
 export function connectionStatus(input: unknown): ReturnType<typeof readAnswer> | ProtocolFailure {
   if (!plain(input) || !exactKeys(input, ["id", "caller", "record"])) return fail("body");
@@ -1044,13 +1161,15 @@ export function activationRead(input: unknown): ReturnType<typeof readAnswer> | 
   if (caller.ok === false) return caller;
   if (!readRepo(input.repo).ok) return fail("repo");
   if (privacyFindings(input.repo, "shared").length) return fail("repo", "forbidden_identifier");
-  const held = input.held_by;
-  if (held !== null && !isBoardId(held)) return fail("repo");
-  if (held !== null && held !== caller.caller.board_id) {
+  if (!explicitRepoShape(input.repo)) return fail("repo", "unsupported_protocol");
+  const held = input.held_by === null ? null : repoHolderMatches(input.repo, caller.caller.board_id, input.held_by);
+  if (held !== null && !held.ok && held.code === "repo_held") {
     const code = "repo_held" satisfies RefusalCode;
     return wireRefusal({ command: "repo.activation.read", id: input.id, idempotency_key: null, code, field: "repo" });
   }
-  const body = { repo: input.repo, active: held !== null, board_id: held === null ? null : caller.caller.board_id };
+  if (held !== null && !held.ok) return held;
+  const body = { repo: input.repo, active: held !== null, board_id: held === null ? null : caller.caller.board_id,
+    activation_id: held === null ? null : held.holder.activation_id };
   const answer = readAnswer("repo.activation.read", input.id, body);
   const checked = validateWire(answer, "response");
   return checked.ok ? answer : checked;
@@ -1151,13 +1270,17 @@ export function admitJob(input: unknown): ReturnType<typeof writeAnswer> | WireR
   if (privacyFindings(input.body, "shared").length) return fail("body", "forbidden_identifier");
   const request = validateAdmitRequest(input.body);
   if (request.ok === false) return request;
+  if (!explicitRepoShape(input.body.repo)) return fail("repo", "unsupported_protocol");
   if (!isOpaqueId(input.new_job_id)) return fail("job_id");
-  const held = input.held_by;
-  if (held !== null && !isBoardId(held)) return fail("repo");
-  if (held === null) return fail("repo", "unauthorized");
-  if (held !== caller.caller.board_id) {
+  if (input.held_by === null) return fail("repo", "unauthorized");
+  const held = repoHolderMatches(input.body.repo, caller.caller.board_id, input.held_by);
+  if (!held.ok && held.code === "repo_held") {
     const code = "repo_held" satisfies RefusalCode;
     return commandRefusal("job.admit", id, idempotencyKey, code, "repo");
+  }
+  if (!held.ok) return held;
+  if (input.body.activation_id !== held.holder.activation_id) {
+    return commandRefusal("job.admit", id, idempotencyKey, "changed_since", "repo");
   }
   if (!Array.isArray(input.open_member_ids) || !input.open_member_ids.every(isOpaqueId)) return fail("members");
   const stored = input.stored === null ? null : input.stored;
@@ -1562,6 +1685,7 @@ export function serveCandidateApproval(input: unknown): ProtocolFailure {
 export function applyRule(name: string, input: unknown): unknown {
   if (!plain(input) && name !== "foldMetricEvents") return fail(null);
   if (name === "negotiate") return negotiate(input as { client_version: unknown });
+  if (name === "confirmNegotiation") return confirmNegotiation(input);
   if (name === "heldActivation") return heldActivation(input as { id: string });
   if (name === "replayAdmission") {
     const value = input as { stored?: unknown; next?: unknown };
@@ -1609,6 +1733,8 @@ export function applyRule(name: string, input: unknown): unknown {
 }
 
 const FABRICATED_SLUG = /^fabricated(?:-[a-z0-9]+)*$/;
+const FABRICATED_NAMESPACE = /^fabricated(?:-[a-z0-9]+)*(?:\/fabricated(?:-[a-z0-9]+)*)*$/;
+const FABRICATED_HOST = /^fabricated(?:-[a-z0-9]+)*(?::[0-9]{1,5})?$/;
 
 /** Authorized fixtures use fabricated ids only. Runtime hosts are not limited to example.com. */
 export function fixtureFindings(value: unknown): string[] {
@@ -1632,10 +1758,11 @@ function walkFixture(value: unknown, found: string[], path: string): void {
     const next = path ? `${path}.${key}` : key;
     if (key === "__proto__" || key === "constructor" || key === "prototype") found.push(next);
     const item = value[key];
-    if ((key === "board_id" || key === "board_repo_id" || key === "owner") && item !== null && !FABRICATED_SLUG.test(String(item)) && !(key === "board_id" && isFabricatedId(item))) found.push(next);
-    if (key === "name" && next.endsWith("repo.name") && item !== null && !FABRICATED_SLUG.test(String(item))) found.push(next);
+    const fabricatedLabel = key === "owner" && next.endsWith("repo.locator.owner") ? FABRICATED_NAMESPACE : FABRICATED_SLUG;
+    if ((key === "board_id" || key === "board_repo_id" || key === "owner") && item !== null && !fabricatedLabel.test(String(item)) && !(key === "board_id" && isFabricatedId(item))) found.push(next);
+    if (key === "name" && (next.endsWith("repo.name") || next.endsWith("repo.locator.name")) && item !== null && !FABRICATED_SLUG.test(String(item))) found.push(next);
     if ((key.endsWith("_id") && key !== "board_id" && key !== "board_repo_id" || key === "attempt" || key === "members") && typeof item === "string" && !isFabricatedId(item)) found.push(next);
-    if (key === "host" && item !== "example.com") found.push(next);
+    if (key === "host" && item !== "example.com" && !(next.endsWith("repo.locator.host") && typeof item === "string" && FABRICATED_HOST.test(item))) found.push(next);
     if (key === "idempotency_key" && item !== null && (typeof item !== "string" || !item.startsWith("fab-"))) found.push(next);
     if (key === "guidance_version" && (typeof item !== "string" || !item.startsWith("fab-guidance-"))) found.push(next);
     if (key === "computer" && item !== "Fabricated computer") found.push(next);

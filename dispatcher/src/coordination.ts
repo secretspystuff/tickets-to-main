@@ -7,7 +7,6 @@ import {
   FIXTURE_FILES,
   PROTOCOL,
   PROTOCOL_VERSION,
-  RUNTIME,
   admissionReservationsServed,
   applyRule,
   catalog,
@@ -117,22 +116,21 @@ function assertFixture(name: string, value: unknown): void {
   }
 }
 
-/**
- * Load the reviewed manifest and every fabricated fixture. This build has no
- * network client, so a served runtime or a served command is refused.
- */
+/** Check the published read subset and the full offline fixture set. */
 export function loadContract(): void {
+  const contract = catalog();
   if (
-    RUNTIME !== "not-served"
+    contract.runtime !== "served"
     || connectionSettingsServed() !== false
     || admissionReservationsServed() !== false
     || !runtimeClaimConsistent()
-    || catalog().served.length !== 0
+    || !contract.no_runtime_readiness_claim
+    || !same(contract.served, ["protocol.hello", "repo.activation.read"])
   ) {
-    throw new Error("This build has no network client. It will not speak to a served runtime.");
+    throw new Error("The coordination manifest lists unexpected capabilities.");
   }
   const manifest = readJson(MANIFEST_URL);
-  if (!same(manifest, catalog())) throw new Error("The coordination manifest does not match.");
+  if (!same(manifest, contract)) throw new Error("The coordination manifest does not match.");
   const names = readdirSync(fileURLToPath(FIXTURE_DIR)).sort();
   const expected = [...FIXTURE_FILES].sort();
   if (names.length !== expected.length || names.some((name, index) => name !== expected[index])) {
@@ -148,18 +146,21 @@ function helloFixture(): { wire?: Array<{ role: WireRole; document: unknown }> }
   return JSON.parse(text) as { wire?: Array<{ role: WireRole; document: unknown }> };
 }
 
-/**
- * Prove the reviewed hello fixture. The runtime is not served, so nothing is sent.
- * A served runtime is refused here until a later milestone has a network client.
- */
+/** Prove the offline hello against the fabricated fixture. */
 export function confirmHello(): HelloProof {
   loadContract();
   const fixture = helloFixture();
   if (fixtureFindings(fixture).length > 0) throw new Error("The coordination hello fixture is not valid.");
+  let offline = false;
   for (const wire of fixture.wire ?? []) {
     const result = validateWire(wire.document, wire.role);
     if (!result.ok) throw new Error("The coordination hello fixture is not valid.");
+    if (wire.role === "response") {
+      const document = wire.document as { command: string; body: { runtime?: unknown } };
+      if (document.command === "protocol.hello" && document.body.runtime === "not-served") offline = true;
+    }
   }
+  if (!offline) throw new Error("The coordination hello fixture is not valid.");
   const accepted = negotiate({ client_version: PROTOCOL_VERSION });
   if (!accepted.ok) throw new Error(accepted.error);
   const refused = negotiate({ client_version: PROTOCOL_VERSION + 1 });
@@ -177,7 +178,7 @@ export function confirmHello(): HelloProof {
   };
 }
 
-/** List every specified command as not served. Fixture bodies are not printed. */
+/** List the commands as unavailable from the offline CLI. */
 export function showCatalog(): { lines: string[] } {
   const hello = confirmHello();
   const commands = COMMANDS.map((command) => `${command}: ${COMMAND_CATALOG[command].effect}, not served.`);
@@ -211,7 +212,7 @@ function unservedAnswer(closed: ProtocolFailure, stuffed: ProtocolFailure): { li
     || shown.includes(STUFFED_JOB)
     || shown.includes("queued")
   ) {
-    throw new Error("This build has no network client. It will not speak to a served runtime.");
+    throw new Error("The offline coordination refusal did not match the contract.");
   }
   return {
     lines: [closed.error, closed.fix, "No network request was sent.", "Nothing was saved."],
@@ -219,7 +220,7 @@ function unservedAnswer(closed: ProtocolFailure, stuffed: ProtocolFailure): { li
 }
 
 /**
- * Refuse a command while the runtime is not served. Reads, admission and
+ * Refuse a command on the offline CLI. Reads, admission and
  * reservations use the protocol's unserved entries and return no body. Nothing
  * is sent and the local record is not changed. The caller's text is not repeated.
  */

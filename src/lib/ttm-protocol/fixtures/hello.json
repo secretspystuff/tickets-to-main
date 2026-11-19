@@ -44,6 +44,39 @@
         "fix": "Update Tickets to Main and try again.",
         "then": "stop"
       }
+    },
+    {
+      "role": "request",
+      "document": {
+        "protocol": "tickets-to-main.coordination",
+        "version": 1,
+        "command": "protocol.hello",
+        "id": "fab00000000000000000000000000085",
+        "idempotency_key": null,
+        "body": {
+          "client_version": 1,
+          "required_features": [
+            "explicit_repo_identity_v1"
+          ]
+        }
+      }
+    },
+    {
+      "role": "response",
+      "document": {
+        "protocol": "tickets-to-main.coordination",
+        "version": 1,
+        "command": "protocol.hello",
+        "id": "fab00000000000000000000000000085",
+        "idempotency_key": null,
+        "body": {
+          "accepted_version": 1,
+          "runtime": "not-served",
+          "accepted_features": [
+            "explicit_repo_identity_v1"
+          ]
+        }
+      }
     }
   ],
   "cases": [
@@ -83,6 +116,61 @@
         "error": "This program speaks a coordination version the server does not.",
         "fix": "Update Tickets to Main and try again.",
         "then": "stop"
+      }
+    },
+    {
+      "rule": "negotiate",
+      "input": {
+        "client_version": 1,
+        "required_features": [
+          "explicit_repo_identity_v1"
+        ]
+      },
+      "expect": {
+        "ok": true,
+        "accepted_version": 1,
+        "accepted_features": [
+          "explicit_repo_identity_v1"
+        ]
+      }
+    },
+    {
+      "rule": "confirmNegotiation",
+      "input": {
+        "request": {
+          "protocol": "tickets-to-main.coordination",
+          "version": 1,
+          "command": "protocol.hello",
+          "id": "fab00000000000000000000000000085",
+          "idempotency_key": null,
+          "body": {
+            "client_version": 1,
+            "required_features": [
+              "explicit_repo_identity_v1"
+            ]
+          }
+        },
+        "response": {
+          "protocol": "tickets-to-main.coordination",
+          "version": 1,
+          "command": "protocol.hello",
+          "id": "fab00000000000000000000000000085",
+          "idempotency_key": null,
+          "body": {
+            "accepted_version": 1,
+            "runtime": "not-served",
+            "accepted_features": [
+              "explicit_repo_identity_v1"
+            ]
+          }
+        }
+      },
+      "expect": {
+        "ok": true,
+        "accepted_version": 1,
+        "accepted_features": [
+          "explicit_repo_identity_v1"
+        ]
       }
     }
   ]

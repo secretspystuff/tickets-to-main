@@ -1,7 +1,7 @@
 {
   "name": "repo-activation",
   "fabricated": true,
-  "shows": "This board can own the repo. A competing board is refused without its name or id. The repo slug and the Git name are different fields.",
+  "shows": "An explicit identity, local listing and activation generation bind this board. Legacy repo fields remain parseable without establishing activation or admission authority. Conflicts name no holding board.",
   "wire": [
     {
       "role": "request",
@@ -10,6 +10,90 @@
         "version": 1,
         "command": "repo.activation.read",
         "id": "fab00000000000000000000000000005",
+        "idempotency_key": null,
+        "body": {
+          "repo": {
+            "identity_id": "fab0Ab1Ab1Ab1Ab1Ab1Ab1Ab1Ab1Ab12",
+            "board_repo_id": "fabricated-board-repo",
+            "locator": {
+              "host": "example.com",
+              "owner": "fabricated-owner",
+              "name": "fabricated-repo"
+            }
+          }
+        }
+      }
+    },
+    {
+      "role": "response",
+      "document": {
+        "protocol": "tickets-to-main.coordination",
+        "version": 1,
+        "command": "repo.activation.read",
+        "id": "fab00000000000000000000000000005",
+        "idempotency_key": null,
+        "body": {
+          "repo": {
+            "identity_id": "fab0Ab1Ab1Ab1Ab1Ab1Ab1Ab1Ab1Ab12",
+            "board_repo_id": "fabricated-board-repo",
+            "locator": {
+              "host": "example.com",
+              "owner": "fabricated-owner",
+              "name": "fabricated-repo"
+            }
+          },
+          "active": true,
+          "board_id": "fabricated-board",
+          "activation_id": "fab00000000000000000000000000081"
+        }
+      }
+    },
+    {
+      "role": "response",
+      "document": {
+        "protocol": "tickets-to-main.coordination",
+        "version": 1,
+        "command": "repo.activation.read",
+        "id": "fab00000000000000000000000000006",
+        "idempotency_key": null,
+        "body": {
+          "repo": {
+            "identity_id": "fab0Ab1Ab1Ab1Ab1Ab1Ab1Ab1Ab1Ab12",
+            "board_repo_id": "fabricated-board-repo",
+            "locator": {
+              "host": "example.com",
+              "owner": "fabricated-owner",
+              "name": "fabricated-repo"
+            }
+          },
+          "active": false,
+          "board_id": null,
+          "activation_id": null
+        }
+      }
+    },
+    {
+      "role": "refusal",
+      "document": {
+        "protocol": "tickets-to-main.coordination",
+        "version": 1,
+        "command": "repo.activation.read",
+        "id": "fab00000000000000000000000000007",
+        "idempotency_key": null,
+        "error": "Another board already coordinates this repo.",
+        "code": "repo_held",
+        "field": "repo",
+        "fix": "Use the board that already coordinates it, or turn coordination off there.",
+        "then": "stop"
+      }
+    },
+    {
+      "role": "request",
+      "document": {
+        "protocol": "tickets-to-main.coordination",
+        "version": 1,
+        "command": "repo.activation.read",
+        "id": "fab00000000000000000000000000086",
         "idempotency_key": null,
         "body": {
           "repo": {
@@ -27,27 +111,7 @@
         "protocol": "tickets-to-main.coordination",
         "version": 1,
         "command": "repo.activation.read",
-        "id": "fab00000000000000000000000000005",
-        "idempotency_key": null,
-        "body": {
-          "repo": {
-            "host": "example.com",
-            "owner": "fabricated-owner",
-            "name": "fabricated-repo",
-            "board_repo_id": "fabricated-board-repo"
-          },
-          "active": true,
-          "board_id": "fabricated-board"
-        }
-      }
-    },
-    {
-      "role": "response",
-      "document": {
-        "protocol": "tickets-to-main.coordination",
-        "version": 1,
-        "command": "repo.activation.read",
-        "id": "fab00000000000000000000000000006",
+        "id": "fab00000000000000000000000000086",
         "idempotency_key": null,
         "body": {
           "repo": {
@@ -59,21 +123,6 @@
           "active": false,
           "board_id": null
         }
-      }
-    },
-    {
-      "role": "refusal",
-      "document": {
-        "protocol": "tickets-to-main.coordination",
-        "version": 1,
-        "command": "repo.activation.read",
-        "id": "fab00000000000000000000000000007",
-        "idempotency_key": null,
-        "error": "Another board already coordinates this repo.",
-        "code": "repo_held",
-        "field": "repo",
-        "fix": "Use the board that already coordinates it, or turn coordination off there.",
-        "then": "stop"
       }
     }
   ],
@@ -106,12 +155,20 @@
           "seat": "viewer"
         },
         "repo": {
-          "host": "example.com",
-          "owner": "fabricated-owner",
-          "name": "fabricated-repo",
-          "board_repo_id": "fabricated-board-repo"
+          "identity_id": "fab0Ab1Ab1Ab1Ab1Ab1Ab1Ab1Ab1Ab12",
+          "board_repo_id": "fabricated-board-repo",
+          "locator": {
+            "host": "example.com",
+            "owner": "fabricated-owner",
+            "name": "fabricated-repo"
+          }
         },
-        "held_by": "fabricated-other-board"
+        "held_by": {
+          "identity_id": "fab0Ab1Ab1Ab1Ab1Ab1Ab1Ab1Ab1Ab12",
+          "board_id": "fabricated-other-board",
+          "board_repo_id": "fabricated-board-repo",
+          "activation_id": "fab00000000000000000000000000081"
+        }
       },
       "expect": {
         "protocol": "tickets-to-main.coordination",
