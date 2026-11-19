@@ -1,9 +1,12 @@
 {
   "protocol": "tickets-to-main.coordination",
   "version": 1,
-  "runtime": "not-served",
+  "runtime": "served",
   "no_runtime_readiness_claim": true,
-  "served": [],
+  "served": [
+    "protocol.hello",
+    "repo.activation.read"
+  ],
   "sharing": "Public contract and authorized fabricated fixtures. No private source, credentials or customer evidence.",
   "connection": "Starts after the existing human-approved program connection. This protocol does not define a new sign-in.",
   "entry": "src/lib/ttm-protocol.ts",
@@ -12,7 +15,7 @@
     "protocol.hello": {
       "effect": "read",
       "group": "public-contract",
-      "served": false
+      "served": true
     },
     "connection.status": {
       "effect": "read",
@@ -22,7 +25,7 @@
     "repo.activation.read": {
       "effect": "read",
       "group": "connection-settings",
-      "served": false
+      "served": true
     },
     "settings.effective.read": {
       "effect": "read",

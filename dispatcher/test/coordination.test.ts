@@ -4,7 +4,7 @@ import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { confirmHello } from "../src/coordination.ts";
 import { run } from "../src/cli.ts";
-import { COMMANDS, validateWire } from "../../src/lib/ttm-protocol.ts";
+import { COMMANDS, catalog, validateWire } from "../../src/lib/ttm-protocol.ts";
 import { harnessIo, removeDir, tempDir } from "./helpers.ts";
 
 test("connect reports the reviewed protocol and sends nothing", async () => {
@@ -36,7 +36,8 @@ test("connect reports the reviewed protocol and sends nothing", async () => {
   }
 });
 
-test("coordination lists the unserved catalog and a send saves nothing", async () => {
+test("offline coordination lists the unserved catalog and a send saves nothing", async t => {
+  const transport = t.mock.method(globalThis, "fetch", async () => { throw new Error("Unexpected network request"); });
   const dir = tempDir();
   try {
     const context = harnessIo();
@@ -82,12 +83,15 @@ test("coordination lists the unserved catalog and a send saves nothing", async (
     assert.equal(context.out.includes("effect"), false);
     assert.equal(context.err.includes("effect"), false);
     assert.deepEqual(readFileSync(join(dir, "ledger.json")), before);
+    for (const command of COMMANDS) assert.equal(await run(["coordination", "send", command], context), 1);
+    assert.equal(transport.mock.callCount(), 0);
+    assert.deepEqual(readFileSync(join(dir, "ledger.json")), before);
   } finally {
     removeDir(dir);
   }
 });
 
-test("a served hello is not a response this build accepts", () => {
+test("the public wire catalog serves exactly two reads while offline proof remains unserved", () => {
   const served = {
     protocol: "tickets-to-main.coordination",
     version: 1,
@@ -96,5 +100,10 @@ test("a served hello is not a response this build accepts", () => {
     idempotency_key: null,
     body: { accepted_version: 1, runtime: "served" },
   };
-  assert.equal(validateWire(served, "response").ok, false);
+  assert.equal(validateWire(served, "response").ok, true);
+  assert.deepEqual(catalog().served, ["protocol.hello", "repo.activation.read"]);
+  assert.equal(catalog().no_runtime_readiness_claim, true);
+  const offline = confirmHello();
+  assert.equal(offline.runtimeLine, "Runtime: not served.");
+  assert.equal(offline.servedLine, "Commands served: none.");
 });

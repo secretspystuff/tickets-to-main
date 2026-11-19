@@ -2,7 +2,7 @@
 
 Public Dispatcher surface for install, connect, status, and the native adapter harness.
 
-This tree is Apache-2.0. It loads the included public coordination protocol, its manifest, and fabricated fixtures. This is pre-release source, not a signed or qualified release. Coordination commands are not served, so no coordination command is sent.
+This tree is Apache-2.0. It loads the included public coordination protocol, its manifest, and fabricated fixtures. This is pre-release source, not a signed or qualified release. The CLI uses the offline fixtures. The separate [coordination client](src/coordination-client.ts) supports the served hello and repository activation reads for an existing approved device connection.
 
 ## What this build does
 
@@ -17,7 +17,7 @@ This tree is Apache-2.0. It loads the included public coordination protocol, its
 
 ## What this build does not do
 
-It does not sign an installer, register startup, open a live Tickets Please connection, admit work, start a coding session, or claim a supported Windows or macOS release. The workspace claim is a local writer record, not a separate user or container. A test keychain is unqualified and is used only when the test switch is set. The stub adapter is not offered.
+The CLI does not sign an installer, register startup, open a live Tickets Please connection, admit work, start a coding session, or claim a supported Windows or macOS release. The workspace claim is a local writer record, not a separate user or container. A test keychain is unqualified and is used only when the test switch is set. The stub adapter is not offered.
 
 ## Check
 
