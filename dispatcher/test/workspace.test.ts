@@ -282,24 +282,26 @@ test("workspace claim and preparation require a definite absence of the recorded
         if (entry.held && entry.observations.length === 2) mkdirSync(candidate);
         const originalDirectories = readdirSync(scratch).sort();
         const originalEpochs = new Set(readdirSync(leaseRoot));
-        const calls: { pid: number; signal: unknown; unreleasedOwners: unknown[] }[] = [];
+        const newEpochs = () => readdirSync(leaseRoot).filter(epoch => /^epoch-[0-9]+$/.test(epoch) && !originalEpochs.has(epoch));
+        const writerChangeEpochs: string[] = [];
+        const calls: { pid: number; signal: unknown; unreleasedOwners: { epoch: string; pid: unknown; namespace: unknown }[] }[] = [];
         probe.mock.method(process, "kill", (pid: number, signal: unknown) => {
           const index = calls.length;
-          const unreleasedOwners = readdirSync(leaseRoot)
-            .filter(epoch => /^epoch-[0-9]+$/.test(epoch) && !originalEpochs.has(epoch))
-            .flatMap(epoch => {
-              const path = join(leaseRoot, epoch);
-              const files = readdirSync(path);
-              if (!files.includes("owner.json") || files.includes("released") || files.includes("released.prepared")) return [];
-              const owner = JSON.parse(readFileSync(join(path, "owner.json"), "utf8"));
-              return [{ pid: owner.pid, namespace: owner.namespace }];
-            });
+          const unreleasedOwners = newEpochs().flatMap(epoch => {
+            const path = join(leaseRoot, epoch);
+            const files = readdirSync(path);
+            if (!files.includes("owner.json") || files.includes("released") || files.includes("released.prepared")) return [];
+            const owner = JSON.parse(readFileSync(join(path, "owner.json"), "utf8"));
+            return [{ epoch, pid: owner.pid, namespace: owner.namespace }];
+          });
           calls.push({ pid, signal, unreleasedOwners });
           if (entry.changeWriter && index === 0) {
+            const beforeWriterChange = new Set(newEpochs());
             updateLedger(dir, [], current => {
               assert.ok(current.workspace);
               current.workspace.writerPid = latestPid;
             });
+            writerChangeEpochs.push(...newEpochs().filter(epoch => !beforeWriterChange.has(epoch)));
             ledger = readFileSync(ledgerPath);
           }
           throw failures[entry.observations[index] ?? entry.observations.at(-1)!];
@@ -310,10 +312,13 @@ test("workspace claim and preparation require a definite absence of the recorded
         assert.equal(readFileSync(workFile, "utf8"), "fabricated work to preserve\n");
         assert.doesNotMatch(context.out + context.err, /fabricated process diagnostic/);
 
+        const commandEpochs = newEpochs().filter(epoch => !writerChangeEpochs.includes(epoch));
         const expectedCalls = entry.observations.map((_, index) => ({
           pid: entry.changeWriter && index > 0 ? latestPid : recordedPid,
           signal: 0,
-          unreleasedOwners: entry.action === "claim" || index > 0 ? [{ pid: process.pid, namespace: "ledger" }] : [],
+          unreleasedOwners: entry.action === "claim" || index > 0
+            ? [{ epoch: commandEpochs[0], pid: process.pid, namespace: "ledger" }]
+            : [],
         }));
         if (entry.held) {
           assert.deepEqual({
@@ -337,6 +342,13 @@ test("workspace claim and preparation require a definite absence of the recorded
             entry.action === "claim"
               ? { path: realpathSync(workspace), writerPid: candidatePid, qualified: false }
               : { path: realpathSync(candidate), writerPid: null, qualified: false });
+        }
+        assert.equal(writerChangeEpochs.length, entry.changeWriter ? 1 : 0);
+        const expectedEpochCount = entry.action === "claim" || entry.observations.length > 1 ? 1 : 0;
+        assert.equal(commandEpochs.length, expectedEpochCount);
+        for (const epoch of commandEpochs) {
+          const path = join(leaseRoot, epoch);
+          assert.deepEqual(readFileSync(join(path, "released")), readFileSync(join(path, "owner.json")));
         }
       } finally {
         removeDir(dir);
