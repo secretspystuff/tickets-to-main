@@ -118,6 +118,21 @@ test("an applied page with more results requests the next page even after reachi
   assert.deepEqual(done.actions, []);
 });
 
+test("an empty accepted page continues for a newly announced signal without repeating unchanged reads", () => {
+  const started = stepBoardFeedReplay(createBoardFeedReplay(currentScope(), 10), { kind: "wake", scope: currentScope() });
+  const first = readChanges(started, 10);
+  const queued = stepBoardFeedReplay(started.state, { kind: "signal", scope: currentScope(), seq: 12 });
+  assert.deepEqual(queued.actions, []);
+  const caught = stepBoardFeedReplay(queued.state, { kind: "changes-applied", scope: currentScope(), requestId: first.requestId, next: 10, more: false });
+  const second = readChanges(caught, 10);
+  const empty = stepBoardFeedReplay(caught.state, { kind: "changes-applied", scope: currentScope(), requestId: second.requestId, next: 10, more: false });
+  assert.equal(empty.state.cursor, 10);
+  assert.deepEqual(empty.actions, []);
+  unchanged(empty.state, { kind: "signal", scope: currentScope(), seq: 12 });
+  const newer = stepBoardFeedReplay(empty.state, { kind: "signal", scope: currentScope(), seq: 13 });
+  readChanges(newer, 10);
+});
+
 test("410 keeps the old cursor until the matching snapshot is applied, then catches up newer signals", () => {
   const started = stepBoardFeedReplay(createBoardFeedReplay(currentScope(), 7), { kind: "signal", scope: currentScope(), seq: 9 });
   const read = readChanges(started, 7);
@@ -145,6 +160,30 @@ test("410 keeps the old cursor until the matching snapshot is applied, then catc
   const done = stepBoardFeedReplay(restored.state, { kind: "changes-applied", scope: currentScope(), requestId: replay.requestId, next: 18, more: false });
   assert.equal(done.state.cursor, 18);
   assert.deepEqual(done.actions, []);
+});
+
+test("a matching 410 snapshot can reset a cursor above the restored board's latest sequence", () => {
+  const initial = createBoardFeedReplay(currentScope(), 100);
+  const started = stepBoardFeedReplay(initial, { kind: "hi", scope: currentScope(), seq: 105 });
+  const oldRead = readChanges(started, 100);
+  unchanged(started.state, { kind: "changes-applied", scope: currentScope(), requestId: oldRead.requestId, next: 20, more: false });
+
+  const gap = stepBoardFeedReplay(started.state, { kind: "changes-too-old", scope: currentScope(), requestId: oldRead.requestId });
+  const snapshot = readSnapshot(gap);
+  const queued = stepBoardFeedReplay(gap.state, { kind: "signal", scope: currentScope(), seq: 24 });
+  assert.equal(queued.state.cursor, 100);
+  assert.deepEqual(queued.actions, []);
+
+  const restored = stepBoardFeedReplay(queued.state, { kind: "snapshot-applied", scope: currentScope(), requestId: snapshot.requestId, next: 20 });
+  assert.equal(restored.state.cursor, 20);
+  const read = readChanges(restored, 20);
+  const partial = stepBoardFeedReplay(restored.state, { kind: "changes-applied", scope: currentScope(), requestId: read.requestId, next: 22, more: false });
+  assert.equal(partial.state.cursor, 22);
+  const finalRead = readChanges(partial, 22);
+  const done = stepBoardFeedReplay(partial.state, { kind: "changes-applied", scope: currentScope(), requestId: finalRead.requestId, next: 24, more: false });
+  assert.equal(done.state.cursor, 24);
+  assert.deepEqual(done.actions, []);
+  assert.equal(initial.cursor, 100);
 });
 
 test("another board or retired session cannot affect current scope or consume a current request", () => {
