@@ -60,6 +60,13 @@ test("fixtures name the two Codex interfaces and one fabricated key", () => {
   assert.deepEqual([...new Set(otherKeys)], ["tp_fixture_key_not_a_real_grant"]);
 });
 
+test("the offline board feed replay reducer cannot start networking or timers", () => {
+  const replay = fileURLToPath(new URL("src/board-feed-replay.ts", root));
+  const code = readFileSync(replay, "utf8");
+  assert.doesNotMatch(code, /\b(?:from|import)\s*["']|\b(?:import|require|createRequire)\s*\(/, replay);
+  assert.doesNotMatch(code, /\b(?:fetch|WebSocket|WebTransport|XMLHttpRequest|EventSource|setTimeout|setInterval|setImmediate|queueMicrotask|requestAnimationFrame|globalThis|global|process|eval|Function)\b/, replay);
+});
+
 test("the artifact checker and stop journal stay behind the fabricated preparation boundary", () => {
   const source = files(fileURLToPath(new URL("src", root))).filter(path => path.endsWith(".ts"));
   const gate = fileURLToPath(new URL("src/push-artifact-gate.ts", root));
