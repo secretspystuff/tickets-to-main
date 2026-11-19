@@ -22,10 +22,58 @@ type Event = Readonly<{ scope: Scope } & (
   | { kind: "snapshot-applied"; requestId: ReplyId; next: number }
   | { kind: "closed"; code: 4403 | 4404 }
 )>;
+type Hint = Extract<Event, { kind: "hi" | "signal" }>;
 type Step = Readonly<{ state: Replay; actions: readonly ReadAction[] }>;
 
-function sequence(value: number): boolean {
-  return Number.isSafeInteger(value) && value >= 0;
+function sequence(value: unknown): value is number {
+  return typeof value === "number" && Number.isSafeInteger(value) && value >= 0;
+}
+
+function record(value: unknown): value is object {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) return false;
+  const prototype = Object.getPrototypeOf(value);
+  return prototype === Object.prototype || prototype === null;
+}
+
+function exactFields(value: object, fields: readonly string[]): boolean {
+  return Reflect.ownKeys(value).length === fields.length && fields.every(field => Object.hasOwn(value, field));
+}
+
+function data(value: object, field: string | number): unknown {
+  const descriptor = Object.getOwnPropertyDescriptor(value, field);
+  return descriptor?.enumerable && Object.hasOwn(descriptor, "value") ? descriptor.value : undefined;
+}
+
+function validSignal(frame: object, tip: number): boolean {
+  const items = data(frame, "items");
+  if (!Array.isArray(items) || items.length > 50 || Reflect.ownKeys(items).length !== items.length + 1) return false;
+  if (items.length === 0) return exactFields(frame, ["t", "seq", "items", "more"]) && data(frame, "more") === true;
+  if (!exactFields(frame, ["t", "seq", "items"])) return false;
+
+  let previous = -1;
+  for (let index = 0; index < items.length; index++) {
+    const item = data(items, index);
+    if (!record(item) || !exactFields(item, ["seq", "kind", "ticket"])) return false;
+    const seq = data(item, "seq");
+    const ticket = data(item, "ticket");
+    if (!sequence(seq) || seq <= previous || seq > tip || typeof data(item, "kind") !== "string"
+      || (ticket !== null && typeof ticket !== "string")) return false;
+    previous = seq;
+  }
+  return true;
+}
+
+export function decodeBoardFeedHint(frame: unknown, scope: Scope): Hint | null {
+  if (!record(frame)) return null;
+  const kind = data(frame, "t");
+  const seq = data(frame, "seq");
+  if (!sequence(seq)) return null;
+  if (kind === "hi") {
+    if (!exactFields(frame, ["t", "v", "seq"]) || data(frame, "v") !== 1) return null;
+  } else if (kind !== "signal" || !validSignal(frame, seq)) {
+    return null;
+  }
+  return { kind, seq, scope: { board: scope.board, session: scope.session } };
 }
 
 function quiet(state: Replay): Step {
