@@ -220,6 +220,80 @@ test("a workspace stays outside the state directory and admits one live writer",
   }
 });
 
+test("workspace claim and preparation require a definite absence of the recorded PID", async t => {
+  const recordedPid = 42017;
+  const candidatePid = 42018;
+  const cases = [
+    { name: "claim holds on an unavailable observation", action: "claim", observations: ["EIO"], held: true },
+    { name: "claim holds when the recorded PID is present", action: "claim", observations: ["EPERM"], held: true },
+    { name: "claim can replace a definitely absent PID", action: "claim", observations: ["ESRCH"], held: false },
+    { name: "prepare holds on an unavailable preflight", action: "prepare", observations: ["EIO"], held: true },
+    { name: "prepare holds when the locked recheck is unavailable", action: "prepare", observations: ["ESRCH", "EIO"], held: true },
+    { name: "prepare can replace an absent record after a second check", action: "prepare", observations: ["ESRCH", "ESRCH"], held: false },
+  ] as const;
+
+  for (const entry of cases) {
+    await t.test(entry.name, async probe => {
+      const dir = tempDir();
+      const scratch = tempDir();
+      const workspace = join(scratch, "existing");
+      const candidate = join(scratch, "candidate");
+      const ledgerPath = join(dir, "ledger.json");
+      try {
+        const setup = io();
+        assert.equal(await run(["install", "--state", dir], setup), 0, setup.err);
+        assert.equal(await run(["workspace", "prepare", "--state", dir, "--workspace", workspace], setup), 0, setup.err);
+        assert.equal(await run(["workspace", "claim", "--state", dir, "--pid", String(recordedPid)], setup), 0, setup.err);
+        const ledger = readFileSync(ledgerPath);
+        assert.equal(parseLedger(ledger.toString("utf8"))?.workspace?.writerPid, recordedPid);
+        const workFile = join(workspace, "local-work.txt");
+        writeFileSync(workFile, "fabricated work to preserve\n");
+        if (entry.held && entry.observations.length === 2) mkdirSync(candidate);
+        const originalDirectories = readdirSync(scratch).sort();
+
+        const calls: [pid: number, signal: unknown][] = [];
+        probe.mock.method(process, "kill", (pid: number, signal: unknown) => {
+          const code = entry.observations[calls.length] ?? entry.observations.at(-1);
+          calls.push([pid, signal]);
+          throw Object.assign(new Error("fabricated process diagnostic"), { code });
+        });
+        const args = entry.action === "claim" ? ["--pid", String(candidatePid)] : ["--workspace", candidate];
+        const context = io();
+        const exitCode = await run(["workspace", entry.action, "--state", dir, ...args], context);
+        assert.equal(readFileSync(workFile, "utf8"), "fabricated work to preserve\n");
+        assert.doesNotMatch(context.out + context.err, /fabricated process diagnostic/);
+
+        const expectedCalls = entry.observations.map(() => [recordedPid, 0]);
+        if (entry.held) {
+          assert.deepEqual({
+            exitCode,
+            ledgerPreserved: readFileSync(ledgerPath).equals(ledger),
+            workspaceDirectories: readdirSync(scratch).sort(),
+            calls,
+          }, {
+            exitCode: 1,
+            ledgerPreserved: true,
+            workspaceDirectories: originalDirectories,
+            calls: expectedCalls,
+          });
+          assert.equal(context.out, "");
+          assert.notEqual(context.err, "");
+        } else {
+          assert.deepEqual(calls, expectedCalls);
+          assert.equal(exitCode, 0, context.err);
+          assert.deepEqual(parseLedger(readFileSync(ledgerPath, "utf8"))?.workspace,
+            entry.action === "claim"
+              ? { path: realpathSync(workspace), writerPid: candidatePid, qualified: false }
+              : { path: realpathSync(candidate), writerPid: null, qualified: false });
+        }
+      } finally {
+        removeDir(dir);
+        removeDir(scratch);
+      }
+    });
+  }
+});
+
 test("status and health report the recorded PID separately from writer custody", async t => {
   const dir = tempDir();
   const workspace = tempDir();
