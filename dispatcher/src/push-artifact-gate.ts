@@ -140,10 +140,10 @@ function check(input: unknown): State {
   const artifacts = entries(request.artifacts);
   if (!artifacts) return "held";
   const held = entries(request.secrets);
-  const secrets = held?.complete && held.values.every(secret => boundedUtf8(secret, MAX_SECRET_BYTES)) ? held.values : null;
-  const scanSecrets = secrets ?? [];
+  const scanSecrets = held?.values.filter(secret => boundedUtf8(secret, MAX_SECRET_BYTES)) ?? [];
+  const secretsComplete = held?.complete && scanSecrets.length === held.values.length;
   const { plan, complete } = expectedEntries(expected?.values ?? []);
-  let incomplete = !expected?.complete || !artifacts.complete || !secrets || !complete;
+  let incomplete = !expected?.complete || !artifacts.complete || !secretsComplete || !complete;
   const seen = new Set<string>();
   const verified = new Set<string>();
   for (const entry of artifacts.values) {

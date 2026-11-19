@@ -270,6 +270,57 @@ test("holds opaque, invalid or oversized bytes and refuses an incomplete held-se
   }
 });
 
+test("every valid held value still stops when another data entry is malformed", () => {
+  const other = "second-bounded-fabricated-match";
+  const miss = "decoy-without-a-scan-match";
+  const inContent = { ...second, bytes: Buffer.from(`before ${held} after`) };
+  const inName = { name: `notes-${other}.txt`, bytes: Buffer.alloc(0) };
+  for (const malformed of ["", false, "a".repeat(4097), "é".repeat(2049), "\ud800"]) {
+    const values = [miss, malformed, held, other];
+    for (const secrets of [values, [...values].reverse()]) {
+      for (const artifact of [inContent, inName]) {
+        assertOutcome(checkPushArtifacts({ expected: inventory([artifact]), artifacts: [artifact], secrets }), stopped);
+      }
+      assertOutcome(checkPushArtifacts({ expected: inventory(text), artifacts: text, secrets }), incomplete);
+    }
+  }
+  for (const [malformed, content] of [[false, "false"], ["é".repeat(2049), "é".repeat(2049)], ["\ud800", "\uFFFD"]] as const) {
+    const artifacts = [{ ...second, bytes: Buffer.from(content) }];
+    assertOutcome(checkPushArtifacts({ expected: inventory(artifacts), artifacts, secrets: [held, malformed] }), incomplete);
+  }
+});
+
+test("holes, accessors and unreadable slots cannot hide a valid held value or supply a new one", () => {
+  const hit = [{ ...second, bytes: Buffer.from(held) }];
+  const getterOnlyText = [{ ...second, bytes: Buffer.from("fabricated-getter-only-value") }];
+  let getterCalls = 0;
+  for (const unknownAt of [0, 1]) {
+    for (const accessor of [false, true]) {
+      const secrets: unknown[] = new Array(2);
+      secrets[1 - unknownAt] = held;
+      if (accessor) {
+        Object.defineProperty(secrets, unknownAt, { enumerable: true, get() {
+          getterCalls += 1;
+          return "fabricated-getter-only-value";
+        } });
+      }
+      assertOutcome(checkPushArtifacts({ expected: inventory(hit), artifacts: hit, secrets }), stopped);
+      assertOutcome(checkPushArtifacts({ expected: inventory(getterOnlyText), artifacts: getterOnlyText, secrets }), incomplete);
+    }
+    const target = [held, held];
+    target[unknownAt] = "fabricated-getter-only-value";
+    const unreadable = new Proxy(target, {
+      getOwnPropertyDescriptor(object, key) {
+        if (key === String(unknownAt)) throw new Error(held);
+        return Reflect.getOwnPropertyDescriptor(object, key);
+      },
+    });
+    assertOutcome(checkPushArtifacts({ expected: inventory(hit), artifacts: hit, secrets: unreadable }), stopped);
+    assertOutcome(checkPushArtifacts({ expected: inventory(getterOnlyText), artifacts: getterOnlyText, secrets: unreadable }), incomplete);
+  }
+  assert.equal(getterCalls, 0);
+});
+
 test("unstable inputs are held before any accessor can substitute an artifact", () => {
   let reads = 0;
   const untrusted = {
