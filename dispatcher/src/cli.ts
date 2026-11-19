@@ -124,7 +124,7 @@ async function runInstall(argv: string[], io: Io): Promise<number> {
 async function runStatus(argv: string[], io: Io): Promise<number> {
   const rest = withoutFlags(argv, ["--state"]);
   if (rest.length > 0) throw new Error(USAGE);
-  const snapshot = await statusOf(stateDir(io, argv), custodyFor(io), io.pidAlive ?? processAlive);
+  const snapshot = await statusOf(stateDir(io, argv), custodyFor(io), io.pidAlive);
   write(io, snapshot.lines);
   return snapshot.exitCode;
 }
