@@ -4,7 +4,6 @@ import { loadLedger, type Ledger, type ToolRecord } from "./ledger.ts";
 import { osWords } from "./platform.ts";
 import { PACKAGE_VERSION, PRODUCT_LINE } from "./version.ts";
 import { confirmHello } from "./coordination.ts";
-import { processAlive } from "./workspace.ts";
 
 export const CODEX_INTERFACE_RULE = "Codex cli and Codex app-server are separate interfaces.";
 
@@ -31,7 +30,23 @@ function keychainLine(kind: string, signedIn: boolean, approved: boolean): strin
   return "Keychain: unavailable";
 }
 
-export async function statusOf(stateDir: string, custody: Custody, pidAlive: (pid: number) => boolean = processAlive): Promise<StatusSnapshot> {
+type PidObservation = "none" | "present" | "absent" | "unavailable";
+
+function observeRecordedPid(pid: number | null, pidAlive?: (pid: number) => boolean): PidObservation {
+  if (pid === null) return "none";
+  try {
+    if (pidAlive) return pidAlive(pid) ? "present" : "absent";
+    process.kill(pid, 0);
+    return "present";
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException | null)?.code;
+    if (code === "EPERM") return "present";
+    if (code === "ESRCH") return "absent";
+    return "unavailable";
+  }
+}
+
+export async function statusOf(stateDir: string, custody: Custody, pidAlive?: (pid: number) => boolean): Promise<StatusSnapshot> {
   const hello = confirmHello();
   const loaded = loadLedger(stateDir);
   if (!loaded.ok && loaded.reason === "missing") {
@@ -54,16 +69,13 @@ export async function statusOf(stateDir: string, custody: Custody, pidAlive: (pi
   const key = approved ? await custody.get(BOARD_KEY_ACCOUNT) : null;
   const signedIn = Boolean(approved && key);
   const board = boardLine(ledger);
-  const writerPid = ledger.workspace?.writerPid ?? null;
-  const writer = writerPid === null ? "none" : pidAlive(writerPid) ? "running" : "stopped";
   const lines = render({
     installed: true,
     os: osWords(ledger.install.platform),
     board,
     signedIn,
     keychain: keychainLine(custody.describe().kind, signedIn, Boolean(approved)),
-    workspace: ledger.workspace ? "prepared, unqualified" : "none",
-    writer,
+    writerPidObservation: ledger.workspace ? observeRecordedPid(ledger.workspace.writerPid, pidAlive) : undefined,
     tools: ledger.tools,
     health: "local record ok",
     protocolLine: hello.protocolLine,
@@ -89,8 +101,7 @@ function render(input: {
   board?: string;
   signedIn?: boolean;
   keychain?: string;
-  workspace?: string;
-  writer?: string;
+  writerPidObservation?: PidObservation;
   tools?: ToolRecord[];
   protocolLine: string;
   runtimeLine: string;
@@ -99,7 +110,11 @@ function render(input: {
   const lines = [`${PRODUCT_LINE} ${PACKAGE_VERSION}`, "", `Installed: ${input.installed ? "yes" : "no"}`];
   if (input.installed && input.os) {
     lines.push(`Operating system: ${input.os}`, "Signed installers: unqualified.", "Startup: unregistered.");
-    lines.push(`Workspace: ${input.workspace ?? "none"}`, `Writer: ${input.writer ?? "none"}`);
+    if (input.writerPidObservation === undefined) lines.push("Workspace: none", "Writer: none");
+    else {
+      const observation = input.writerPidObservation === "present" ? "present (process identity unverified)" : input.writerPidObservation;
+      lines.push("Workspace: prepared, unqualified", "Writer: unknown (including helpers)", `Recorded writer PID: ${observation}`);
+    }
   }
   lines.push(
     "",
