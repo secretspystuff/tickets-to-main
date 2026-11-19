@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { appendFileSync, cpSync, linkSync, readFileSync, realpathSync, renameSync, writeFileSync } from "node:fs";
+import { appendFileSync, cpSync, existsSync, linkSync, readFileSync, realpathSync, renameSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { test, type TestContext } from "node:test";
 import { runArtifactPreparation } from "../src/artifact-preparation.ts";
@@ -160,21 +160,41 @@ function events(path: string): Array<Record<string, unknown>> {
   });
 }
 
-function child(stateDir: string, request: Request, current: Current, crash: boolean, now = 100) {
+type CheckoutObservation = { birthNs: string | null; changeNs: string; match?: true };
+
+function child(stateDir: string, request: Request, current: Current, crash: boolean, now = 100, observation?: CheckoutObservation) {
   const url = new URL("../src/artifact-preparation.ts", import.meta.url).href;
   const script = `
 import { createHash } from "node:crypto";
-import { runArtifactPreparation } from ${JSON.stringify(url)};
-const [stateDir, request, current, mode, now] = process.argv.slice(1);
+import fs from "node:fs";
+import { syncBuiltinESMExports } from "node:module";
+const [stateDir, request, scope, mode, now, fixture] = process.argv.slice(1);
+const current = JSON.parse(scope);
+const observation = JSON.parse(fixture);
+if (observation) {
+  const inspect = fs.lstatSync;
+  fs.lstatSync = (path, options) => {
+    const stat = inspect(path, options);
+    if (path !== current.workspace || options?.bigint !== true) return stat;
+    stat.dev = 17n;
+    stat.ino = 47n;
+    stat.birthtimeNs = observation.birthNs === null ? undefined : BigInt(observation.birthNs);
+    stat.ctimeNs = BigInt(observation.changeNs);
+    return stat;
+  };
+  syncBuiltinESMExports();
+}
+const { runArtifactPreparation } = await import(${JSON.stringify(url)});
 const bytes = Buffer.from("fabricated restart artifact");
 const name = "fabricated-restart.txt";
-const clean = { expected: [{ name, size: bytes.byteLength, sha256: createHash("sha256").update(bytes).digest("hex") }],
-  artifacts: [{ name, bytes }], secrets: [] };
-const input = mode === "crash" ? new Proxy({}, { ownKeys() { process.exit(37); } }) : clean;
+const batch = { expected: [{ name, size: bytes.byteLength, sha256: createHash("sha256").update(bytes).digest("hex") }],
+  artifacts: [{ name, bytes }], secrets: observation?.match ? [bytes.toString()] : [] };
+const input = mode === "crash" ? new Proxy({}, { ownKeys() { process.exit(37); } }) : batch;
 const result = runArtifactPreparation({ stateDir, request: JSON.parse(request), artifacts: input,
-  context: { kind: "fabricated-harness", now: () => Number(now), readCurrent: () => JSON.parse(current) } });
+  context: { kind: "fabricated-harness", now: () => Number(now), readCurrent: () => structuredClone(current) } });
 process.stdout.write(JSON.stringify(result));`;
-  return spawnSync(process.execPath, ["--input-type=module", "--eval", script, stateDir, JSON.stringify(request), JSON.stringify(current), crash ? "crash" : "read", String(now)], { encoding: "utf8" });
+  return spawnSync(process.execPath, ["--input-type=module", "--eval", script, stateDir, JSON.stringify(request), JSON.stringify(current),
+    crash ? "crash" : "read", String(now), JSON.stringify(observation ?? null)], { encoding: "utf8" });
 }
 
 test("a detected artifact secret persists across a new process and blocks a queued passing receipt", async t => {
@@ -400,6 +420,78 @@ test("a same-path replacement cannot resume the original checkout's stop", t => 
   assert.deepEqual(events(f.journal).map(row => row.kind), ["artifact.intent", "runner.stopped", "runner.resumed"]);
   assertCheckout(f.workspace, original.identity);
   assertCheckout(replacementLocation, replacement.identity);
+});
+
+test("a restarted recovery holds for recycled or ambiguous directory identity", async t => {
+  const original = { birthNs: "1700000000000000100", changeNs: "1700000000000000200", match: true } as const;
+  const cases = [
+    { name: "same device and inode with a new birth time", birthNs: "1700000000000000300", changeNs: "1700000000000000400", expected: "stopped" },
+    { name: "missing birth time", birthNs: null, changeNs: original.changeNs, expected: "stopped" },
+    { name: "epoch fallback", birthNs: "0", changeNs: original.changeNs, expected: "stopped" },
+    { name: "change-time fallback", birthNs: original.birthNs, changeNs: original.birthNs, expected: "stopped" },
+    { name: "original birth time with a later change time", birthNs: original.birthNs, changeNs: "1700000000000000400", expected: "resumed" },
+  ] as const;
+
+  for (const { name, birthNs, changeNs, expected } of cases) {
+    await t.test(name, t => {
+      const f = fixture(t);
+      const first = f.receipt("a", 90);
+      const source = child(f.stateDir, f.request(first), f.current(first), false, 100, original);
+      assert.equal(source.status, 0, source.stderr);
+      assert.equal(source.stderr, "");
+      const stopped = JSON.parse(source.stdout) as ReturnType<typeof runArtifactPreparation>;
+      assertResult(stopped);
+      assert.equal(stopped.state, "stopped");
+      assert.equal(stopped.reason, "secret-detected");
+      assert.ok(stopped.stopSequence !== null);
+      const saved = readFileSync(f.journal);
+      assert.equal(saved.includes(original.birthNs), false);
+      assert.equal(saved.includes("17:47"), false);
+
+      const fresh = f.receipt("b", 105);
+      const ledger = readFileSync(join(f.stateDir, "ledger.json"));
+      const work = readFileSync(join(f.workspace, "behavior.txt"));
+      const recovery = child(f.stateDir, f.request(fresh, stopped.stopSequence), f.current(fresh, stopped.stopSequence), false, 120, { birthNs, changeNs });
+      assert.equal(recovery.status, 0, recovery.stderr);
+      assert.equal(recovery.stderr, "");
+      const result = JSON.parse(recovery.stdout) as ReturnType<typeof runArtifactPreparation>;
+      assertResult(result);
+      assert.equal(result.state, expected);
+      assert.deepEqual(readFileSync(join(f.stateDir, "ledger.json")), ledger);
+      assert.deepEqual(readFileSync(join(f.workspace, "behavior.txt")), work);
+      if (expected === "stopped") {
+        assert.deepEqual(result, stopped);
+        assert.deepEqual(readFileSync(f.journal), saved);
+      } else {
+        assert.deepEqual(events(f.journal).map(row => row.kind), ["artifact.intent", "runner.stopped", "runner.resumed"]);
+      }
+    });
+  }
+});
+
+test("an ambiguous original birth time cannot authorize a local preparation", async t => {
+  const cases = [
+    { name: "missing birth time", birthNs: null, changeNs: "1700000000000000200" },
+    { name: "epoch fallback", birthNs: "0", changeNs: "1700000000000000200" },
+    { name: "change-time fallback", birthNs: "1700000000000000100", changeNs: "1700000000000000100" },
+  ] as const;
+  for (const { name, birthNs, changeNs } of cases) {
+    await t.test(name, t => {
+      const f = fixture(t);
+      const fresh = f.receipt("a", 90);
+      const ledger = readFileSync(join(f.stateDir, "ledger.json"));
+      const work = readFileSync(join(f.workspace, "behavior.txt"));
+      const run = child(f.stateDir, f.request(fresh), f.current(fresh), false, 100, { birthNs, changeNs });
+      assert.equal(run.status, 0, run.stderr);
+      assert.equal(run.stderr, "");
+      const result = JSON.parse(run.stdout) as ReturnType<typeof runArtifactPreparation>;
+      assertResult(result);
+      assert.equal(result.state, "held");
+      assert.deepEqual(readFileSync(join(f.stateDir, "ledger.json")), ledger);
+      assert.deepEqual(readFileSync(join(f.workspace, "behavior.txt")), work);
+      if (existsSync(f.journal)) assert.equal(readFileSync(f.journal).length, 0);
+    });
+  }
 });
 
 test("a fresh process holds an interrupted scan before preparing anything else", t => {

@@ -1,7 +1,7 @@
 import { isDeepStrictEqual } from "node:util";
 import { journalDigest } from "./assignment-journal.ts";
 import { validCheckSnapshot, type CheckAttemptRecord, type CurrentCheckSnapshot } from "./check-attempt-record.ts";
-import { assignmentDirectory, directoriesOverlap, type DirectoryIdentity } from "./directory-identity.ts";
+import { assignmentDirectory, directoriesOverlap, directoryBirthTime, type DirectoryIdentity } from "./directory-identity.ts";
 import { assertPrivateDirectory } from "./fs-safety.ts";
 import { loadLedger } from "./ledger.ts";
 import { withPrivateJournal } from "./private-journal.ts";
@@ -30,7 +30,7 @@ type Stopped = Marker & { kind: "runner.stopped"; reason: StopReason };
 type Entry = Intent | Stopped | (Marker & { kind: "artifact.checked" | "runner.resumed" });
 type Stop = { intent: Intent; marker: Stopped };
 type History = { sequence: number; at: number; pending: Intent | null; stop: Stop | null; resumedAt: number };
-type Approval = { workspace: DirectoryIdentity; receipt: CheckAttemptRecord };
+type Approval = { workspace: DirectoryIdentity; workspaceDigest: string; receipt: CheckAttemptRecord };
 
 function outcome(state: Result["state"], reason: Result["reason"] = null, stopSequence: number | null = null): Result {
   return { state, reason, stopSequence, qualification: "unqualified-harness", publishable: false };
@@ -44,10 +44,6 @@ const opaque = (value: unknown): value is string => typeof value === "string" &&
 const digest = (value: unknown): value is string => typeof value === "string" && /^[a-f0-9]{64}$/.test(value);
 const integer = (value: unknown, minimum: number): value is number => typeof value === "number" && Number.isSafeInteger(value) && value >= minimum;
 const exact = (value: object, keys: readonly string[]) => Reflect.ownKeys(value).length === keys.length && keys.every(key => Object.hasOwn(value, key));
-
-function workspaceDigest(workspace: DirectoryIdentity): string {
-  return journalDigest(JSON.stringify([workspace.path, workspace.identity]));
-}
 
 function requestOf(value: unknown): Request | null {
   if (!value || typeof value !== "object" || Object.getPrototypeOf(value) !== Object.prototype) return null;
@@ -120,7 +116,9 @@ function approval(input: Input, state: DirectoryIdentity, request: Request, at: 
       || receipt.startedAt <= newerThan || receipt.outstandingHostChecks.length > 0
       || (receipt.state !== "passed" && receipt.state !== "not_required")
       || !isDeepStrictEqual(receipt.snapshot, current.snapshot)) return null;
-    return { workspace, receipt };
+    const birthTime = directoryBirthTime(workspace).toString();
+    const workspaceDigest = journalDigest(JSON.stringify([workspace.path, workspace.identity, birthTime]));
+    return { workspace, workspaceDigest, receipt };
   } catch {
     return null;
   }
@@ -146,7 +144,7 @@ export function runArtifactPreparation(input: Input): Result {
         if (!stop) return held();
         if (request.stopSequence !== stop.marker.sequence || journalDigest(request.jobId) !== stop.intent.jobDigest) return stopped(stop.marker);
         const before = approval(input, state, request, at, stop.marker.at);
-        if (!before || workspaceDigest(before.workspace) !== stop.intent.workspaceDigest) return stopped(stop.marker);
+        if (!before || before.workspaceDigest !== stop.intent.workspaceDigest) return stopped(stop.marker);
         if (checkPushArtifacts(input.artifacts).state !== "clear") return stopped(stop.marker);
         const completedAt = input.context.now();
         if (!integer(completedAt, at) || !isDeepStrictEqual(before, approval(input, state, request, completedAt, stop.marker.at))) {
@@ -160,7 +158,7 @@ export function runArtifactPreparation(input: Input): Result {
       const sequence = history.sequence + 1;
       if (!integer(sequence, 1)) return unavailable();
       append({ kind: "artifact.intent", sequence, at,
-        jobDigest: journalDigest(request.jobId), workspaceDigest: workspaceDigest(before.workspace) });
+        jobDigest: journalDigest(request.jobId), workspaceDigest: before.workspaceDigest });
       const scan = checkPushArtifacts(input.artifacts);
       const completedAt = input.context.now();
       if (!integer(completedAt, at)) return unavailable();
