@@ -65,6 +65,12 @@ export type WorkspaceRecord = {
   qualified: false;
 };
 
+export type BoardFeedCursorRecord = {
+  board: string;
+  binding: string;
+  handled: number;
+};
+
 export type Ledger = {
   version: 1;
   install: InstallRecord | null;
@@ -72,6 +78,7 @@ export type Ledger = {
   tools: ToolRecord[];
   workspace: WorkspaceRecord | null;
   checkAttempts?: CheckAttemptRecord[];
+  boardFeedCursors?: BoardFeedCursorRecord[];
 };
 
 export const LEDGER_FILE = "ledger.json";
@@ -149,6 +156,16 @@ function isWorkspace(value: unknown): value is WorkspaceRecord {
     && row.qualified === false;
 }
 
+function isBoardFeedCursor(value: unknown): value is BoardFeedCursorRecord {
+  if (value === null || typeof value !== "object" || Array.isArray(value)) return false;
+  const row = value as Record<string, unknown>;
+  const keys = ["board", "binding", "handled"];
+  return Object.keys(row).length === keys.length && keys.every(key => Object.hasOwn(row, key))
+    && typeof row.board === "string" && row.board.length > 0
+    && typeof row.binding === "string" && row.binding.length > 0
+    && typeof row.handled === "number" && Number.isSafeInteger(row.handled) && row.handled >= 0;
+}
+
 function isDeliveryReceipt(value: unknown): value is DeliveryReceipt {
   if (value === null || typeof value !== "object" || Array.isArray(value)) return false;
   const row = value as Record<string, unknown>;
@@ -190,7 +207,8 @@ export function parseLedger(text: string): Ledger | null {
   }
   if (parsed === null || typeof parsed !== "object") return null;
   const row = parsed as Record<string, unknown>;
-  if (row.version !== 1 || Object.keys(row).some((key) => !["version", "install", "connection", "tools", "workspace", "checkAttempts"].includes(key))) return null;
+  const fields = ["version", "install", "connection", "tools", "workspace", "checkAttempts", "boardFeedCursors"];
+  if (row.version !== 1 || Object.keys(row).some(key => !fields.includes(key))) return null;
   const install = row.install;
   let installRecord: InstallRecord | null = null;
   if (install !== null) {
@@ -221,6 +239,9 @@ export function parseLedger(text: string): Ledger | null {
   if (!Array.isArray(row.tools) || !row.tools.every(isTool)) return null;
   if (row.checkAttempts !== undefined && (!Array.isArray(row.checkAttempts) || !row.checkAttempts.every(validCheckAttemptRecord)
     || new Set(row.checkAttempts.map((attempt) => attempt.attemptId)).size !== row.checkAttempts.length)) return null;
+  const cursors = row.boardFeedCursors;
+  if (cursors !== undefined && (!Array.isArray(cursors) || !cursors.every(isBoardFeedCursor)
+    || new Set(cursors.map(cursor => cursor.board)).size !== cursors.length)) return null;
   let workspace: WorkspaceRecord | null = null;
   if (row.workspace !== undefined && row.workspace !== null) {
     if (!isWorkspace(row.workspace)) return null;
@@ -238,6 +259,7 @@ export function parseLedger(text: string): Ledger | null {
     tools: row.tools,
     workspace,
     ...(row.checkAttempts === undefined ? {} : { checkAttempts: row.checkAttempts }),
+    ...(cursors === undefined ? {} : { boardFeedCursors: cursors }),
   };
 }
 
