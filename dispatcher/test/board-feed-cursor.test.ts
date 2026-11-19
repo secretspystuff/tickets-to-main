@@ -8,7 +8,11 @@ import { emptyLedger, ledgerPath, loadLedger } from "../src/ledger.ts";
 import { removeDir, tempDir } from "./helpers.ts";
 
 type Replay = ReturnType<typeof createBoardFeedReplay>;
-type Event = Parameters<typeof stepBoardFeedReplay>[1];
+type Event = Parameters<typeof stepBoardFeedReplay>[1] | {
+  kind: "snapshot-read-failed";
+  scope: Replay["scope"];
+  requestId: string | number;
+};
 type Step = ReturnType<typeof stepBoardFeedReplay>;
 type Context = Readonly<{ board: string; binding: string; session: string }>;
 type Restore = { kind: "loaded"; replay: Replay } | { kind: "missing" | "invalid" | "scope-mismatch" };
@@ -61,6 +65,14 @@ function read(step: Step, current: Context, since: number) {
   assert.ok(action?.kind === "read-changes");
   assert.deepEqual(action.scope, scopeOf(current));
   assert.equal(action.since, since);
+  return action.requestId;
+}
+
+function readSnapshot(step: Step, current: Context) {
+  assert.equal(step.actions.length, 1);
+  const action = step.actions[0];
+  assert.ok(action?.kind === "read-snapshot");
+  assert.deepEqual(action.scope, scopeOf(current));
   return action.requestId;
 }
 
@@ -330,4 +342,54 @@ test("restart before and after the cursor commit reads only complete local state
       } finally { removeDir(dir); }
     });
   }
+});
+
+test("snapshot failure and retry keep the durable cursor and fresh replay scope", async () => {
+  const api = await checkpoint();
+  const dir = tempDir();
+  try {
+    const path = ledgerPath(dir);
+    const before = saveFixture(dir, [row(5), row(33, otherBoard)]);
+    const interrupted = context("fabricated-interrupted-session");
+    const interruptedScope = scopeOf(interrupted);
+    const initial = restored(api.restoreBoardFeedCursor(dir, interrupted), interrupted, 5);
+    const started = accepted(api.stepBoardFeedCursor(dir, interrupted, initial, { kind: "hi", scope: interruptedScope, seq: 9 }));
+    const gap = accepted(api.stepBoardFeedCursor(dir, interrupted, started.state, {
+      kind: "changes-too-old", scope: interruptedScope, requestId: read(started, interrupted, 5),
+    }));
+    const oldSnapshot = readSnapshot(gap, interrupted);
+    const failed = accepted(api.stepBoardFeedCursor(dir, interrupted, gap.state, {
+      kind: "snapshot-read-failed", scope: interruptedScope, requestId: oldSnapshot,
+    }));
+    assert.equal(failed.state.cursor, 5);
+    assert.deepEqual(failed.actions, []);
+    assert.deepEqual(readFileSync(path), before);
+
+    const current = context();
+    const scope = scopeOf(current);
+    const restarted = restored(api.restoreBoardFeedCursor(dir, current), current, 5);
+    const catchingUp = accepted(api.stepBoardFeedCursor(dir, current, restarted, { kind: "hi", scope, seq: 9 }));
+    const rediscovered = accepted(api.stepBoardFeedCursor(dir, current, catchingUp.state, {
+      kind: "changes-too-old", scope, requestId: read(catchingUp, current, 5),
+    }));
+    const snapshot = readSnapshot(rediscovered, current);
+    assert.equal(snapshot, oldSnapshot);
+    const failure = { kind: "snapshot-read-failed", scope, requestId: snapshot } as const;
+    assert.deepEqual(accepted(api.stepBoardFeedCursor(dir, current, rediscovered.state, { ...failure, scope: interruptedScope })), {
+      state: rediscovered.state, actions: [],
+    });
+    assert.deepEqual(api.stepBoardFeedCursor(dir, current, failed.state, { ...failure, scope: interruptedScope }), { kind: "held" });
+    const waiting = accepted(api.stepBoardFeedCursor(dir, current, rediscovered.state, failure));
+    assert.deepEqual(waiting.actions, []);
+    const retrying = accepted(api.stepBoardFeedCursor(dir, current, waiting.state, { kind: "wake", scope }));
+    const retry = readSnapshot(retrying, current);
+    assert.notEqual(retry, snapshot);
+    assert.equal(retrying.state.cursor, 5);
+    assert.deepEqual(api.stepBoardFeedCursor(dir, current, retrying.state, {
+      kind: "snapshot-applied", scope, requestId: retry, next: 9,
+    }), { kind: "held" });
+    assert.deepEqual(readFileSync(path), before);
+    restored(api.restoreBoardFeedCursor(dir, current), current, 5);
+    restored(api.restoreBoardFeedCursor(dir, otherBoard), otherBoard, 33);
+  } finally { removeDir(dir); }
 });
