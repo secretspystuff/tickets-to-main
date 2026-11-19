@@ -242,43 +242,80 @@ test("the offline hint decoder projects only approved hints with the caller's sc
   assert.equal(typeof decodeBoardFeedHint, "function", "the test-first board-feed hint decoder export is pending");
   const hello = { t: "hi", v: 1, seq: 0 };
   const item = { seq: 11, kind: "ticket.ready", ticket: "fabricated-ticket" };
+  const lowerItem = { ...item, seq: 10 };
+  const nextItem = { seq: 12, kind: "ticket.patched", ticket: "fabricated-other-ticket" };
   const signal = { t: "signal", seq: 12, items: [item] };
+  const lowerSignal = { ...signal, items: [lowerItem] };
+  const multiple = { ...signal, seq: 13, items: [item, nextItem] };
   const overflow = { t: "signal", seq: 14, items: [], more: true };
+  const max = Number.MAX_SAFE_INTEGER;
+  const maxSignal = { ...signal, seq: max };
+  const maxMultiple = { ...maxSignal, items: [lowerItem, nextItem] };
+  const atLimit = { ...signal, seq: 100, items: Array.from({ length: 50 }, (_, i) => ({ ...item, seq: 20 + i })) };
+  const omit = Symbol("omit field");
+  const invalidSequence = [omit, "12", -1, 10.5, NaN, Infinity, max + 1];
+  const invalidTag = [omit, 1, "seq", "pong", "closed", "changes-applied"];
+  type Fields = readonly (readonly [string, readonly unknown[]])[];
+  const unexpected: Fields = [
+    ["board", [otherBoard.board]],
+    ["session", [retiredSession.session]],
+    ["scope", [otherBoard, retiredSession]],
+    ["author", [{ board: otherBoard.board, session: retiredSession.session }, { scope: retiredSession }]],
+    ["extra", ["fabricated-extension"]],
+  ];
 
-  function ignored(frame: unknown, state = createBoardFeedReplay(currentScope(), 10)) {
+  function vary(
+    record: Record<string, unknown>, fields: Fields,
+    check: (changed: Record<string, unknown>, description: string) => void,
+  ) {
+    for (const [field, values] of fields) {
+      for (const [index, value] of values.entries()) {
+        const candidate = { ...record };
+        if (value === omit) delete candidate[field];
+        else candidate[field] = value;
+        check(candidate, `${field} variant ${index + 1}`);
+      }
+    }
+  }
+
+  function ignored(frame: unknown, state = createBoardFeedReplay(currentScope(), 10), description?: string) {
     const scope = currentScope();
     const original = structuredClone(frame);
     const before = structuredClone(state);
     const hint = decodeBoardFeedHint(frame, scope);
     const result = hint === null ? { state, actions: [] } : stepBoardFeedReplay(state, hint);
-    assert.deepEqual(result.actions, []);
-    assert.deepEqual(result.state, before);
-    assert.equal(hint, null);
+    assert.deepEqual(result.actions, [], description);
+    assert.deepEqual(result.state, before, description);
+    assert.equal(hint, null, description);
     assert.deepEqual(scope, currentScope());
     assert.deepEqual(state, before);
     assert.deepEqual(frame, original);
   }
 
-  await t.test("v1 hello and ordinary and overflow signals are tip hints across the valid sequence range", () => {
+  await t.test("accepts publisher frames across the sequence and item-count boundaries", () => {
     const cases = [
-      { frame: hello, kind: "hi", seq: 0, cursor: 0 },
-      { frame: { ...hello, seq: 23 }, kind: "hi", seq: 23, cursor: 20 },
-      { frame: { ...hello, seq: Number.MAX_SAFE_INTEGER }, kind: "hi", seq: Number.MAX_SAFE_INTEGER, cursor: 10 },
-      { frame: signal, kind: "signal", seq: 12, cursor: 10 },
-      { frame: { ...signal, items: [{ ...item, seq: 12 }] }, kind: "signal", seq: 12, cursor: 10 },
-      {
-        frame: { ...signal, seq: 13, items: [item, { seq: 12, kind: "ticket.patched", ticket: "fabricated-other-ticket" }] },
-        kind: "signal", seq: 13, cursor: 10,
-      },
-      { frame: overflow, kind: "signal", seq: 14, cursor: 10 },
-      { frame: { ...signal, seq: Number.MAX_SAFE_INTEGER }, kind: "signal", seq: Number.MAX_SAFE_INTEGER, cursor: 10 },
+      { frame: hello, kind: "hi", cursor: 0 },
+      { frame: { ...hello, seq: 23 }, kind: "hi", cursor: 20 },
+      { frame: { ...hello, seq: max }, kind: "hi", cursor: 10 },
+      { frame: signal, kind: "signal", cursor: 10 },
+      { frame: lowerSignal, kind: "signal", cursor: 10 },
+      { frame: { ...signal, items: [{ ...item, seq: 12 }] }, kind: "signal", cursor: 10 },
+      { frame: multiple, kind: "signal", cursor: 10 },
+      { frame: { ...multiple, seq: 14, items: [item, { ...nextItem, seq: 13 }] }, kind: "signal", cursor: 10 },
+      { frame: { ...signal, items: [{ ...item, ticket: null }] }, kind: "signal", cursor: 10 },
+      { frame: atLimit, kind: "signal", cursor: 10 },
+      { frame: maxSignal, kind: "signal", cursor: 10 },
+      { frame: maxMultiple, kind: "signal", cursor: 10 },
+      { frame: { ...maxSignal, items: [{ ...item, seq: max }] }, kind: "signal", cursor: 10 },
+      { frame: overflow, kind: "signal", cursor: 10 },
+      { frame: { ...overflow, seq: max }, kind: "signal", cursor: 10 },
     ] as const;
-    for (const { frame, kind, seq, cursor } of cases) {
+    for (const { frame, kind, cursor } of cases) {
       const scope = currentScope();
       const before = structuredClone(frame);
       const state = createBoardFeedReplay(scope, cursor);
       const hint = decodeBoardFeedHint(frame, scope);
-      assert.deepEqual(hint, { kind, seq, scope: currentScope() });
+      assert.deepEqual(hint, { kind, seq: frame.seq, scope: currentScope() });
       assert.ok(hint);
       const step = stepBoardFeedReplay(state, hint);
       readChanges(step, cursor);
@@ -300,29 +337,50 @@ test("the offline hint decoder projects only approved hints with the caller's sc
     readChanges(stepBoardFeedReplay(state, current), 10);
   });
 
-  await t.test("unsupported, unsafe, and foreign frames produce no event or read", () => {
+  await t.test("rejects malformed publisher fields one at a time", () => {
     const state = createBoardFeedReplay(currentScope(), 10);
-    const invalidFrames: unknown[] = [
-      null, "fabricated text frame", ["signal", 12],
-      { kind: "signal", seq: 12 }, { t: 1, seq: 12 },
-      { t: "seq", seq: 12 }, { t: "pong", seq: 12 },
-      { t: "closed", code: 4403, seq: 12 }, { t: "changes-applied", requestId: 1, next: 12, seq: 12 },
-      { t: "hi", seq: 12 }, { t: "hi", v: 2, seq: 12 }, { t: "hi", v: "1", seq: 12 },
-      { t: "hi", v: 1 }, { t: "signal" },
+    const cases: { name: string; frame: Record<string, unknown>; fields: Fields }[] = [
+      { name: "hello", frame: hello, fields: [
+        ["v", [omit, 0, 2, "1", true, null]], ["items", [[]]], ["more", [true]],
+        ["mine", [0]], ["text_connection", ["fabricated-text-connection"]], ["text_protocol", [{}]],
+      ] },
+      { name: "ordinary signal", frame: lowerSignal, fields: [
+        ["items", [omit, null, "fabricated", {}, [], [null]]], ["more", [true, false, "true"]], ["v", [1]],
+      ] },
+      { name: "overflow", frame: overflow, fields: [
+        ["items", [omit, null, "fabricated", {}, [item]]], ["more", [omit, false, "true", null, 1]], ["v", [1]],
+      ] },
     ];
-    for (const seq of ["12", -1, 10.5, NaN, Infinity, Number.MAX_SAFE_INTEGER + 1]) {
-      invalidFrames.push({ ...hello, seq }, { ...signal, seq }, { ...overflow, seq });
+    for (const { name, frame, fields } of cases) {
+      vary(frame, [["t", invalidTag], ["seq", invalidSequence], ...fields, ...unexpected], (candidate, description) => {
+        ignored(candidate, state, `${name} ${description}`);
+      });
     }
-    for (const frame of [hello, signal, overflow]) {
-      invalidFrames.push(
-        { ...frame, scope: otherBoard }, { ...frame, scope: retiredSession },
-        { ...frame, board: otherBoard.board }, { ...frame, session: retiredSession.session },
-      );
-    }
-    for (const frame of invalidFrames) ignored(frame, state);
-    const current = decodeBoardFeedHint(signal, currentScope());
-    assert.ok(current);
-    readChanges(stepBoardFeedReplay(state, current), 10);
+    ignored({ ...atLimit, items: [...atLimit.items, { ...item, seq: 70 }] }, state, "ordinary signal above the item limit");
+  });
+
+  await t.test("rejects malformed item fields in the first and later positions", () => {
+    const state = createBoardFeedReplay(currentScope(), 10);
+    const fields: Fields = [
+      ["seq", invalidSequence], ["kind", [omit, 1, null]], ["ticket", [omit, 1, false]], ...unexpected,
+    ];
+    vary(lowerItem, fields, (candidate, description) => {
+      ignored({ ...maxMultiple, items: [candidate, nextItem] }, state, `first item ${description}`);
+    });
+    vary(nextItem, fields, (candidate, description) => {
+      ignored({ ...maxMultiple, items: [lowerItem, candidate] }, state, `later item ${description}`);
+    });
+    ignored({ ...signal, items: [{ ...item, seq: 99 }] }, state, "first item beyond the frame tip");
+    ignored({ ...signal, items: [item, { ...nextItem, seq: 99 }] }, state, "later item beyond the frame tip");
+    ignored({ ...multiple, items: [nextItem, item] }, state, "items out of publisher order");
+    ignored({ ...multiple, items: [item, { ...nextItem, seq: 11 }] }, state, "duplicate item sequence");
+  });
+
+  await t.test("rejects non-hint shapes without issuing a read", () => {
+    for (const frame of [
+      null, "fabricated text frame", ["signal", 12], { kind: "signal", seq: 12 },
+      { t: "closed", code: 4403, seq: 12 }, { t: "changes-applied", requestId: 1, next: 12, seq: 12 },
+    ]) ignored(frame);
   });
 
   await t.test("complete internal events with any scope cannot enter through the hint decoder", () => {
@@ -344,46 +402,6 @@ test("the offline hint decoder projects only approved hints with the caller's sc
         { frame: { kind: "closed", scope, code: 4404 }, state: gap.state },
       ];
       for (const { frame, state } of cases) ignored(frame, state);
-    }
-  });
-
-  await t.test("signal item and author metadata cannot replace the frame tip or caller scope", () => {
-    const state = createBoardFeedReplay(currentScope(), 10);
-    for (const metadata of [
-      { board: otherBoard.board }, { session: retiredSession.session },
-      { scope: otherBoard }, { scope: retiredSession },
-    ]) {
-      const foreignItem = { ...item, ...metadata };
-      ignored({ ...signal, items: [foreignItem] }, state);
-      ignored({ ...signal, items: [item, { ...foreignItem, seq: 12 }] }, state);
-      ignored({ ...signal, author: metadata }, state);
-      ignored({ ...overflow, author: metadata }, state);
-    }
-    ignored({ ...signal, items: [{ ...item, seq: 99 }] }, state);
-    ignored({ ...signal, items: [item, { ...item, seq: 99 }] }, state);
-
-    const hint = decodeBoardFeedHint(signal, currentScope());
-    assert.deepEqual(hint, { kind: "signal", seq: 12, scope: currentScope() });
-    assert.ok(hint);
-    readChanges(stepBoardFeedReplay(state, hint), 10);
-  });
-
-  await t.test("only the published ordinary signal and overflow shapes qualify", () => {
-    const state = createBoardFeedReplay(currentScope(), 10);
-    for (const frame of [
-      { t: "signal", seq: 12 },
-      { ...signal, items: null }, { ...signal, items: "fabricated" }, { ...signal, items: [] },
-      { ...signal, items: [null] }, { ...signal, items: [{ ...item, seq: "11" }] },
-      { ...signal, items: [{ ...item, kind: 1 }] }, { ...signal, items: [{ ...item, ticket: 1 }] },
-      { ...overflow, more: "true" }, { ...overflow, more: false }, { ...overflow, items: [item] },
-      { t: "signal", seq: 14, more: true },
-    ]) ignored(frame, state);
-
-    for (const frame of [{ ...signal, items: [{ ...item, ticket: null }] }, overflow]) {
-      const hint = decodeBoardFeedHint(frame, currentScope());
-      assert.deepEqual(hint, { kind: "signal", seq: frame.seq, scope: currentScope() });
-      assert.ok(hint);
-      readChanges(stepBoardFeedReplay(state, hint), 10);
     }
   });
 });
