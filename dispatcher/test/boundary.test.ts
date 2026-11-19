@@ -60,17 +60,27 @@ test("fixtures name the two Codex interfaces and one fabricated key", () => {
   assert.deepEqual([...new Set(otherKeys)], ["tp_fixture_key_not_a_real_grant"]);
 });
 
-test("the artifact gate has only local hash and text helpers and no runtime caller", () => {
+test("the artifact checker and stop journal stay behind the fabricated preparation boundary", () => {
   const source = files(fileURLToPath(new URL("src", root))).filter(path => path.endsWith(".ts"));
   const gate = fileURLToPath(new URL("src/push-artifact-gate.ts", root));
   const helper = fileURLToPath(new URL("src/secret-text.ts", root));
+  const preparation = fileURLToPath(new URL("src/artifact-preparation.ts", root));
+  const journal = fileURLToPath(new URL("src/private-journal.ts", root));
   for (const [file, allowed] of [[gate, ["./secret-text.ts", "node:crypto"]], [helper, []]] as const) {
     const code = readFileSync(file, "utf8");
     const imports = [...code.matchAll(/\b(?:from|import)\s*["']([^"']+)["']/g)].map(match => match[1]);
     assert.deepEqual(imports.sort(), allowed);
     assert.doesNotMatch(code, /\b(?:process|console|globalThis|eval|Function|require|createRequire)\b|\bimport\s*\(/, file);
   }
+  const code = readFileSync(preparation, "utf8");
+  const imports = (path: string) => [...readFileSync(path, "utf8").matchAll(/\b(?:from|import)\s*["']([^"']+)["']/g)].map(match => match[1]).sort();
+  assert.deepEqual(imports(preparation), ["./assignment-journal.ts", "./check-attempt-record.ts", "./directory-identity.ts",
+    "./fs-safety.ts", "./ledger.ts", "./private-journal.ts", "./push-artifact-gate.ts", "node:util"]);
+  assert.deepEqual(imports(journal), ["./fs-safety.ts", "./state-lease.ts", "node:fs", "node:path"]);
+  assert.doesNotMatch(code, /\b(?:process|console|globalThis|eval|Function|require|createRequire|fetch)\b|\bimport\s*\(/);
   for (const path of [...source, ...files(fileURLToPath(new URL("bin", root)))]) {
-    if (path !== gate) assert.doesNotMatch(readFileSync(path, "utf8"), /\bpush-artifact-gate\b/, path);
+    const source = readFileSync(path, "utf8");
+    if (path !== gate && path !== preparation) assert.doesNotMatch(source, /\bpush-artifact-gate\b/, path);
+    if (path !== preparation && path !== journal) assert.doesNotMatch(source, /\bartifact-preparation\b/, path);
   }
 });

@@ -53,6 +53,15 @@ export function assignmentDirectory(path: string, host: DirectoryHost = native):
   return { path: canonical, legacyPath: host.legacyPath?.(path) ?? canonical, identity: ancestors[0]!, ancestors };
 }
 
+export function directoryBirthTime(directory: DirectoryIdentity): bigint {
+  const current = lstatSync(directory.path, { bigint: true });
+  if (!current.isDirectory() || current.isSymbolicLink() || `${current.dev}:${current.ino}` !== directory.identity) throw unavailable();
+  const { birthtimeNs, ctimeNs } = current;
+  // Node can substitute the epoch or change time when creation time is unavailable.
+  if (typeof birthtimeNs !== "bigint" || typeof ctimeNs !== "bigint" || birthtimeNs <= 0n || birthtimeNs >= ctimeNs) throw unavailable();
+  return birthtimeNs;
+}
+
 export function directoriesOverlap(a: DirectoryIdentity, b: DirectoryIdentity): boolean {
   return a.ancestors.includes(b.identity) || b.ancestors.includes(a.identity);
 }
