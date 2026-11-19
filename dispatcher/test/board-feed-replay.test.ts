@@ -241,8 +241,23 @@ test("idle stays silent and wake explicitly requests catch-up from the saved cur
 test("the offline hint decoder projects only approved hints with the caller's scope", async t => {
   assert.equal(typeof decodeBoardFeedHint, "function", "the test-first board-feed hint decoder export is pending");
   const hello = { t: "hi", v: 1, seq: 0 };
-  const signal = { t: "signal", seq: 12, items: [{ seq: 11, kind: "ticket.ready", ticket: "fabricated-ticket" }] };
+  const item = { seq: 11, kind: "ticket.ready", ticket: "fabricated-ticket" };
+  const signal = { t: "signal", seq: 12, items: [item] };
   const overflow = { t: "signal", seq: 14, items: [], more: true };
+
+  function ignored(frame: unknown, state = createBoardFeedReplay(currentScope(), 10)) {
+    const scope = currentScope();
+    const original = structuredClone(frame);
+    const before = structuredClone(state);
+    const hint = decodeBoardFeedHint(frame, scope);
+    const result = hint === null ? { state, actions: [] } : stepBoardFeedReplay(state, hint);
+    assert.deepEqual(result.actions, []);
+    assert.deepEqual(result.state, before);
+    assert.equal(hint, null);
+    assert.deepEqual(scope, currentScope());
+    assert.deepEqual(state, before);
+    assert.deepEqual(frame, original);
+  }
 
   await t.test("v1 hello at zero and ordinary and overflow signals are tip hints", () => {
     const cases = [
@@ -279,9 +294,7 @@ test("the offline hint decoder projects only approved hints with the caller's sc
   });
 
   await t.test("unsupported, unsafe, and foreign frames produce no event or read", () => {
-    const scope = currentScope();
-    const state = createBoardFeedReplay(scope, 10);
-    const before = structuredClone(state);
+    const state = createBoardFeedReplay(currentScope(), 10);
     const invalidFrames: unknown[] = [
       null, "fabricated text frame", ["signal", 12],
       { kind: "signal", seq: 12 }, { t: 1, seq: 12 },
@@ -299,17 +312,71 @@ test("the offline hint decoder projects only approved hints with the caller's sc
         { ...frame, board: otherBoard.board }, { ...frame, session: retiredSession.session },
       );
     }
-    for (const frame of invalidFrames) {
-      const original = structuredClone(frame);
-      const hint = decodeBoardFeedHint(frame, scope);
-      assert.deepEqual(hint === null ? [] : stepBoardFeedReplay(state, hint).actions, []);
-      assert.equal(hint, null);
-      assert.deepEqual(scope, currentScope());
-      assert.deepEqual(state, before);
-      assert.deepEqual(frame, original);
-    }
-    const current = decodeBoardFeedHint(signal, scope);
+    for (const frame of invalidFrames) ignored(frame, state);
+    const current = decodeBoardFeedHint(signal, currentScope());
     assert.ok(current);
     readChanges(stepBoardFeedReplay(state, current), 10);
+  });
+
+  await t.test("complete internal events with any scope cannot enter through the hint decoder", () => {
+    const initial = createBoardFeedReplay(currentScope(), 10);
+    const pending = stepBoardFeedReplay(initial, { kind: "signal", scope: currentScope(), seq: 12 });
+    const read = readChanges(pending, 10);
+    const gap = stepBoardFeedReplay(pending.state, { kind: "changes-too-old", scope: currentScope(), requestId: read.requestId });
+    const snapshot = readSnapshot(gap);
+    for (const scope of [currentScope(), retiredSession, otherBoard]) {
+      const cases: { frame: Event; state: Replay }[] = [
+        { frame: { kind: "hi", scope, seq: 0 }, state: initial },
+        { frame: { kind: "signal", scope, seq: 12 }, state: initial },
+        { frame: { kind: "idle", scope }, state: initial },
+        { frame: { kind: "wake", scope }, state: initial },
+        { frame: { kind: "changes-applied", scope, requestId: read.requestId, next: 99, more: false }, state: pending.state },
+        { frame: { kind: "changes-too-old", scope, requestId: read.requestId }, state: pending.state },
+        { frame: { kind: "snapshot-applied", scope, requestId: snapshot.requestId, next: 99 }, state: gap.state },
+        { frame: { kind: "closed", scope, code: 4403 }, state: pending.state },
+        { frame: { kind: "closed", scope, code: 4404 }, state: gap.state },
+      ];
+      for (const { frame, state } of cases) ignored(frame, state);
+    }
+  });
+
+  await t.test("signal item and author metadata cannot replace the frame tip or caller scope", () => {
+    const state = createBoardFeedReplay(currentScope(), 10);
+    for (const metadata of [
+      { board: otherBoard.board }, { session: retiredSession.session },
+      { scope: otherBoard }, { scope: retiredSession },
+    ]) {
+      const foreignItem = { ...item, ...metadata };
+      ignored({ ...signal, items: [foreignItem] }, state);
+      ignored({ ...signal, items: [item, { ...foreignItem, seq: 12 }] }, state);
+      ignored({ ...signal, author: metadata }, state);
+      ignored({ ...overflow, author: metadata }, state);
+    }
+    ignored({ ...signal, items: [{ ...item, seq: 99 }] }, state);
+    ignored({ ...signal, items: [item, { ...item, seq: 99 }] }, state);
+
+    const hint = decodeBoardFeedHint(signal, currentScope());
+    assert.deepEqual(hint, { kind: "signal", seq: 12, scope: currentScope() });
+    assert.ok(hint);
+    readChanges(stepBoardFeedReplay(state, hint), 10);
+  });
+
+  await t.test("only the published ordinary signal and overflow shapes qualify", () => {
+    const state = createBoardFeedReplay(currentScope(), 10);
+    for (const frame of [
+      { t: "signal", seq: 12 },
+      { ...signal, items: null }, { ...signal, items: "fabricated" }, { ...signal, items: [] },
+      { ...signal, items: [null] }, { ...signal, items: [{ ...item, seq: "11" }] },
+      { ...signal, items: [{ ...item, kind: 1 }] }, { ...signal, items: [{ ...item, ticket: 1 }] },
+      { ...overflow, more: "true" }, { ...overflow, more: false }, { ...overflow, items: [item] },
+      { t: "signal", seq: 14, more: true },
+    ]) ignored(frame, state);
+
+    for (const frame of [{ ...signal, items: [{ ...item, ticket: null }] }, overflow]) {
+      const hint = decodeBoardFeedHint(frame, currentScope());
+      assert.deepEqual(hint, { kind: "signal", seq: frame.seq, scope: currentScope() });
+      assert.ok(hint);
+      readChanges(stepBoardFeedReplay(state, hint), 10);
+    }
   });
 });
