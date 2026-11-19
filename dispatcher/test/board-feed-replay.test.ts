@@ -15,12 +15,14 @@ type Event = { scope: Scope } & (
   | { kind: "snapshot-applied"; requestId: RequestId; next: number }
   | { kind: "closed"; code: 4403 | 4404 }
 );
+type Hint = Extract<Event, { kind: "hi" | "signal" }>;
 type Step = { state: Replay; actions: readonly Action[] };
 
 const modulePath = "../src/board-feed-replay.ts";
-const { createBoardFeedReplay, stepBoardFeedReplay }: {
+const { createBoardFeedReplay, stepBoardFeedReplay, decodeBoardFeedHint }: {
   createBoardFeedReplay(scope: Scope, handledCursor: number): Replay;
   stepBoardFeedReplay(state: Replay, event: Event): Step;
+  decodeBoardFeedHint(input: unknown, scope: Scope): Hint | null;
 } = await import(modulePath);
 
 const currentScope = (): Scope => ({ board: "fabricated-board-a", session: "fabricated-session-2" });
@@ -234,4 +236,80 @@ test("idle stays silent and wake explicitly requests catch-up from the saved cur
   assert.equal(caught.state.cursor, 11);
   unchanged(caught.state, { kind: "idle", scope: currentScope() });
   unchanged(caught.state, { kind: "idle", scope: currentScope() });
+});
+
+test("the offline hint decoder projects only approved hints with the caller's scope", async t => {
+  assert.equal(typeof decodeBoardFeedHint, "function", "the test-first board-feed hint decoder export is pending");
+  const hello = { t: "hi", v: 1, seq: 0 };
+  const signal = { t: "signal", seq: 12, items: [{ seq: 11, kind: "ticket.ready", ticket: "fabricated-ticket" }] };
+  const overflow = { t: "signal", seq: 14, items: [], more: true };
+
+  await t.test("v1 hello at zero and ordinary and overflow signals are tip hints", () => {
+    const cases = [
+      { frame: hello, kind: "hi", seq: 0, cursor: 0 },
+      { frame: signal, kind: "signal", seq: 12, cursor: 10 },
+      { frame: overflow, kind: "signal", seq: 14, cursor: 10 },
+      { frame: { ...signal, seq: Number.MAX_SAFE_INTEGER }, kind: "signal", seq: Number.MAX_SAFE_INTEGER, cursor: 10 },
+    ] as const;
+    for (const { frame, kind, seq, cursor } of cases) {
+      const scope = currentScope();
+      const before = structuredClone(frame);
+      const state = createBoardFeedReplay(scope, cursor);
+      const hint = decodeBoardFeedHint(frame, scope);
+      assert.deepEqual(hint, { kind, seq, scope: currentScope() });
+      assert.ok(hint);
+      const step = stepBoardFeedReplay(state, hint);
+      readChanges(step, cursor);
+      assert.equal(step.state.cursor, cursor);
+      assert.deepEqual(frame, before);
+      assert.deepEqual(scope, currentScope());
+    }
+  });
+
+  await t.test("the same frame takes the caller's generation and a retired hint cannot wake current replay", () => {
+    const state = createBoardFeedReplay(currentScope(), 10);
+    const retired = decodeBoardFeedHint(signal, retiredSession);
+    assert.deepEqual(retired, { kind: "signal", seq: 12, scope: retiredSession });
+    assert.ok(retired);
+    unchanged(state, retired);
+    const current = decodeBoardFeedHint(signal, currentScope());
+    assert.deepEqual(current, { kind: "signal", seq: 12, scope: currentScope() });
+    assert.ok(current);
+    readChanges(stepBoardFeedReplay(state, current), 10);
+  });
+
+  await t.test("unsupported, unsafe, and foreign frames produce no event or read", () => {
+    const scope = currentScope();
+    const state = createBoardFeedReplay(scope, 10);
+    const before = structuredClone(state);
+    const invalidFrames: unknown[] = [
+      null, "fabricated text frame", ["signal", 12],
+      { kind: "signal", seq: 12 }, { t: 1, seq: 12 },
+      { t: "seq", seq: 12 }, { t: "pong", seq: 12 },
+      { t: "closed", code: 4403, seq: 12 }, { t: "changes-applied", requestId: 1, next: 12, seq: 12 },
+      { t: "hi", seq: 12 }, { t: "hi", v: 2, seq: 12 }, { t: "hi", v: "1", seq: 12 },
+      { t: "hi", v: 1 }, { t: "signal" },
+    ];
+    for (const seq of ["12", -1, 10.5, NaN, Infinity, Number.MAX_SAFE_INTEGER + 1]) {
+      invalidFrames.push({ ...hello, seq }, { ...signal, seq });
+    }
+    for (const frame of [hello, signal, overflow]) {
+      invalidFrames.push(
+        { ...frame, scope: otherBoard }, { ...frame, scope: retiredSession },
+        { ...frame, board: otherBoard.board }, { ...frame, session: retiredSession.session },
+      );
+    }
+    for (const frame of invalidFrames) {
+      const original = structuredClone(frame);
+      const hint = decodeBoardFeedHint(frame, scope);
+      assert.deepEqual(hint === null ? [] : stepBoardFeedReplay(state, hint).actions, []);
+      assert.equal(hint, null);
+      assert.deepEqual(scope, currentScope());
+      assert.deepEqual(state, before);
+      assert.deepEqual(frame, original);
+    }
+    const current = decodeBoardFeedHint(signal, scope);
+    assert.ok(current);
+    readChanges(stepBoardFeedReplay(state, current), 10);
+  });
 });
