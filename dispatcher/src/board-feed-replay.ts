@@ -7,6 +7,7 @@ type Replay = Readonly<{
   cursor: number;
   announcedSequence: number;
   pending: PendingRead | null;
+  snapshotRequired: boolean;
   nextRequestId: number;
   terminal: Terminal | null;
 }>;
@@ -18,7 +19,7 @@ type Event = Readonly<{ scope: Scope } & (
   { kind: "hi" | "signal"; seq: number }
   | { kind: "idle" | "wake" }
   | { kind: "changes-applied"; requestId: ReplyId; next: number; more: boolean }
-  | { kind: "changes-too-old"; requestId: ReplyId }
+  | { kind: "changes-too-old" | "snapshot-read-failed"; requestId: ReplyId }
   | { kind: "snapshot-applied"; requestId: ReplyId; next: number }
   | { kind: "closed"; code: 4403 | 4404 }
 )>;
@@ -98,6 +99,7 @@ export function createBoardFeedReplay(scope: Scope, handledCursor: number): Repl
     cursor: handledCursor,
     announcedSequence: handledCursor,
     pending: null,
+    snapshotRequired: false,
     nextRequestId: 1,
     terminal: null,
   };
@@ -113,15 +115,15 @@ export function stepBoardFeedReplay(state: Replay, event: Event): Step {
     case "idle":
       return quiet(state);
     case "wake":
-      return pending ? quiet(state) : read(state, "read-changes");
+      return pending ? quiet(state) : read(state, state.snapshotRequired ? "read-snapshot" : "read-changes");
     case "hi":
     case "signal": {
       if (!sequence(event.seq)) return quiet(state);
-      const latest = pending?.kind === "read-snapshot" ? state.announcedSequence : Math.max(state.cursor, state.announcedSequence);
+      const latest = state.snapshotRequired ? state.announcedSequence : Math.max(state.cursor, state.announcedSequence);
       const newer = event.seq > latest;
       if (event.kind === "signal" && !newer) return quiet(state);
       const announced = newer ? { ...state, announcedSequence: event.seq } : state;
-      return pending ? quiet(announced) : read(announced, "read-changes");
+      return pending || state.snapshotRequired ? quiet(announced) : read(announced, "read-changes");
     }
     case "changes-applied": {
       if (pending?.kind !== "read-changes" || pending.requestId !== event.requestId
@@ -132,12 +134,15 @@ export function stepBoardFeedReplay(state: Replay, event: Event): Step {
     }
     case "changes-too-old":
       return pending?.kind === "read-changes" && pending.requestId === event.requestId
-        ? read({ ...state, announcedSequence: 0 }, "read-snapshot") : quiet(state);
+        ? read({ ...state, pending: null, announcedSequence: 0, snapshotRequired: true }, "read-snapshot") : quiet(state);
+    case "snapshot-read-failed":
+      return pending?.kind === "read-snapshot" && pending.requestId === event.requestId
+        ? quiet({ ...state, pending: null }) : quiet(state);
     case "snapshot-applied":
       if (pending?.kind !== "read-snapshot" || pending.requestId !== event.requestId || !sequence(event.next)) return quiet(state);
       // A board restored from backup can have a lower latest sequence.
-      return read({ ...state, cursor: event.next, pending: null }, "read-changes");
+      return read({ ...state, cursor: event.next, pending: null, snapshotRequired: false }, "read-changes");
     case "closed":
-      return quiet({ ...state, pending: null, terminal: event.code === 4403 ? "connection-ended" : "board-deleted" });
+      return quiet({ ...state, pending: null, snapshotRequired: false, terminal: event.code === 4403 ? "connection-ended" : "board-deleted" });
   }
 }
