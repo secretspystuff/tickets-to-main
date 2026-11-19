@@ -2,6 +2,7 @@ import { lstatSync, realpathSync, rmdirSync } from "node:fs";
 import { isAbsolute, resolve, sep } from "node:path";
 import { StateError, assertPrivateAccess, ensurePrivateDirectory } from "./fs-safety.ts";
 import { loadLedger, updateLedger, type Ledger } from "./ledger.ts";
+import { observeRecordedPid } from "./process-identity.ts";
 
 function nested(parent: string, child: string): boolean {
   const root = parent.endsWith(sep) ? parent : parent + sep;
@@ -19,15 +20,12 @@ function requireInstalled(stateDir: string): Ledger {
   return loaded.ledger;
 }
 
-/** True when the process exists. EPERM still means it exists. */
 export function processAlive(pid: number): boolean {
-  if (!Number.isInteger(pid) || pid <= 0) return false;
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch (error) {
-    return (error as NodeJS.ErrnoException).code === "EPERM";
+  const observation = observeRecordedPid(pid);
+  if (observation === "unavailable" || observation === "none") {
+    throw new StateError("The recorded writer could not be checked. Its workspace was preserved.");
   }
+  return observation === "present";
 }
 
 function separateDirectory(stateDir: string, workspace: string): string {

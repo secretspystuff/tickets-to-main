@@ -3,6 +3,23 @@ import { spawnSync } from "node:child_process";
 import { win32 } from "node:path";
 
 export type ProcessOwner = { pid: number; birth?: string };
+export type PidObservation = "none" | "present" | "absent" | "unavailable";
+
+export function observeRecordedPid(pid: number | null, pidAlive?: (pid: number) => boolean): PidObservation {
+  if (pid === null) return "none";
+  if (!Number.isSafeInteger(pid) || pid <= 0) return "unavailable";
+  try {
+    if (pidAlive) return pidAlive(pid) ? "present" : "absent";
+    process.kill(pid, 0);
+    return "present";
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException | null)?.code;
+    if (code === "EPERM") return "present";
+    if (code === "ESRCH") return "absent";
+    return "unavailable";
+  }
+}
+
 export const validProcessBirth = (value: unknown): value is string => typeof value === "string"
   && (/^linux:[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}:[1-9][0-9]*$/.test(value) || /^win32:[1-9][0-9]{15,19}$/.test(value)
     || (value.startsWith("darwin:") && macStart(value.slice(7)) !== null));

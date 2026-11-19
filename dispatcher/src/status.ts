@@ -4,6 +4,7 @@ import { loadLedger, type Ledger, type ToolRecord } from "./ledger.ts";
 import { osWords } from "./platform.ts";
 import { PACKAGE_VERSION, PRODUCT_LINE } from "./version.ts";
 import { confirmHello } from "./coordination.ts";
+import { observeRecordedPid, type PidObservation } from "./process-identity.ts";
 
 export const CODEX_INTERFACE_RULE = "Codex cli and Codex app-server are separate interfaces.";
 
@@ -28,22 +29,6 @@ function keychainLine(kind: string, signedIn: boolean, approved: boolean): strin
   if (kind === "secret-tool") return "Keychain: secret-tool, unqualified";
   if (kind === "windows-credential-manager") return "Keychain: Windows Credential Manager, unqualified";
   return "Keychain: unavailable";
-}
-
-type PidObservation = "none" | "present" | "absent" | "unavailable";
-
-function observeRecordedPid(pid: number | null, pidAlive?: (pid: number) => boolean): PidObservation {
-  if (pid === null) return "none";
-  try {
-    if (pidAlive) return pidAlive(pid) ? "present" : "absent";
-    process.kill(pid, 0);
-    return "present";
-  } catch (error) {
-    const code = (error as NodeJS.ErrnoException | null)?.code;
-    if (code === "EPERM") return "present";
-    if (code === "ESRCH") return "absent";
-    return "unavailable";
-  }
 }
 
 export async function statusOf(stateDir: string, custody: Custody, pidAlive?: (pid: number) => boolean): Promise<StatusSnapshot> {
