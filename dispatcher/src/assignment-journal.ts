@@ -1,8 +1,5 @@
 import { createHash } from "node:crypto";
-import { closeSync, constants, fsyncSync, fstatSync, lstatSync, openSync, readFileSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
-import { assertPrivateAccess, assertPrivateDirectory } from "./fs-safety.ts";
-import { withStateLease } from "./state-lease.ts";
+import { withPrivateJournal } from "./private-journal.ts";
 import { currentProcessOwner, validProcessBirth, type ProcessOwner } from "./process-identity.ts";
 
 export type Intent = {
@@ -14,7 +11,6 @@ type Result = { kind: "result"; id: string; sequence: number; requestDigest: str
 type Started = { kind: "started"; id: string; sequence: number; requestDigest: string; at: number };
 type Entry = { intent: Intent; started: boolean; result: Result | null };
 export const journalDigest = (value: string): string => createHash("sha256").update(value).digest("hex");
-const MAX_BYTES = 8 * 1024 * 1024;
 const opaque = (value: unknown) => typeof value === "string" && /^[a-f0-9]{32}$/.test(value);
 const digest = (value: unknown) => typeof value === "string" && /^[a-f0-9]{64}$/.test(value);
 const integer = (value: unknown, min: number) => Number.isSafeInteger(value) && (value as number) >= min;
@@ -67,43 +63,7 @@ function records(text: string): Map<string, Entry> {
 }
 
 function transact<T>(stateDir: string, operation: (entries: Map<string, Entry>, append: (value: Intent | Started | Result) => void) => T): T {
-  assertPrivateDirectory(stateDir);
-  return withStateLease(stateDir, "ledger", () => {
-    const path = join(stateDir, "assignment-intents.jsonl");
-    let exists = true;
-    try {
-      const info = lstatSync(path);
-      if (!info.isFile() || info.isSymbolicLink() || info.nlink !== 1 || info.size > MAX_BYTES) throw unavailable();
-      assertPrivateAccess(path);
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
-      exists = false;
-    }
-    const fd = openSync(path, constants.O_RDWR | constants.O_APPEND | (exists ? 0 : constants.O_CREAT | constants.O_EXCL) | (constants.O_NOFOLLOW ?? 0), 0o600);
-    try {
-      const actual = fstatSync(fd);
-      const listed = lstatSync(path);
-      if (!actual.isFile() || listed.isSymbolicLink() || actual.ino !== listed.ino || actual.dev !== listed.dev
-        || actual.nlink !== 1 || actual.size > MAX_BYTES) throw unavailable();
-      assertPrivateAccess(path);
-      const text = readFileSync(fd, "utf8");
-      const entries = records(text);
-      // A previous process may have died after writing bytes but before their flush completed.
-      fsyncSync(fd);
-      if (!exists && process.platform !== "win32") {
-        const directory = openSync(stateDir, "r");
-        try { fsyncSync(directory); } finally { closeSync(directory); }
-      }
-      let length = Buffer.byteLength(text);
-      return operation(entries, (record) => {
-        const bytes = JSON.stringify(record) + "\n";
-        length += Buffer.byteLength(bytes);
-        if (length > MAX_BYTES) throw unavailable();
-        writeFileSync(fd, bytes);
-        fsyncSync(fd);
-      });
-    } finally { closeSync(fd); }
-  });
+  return withPrivateJournal(stateDir, "assignment-intents.jsonl", records, operation);
 }
 
 function matching(left: Intent, right: Intent): boolean {
