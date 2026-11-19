@@ -1,13 +1,14 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import { once } from "node:events";
-import { existsSync, readFileSync, readdirSync } from "node:fs";
+import { existsSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { test } from "node:test";
 import { loadLedger, saveLedger, updateLedger } from "../src/ledger.ts";
 import { recoverInstall } from "../src/install.ts";
-import { withStateLease } from "../src/state-lease.ts";
-import { removeDir, tempDir } from "./helpers.ts";
+import { withStateLease, stateLeaseStatus } from "../src/state-lease.ts";
+import { processBirth } from "../src/process-identity.ts";
+import { differentBirth, removeDir, tempDir } from "./helpers.ts";
 import { assertNonInstallState, installFixture, nonInstallState, seedRetainedLedger, snapshot } from "./release-test-fixtures.ts";
 
 const ledgerModule = new URL("../src/ledger.ts", import.meta.url).href;
@@ -59,6 +60,37 @@ const barrier = `
   const wait = () => readSync(0, Buffer.alloc(1), 0, 1, null);
   const say = (value) => process.stdout.write(value + String.fromCharCode(10));
 `;
+
+test("a reused live PID cannot hold a crashed owner's lease; matching and unknown ownership stay held", async (t) => {
+  const dir = tempDir();
+  try {
+    const crashed = child(`import { withStateLease } from ${JSON.stringify(leaseModule)};
+      withStateLease(process.argv[1], 'release', () => process.exit(73));`, [dir]);
+    t.after(() => { if (crashed.process.exitCode === null) crashed.process.kill(); });
+    await crashed.done(73);
+    const file = join(dir, ".state-leases", "release", "epoch-0", "owner.json");
+    const original = readFileSync(file, "utf8");
+    const owner = JSON.parse(original);
+    const birth = processBirth(process.pid);
+    assert.ok(birth, "the native probe must obtain a real process start identity");
+    writeFileSync(file, JSON.stringify({ ...owner, version: 2, pid: process.pid, birth }));
+    const held = snapshot(dir);
+    assert.equal(stateLeaseStatus(dir, "release"), "active");
+    assert.throws(() => withStateLease(dir, "release", () => assert.fail("live owner bypassed")));
+    assert.deepEqual(snapshot(dir), held);
+    const { birth: _birth, ...legacyOwner } = owner;
+    writeFileSync(file, JSON.stringify({ ...legacyOwner, version: 1, pid: process.pid }));
+    assert.equal(stateLeaseStatus(dir, "release"), "active", "legacy live PID has no proof of a different incarnation");
+    writeFileSync(file, JSON.stringify({ ...owner, version: 2, pid: process.pid, birth: differentBirth(birth) }));
+    const stale = readFileSync(file);
+    assert.equal(stateLeaseStatus(dir, "release"), "dead");
+    let entered = false;
+    withStateLease(dir, "release", () => { entered = true; });
+    assert.equal(entered, true);
+    assert.deepEqual(readFileSync(file), stale, "old epoch must remain immutable");
+    assert.equal(stateLeaseStatus(dir, "release"), "released");
+  } finally { removeDir(dir); }
+});
 
 test("stale saveLedger refuses rather than overwriting any newer supported record field", () => {
   const dir = tempDir();

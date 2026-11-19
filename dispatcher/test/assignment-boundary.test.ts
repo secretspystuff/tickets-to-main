@@ -2,12 +2,16 @@ import assert from "node:assert/strict";
 import { test, type TestContext } from "node:test";
 import fs, { mkdtempSync, mkdirSync, readFileSync, writeFileSync, chmodSync, rmSync, symlinkSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, sep } from "node:path";
 import { spawn, spawnSync } from "node:child_process";
 import { syncBuiltinESMExports } from "node:module";
 import { createHash } from "node:crypto";
 import { fileURLToPath } from "node:url";
 import { runAssignment, type AssignmentRequest, type CurrentAssignment, type AssignmentTerminal } from "../src/assignment-boundary.ts";
+import { processBirth } from "../src/process-identity.ts";
+import { assignmentDirectory } from "../src/directory-identity.ts";
+import { ensurePrivateDirectory } from "../src/fs-safety.ts";
+import { differentBirth, fileSymlink } from "./helpers.ts";
 
 const id = (n: number) => n.toString(16).padStart(32, "0");
 function canonical(value: unknown): string {
@@ -22,6 +26,7 @@ function fixture(t: TestContext) {
   const stateDir = join(root, "state");
   const workspace = join(root, "workspace");
   mkdirSync(stateDir, { mode: 0o700 }); mkdirSync(workspace);
+  if (process.platform === "win32") ensurePrivateDirectory(root);
   const request: AssignmentRequest = {
     version: 1, id: id(1), sequence: 1, operation: "native.assign", input: "Fabricated task data",
     binding: { board: id(2), repo: id(3), activation: id(4), connection: id(5), job: id(6), claim: id(7), requirements: id(8), candidate: id(9), policy: id(10), fence: 1 },
@@ -35,16 +40,18 @@ function fixture(t: TestContext) {
   let observe = () => structuredClone(current);
   let kind = "fabricated-harness";
   let secrets = ["fabricated-held-secret"];
+  let directory = assignmentDirectory;
   const terminal = (): AssignmentTerminal => ({ id: request.id, sequence: request.sequence, result: "completed", writersContained: true });
   const run = (raw = JSON.stringify(request)) => runAssignment({
     stateDir, raw, secrets, now: () => now,
     adapter: { kind: kind as "fabricated-harness", readCurrent: async () => { reads++; return observe(); }, execute: (value) => effects(value), reconcile: () => reconcile() },
-  });
+  }, directory);
   return { root, stateDir, workspace, request, current, calls, run, terminal,
     get reads() { return reads; },
     set now(value: number) { now = value; },
     set kind(value: string) { kind = value; },
     set secrets(value: string[]) { secrets = value; },
+    set directory(value: typeof directory) { directory = value; },
     set effects(value: typeof effects) { effects = value; },
     set reconcile(value: typeof reconcile) { reconcile = value; },
     set observe(value: typeof observe) { observe = value; },
@@ -77,7 +84,7 @@ test("flush intent before dispatch; persist only identifiers and digests, never 
     assert.equal(intent.kind, "intent");
     assert.equal(intent.id, f.request.id);
     assert.equal(intent.sequence, 1);
-    assert.equal(intent.version, 2);
+    assert.equal(intent.version, 4);
     assert.equal(started.kind, "started");
     assert.equal(started.id, intent.id);
     assert.equal(started.requestDigest, intent.requestDigest);
@@ -292,6 +299,9 @@ test("legacy intents without a start marker remain uncertain; legacy terminal re
   assert.equal((await f.run()).state, "completed");
   const [intent, , result] = f.journal().trim().split("\n").map((line) => JSON.parse(line));
   delete intent.version;
+  delete intent.birth;
+  delete intent.aliasDigest;
+  intent.workspaceDigest = createHash("sha256").update(f.workspace).digest("hex");
   const legacy = JSON.stringify(intent) + "\n";
   const path = join(f.stateDir, "assignment-intents.jsonl");
   writeFileSync(path, legacy + JSON.stringify(result) + "\n");
@@ -304,12 +314,168 @@ test("legacy intents without a start marker remain uncertain; legacy terminal re
   assert.equal(f.calls.length, 1);
 });
 
+test("unresolved legacy path hashes hold a new scope even when Windows path spelling may differ", async (t) => {
+  for (const version of [undefined, 2]) {
+    const f = fixture(t);
+    await f.run();
+    const [intent] = f.journal().trim().split("\n").map((line) => JSON.parse(line));
+    delete intent.birth;
+    delete intent.aliasDigest;
+    if (version === undefined) delete intent.version; else intent.version = version;
+    intent.workspaceDigest = createHash("sha256").update("C:\\OLD~1\\MiXeD").digest("hex");
+    const old = JSON.stringify(intent) + "\n";
+    writeFileSync(join(f.stateDir, "assignment-intents.jsonl"), old);
+    f.request.id = id(11); f.request.binding.connection = id(12); f.current.binding = structuredClone(f.request.binding);
+    assert.equal((await f.run()).state, "held");
+    assert.equal(f.journal(), old);
+    assert.equal(f.calls.length, 1);
+  }
+});
+
+test("old version-2 preparations and started results retain exact replay and recovery", async (t) => {
+  for (const phase of ["prepared", "started", "terminal"]) {
+    const f = fixture(t);
+    await f.run();
+    const [intent, started, result] = f.journal().trim().split("\n").map((line) => JSON.parse(line));
+    intent.version = 2; delete intent.birth; delete intent.aliasDigest;
+    intent.workspaceDigest = createHash("sha256").update(f.workspace).digest("hex");
+    const rows = phase === "prepared" ? [intent] : phase === "started" ? [intent, started] : [intent, started, result];
+    writeFileSync(join(f.stateDir, "assignment-intents.jsonl"), rows.map((row) => JSON.stringify(row)).join("\n") + "\n");
+    f.reconcile = async () => f.terminal();
+    assert.equal((await f.run()).state, phase === "prepared" ? "not-started" : "completed");
+    f.request.id = id(11); f.request.sequence = 2; f.current.nextSequence = 2;
+    assert.equal((await f.run()).state, "completed");
+    assert.equal(f.calls.length, 2);
+  }
+});
+
+test("reused PID retires a preparation but only reconciles a started intent", async (t) => {
+  for (const started of [false, true]) {
+    const f = fixture(t);
+    const child = spawnSync(process.execPath, [fileURLToPath(new URL("./assignment-crash-fixture.ts", import.meta.url)), f.stateDir, JSON.stringify(f.request), JSON.stringify(f.current)], { encoding: "utf8" });
+    assert.equal(child.status, 73, child.stderr);
+    const rows = f.journal().trim().split("\n").map((line) => JSON.parse(line));
+    const birth = processBirth(process.pid);
+    assert.ok(birth);
+    rows[0].pid = process.pid; rows[0].birth = differentBirth(birth);
+    if (!started) rows.pop();
+    writeFileSync(join(f.stateDir, "assignment-intents.jsonl"), rows.map((row) => JSON.stringify(row)).join("\n") + "\n");
+    let observations = 0;
+    f.reconcile = async () => { observations++; return f.terminal(); };
+    assert.equal((await f.run()).state, started ? "completed" : "not-started");
+    assert.equal(observations, started ? 1 : 0);
+    assert.equal(f.calls.length, 0);
+    f.request.id = id(11); f.request.sequence = 2; f.current.nextSequence = 2;
+    assert.equal((await f.run()).state, "completed");
+    assert.equal((await f.run()).state, "completed");
+    assert.equal(f.calls.length, 1);
+  }
+});
+
+test("a same-path reclone blocks the next request until the started request reconciles", async (t) => {
+  const f = fixture(t);
+  const first = JSON.stringify(f.request);
+  const terminal = f.terminal();
+  f.effects = async (value) => { f.calls.push(value); throw new Error("controller lost after dispatch"); };
+  assert.equal((await f.run()).state, "held");
+  const before = f.journal();
+  const old = assignmentDirectory(f.workspace).identity;
+  const retired = join(f.root, "retired"); fs.renameSync(f.workspace, retired);
+  mkdirSync(f.workspace); rmSync(retired, { recursive: true });
+  assert.notEqual(assignmentDirectory(f.workspace).identity, old);
+  f.request.id = id(11); f.request.sequence = 2; f.current.nextSequence = 2;
+  assert.equal((await f.run()).state, "held");
+  assert.equal(f.journal(), before);
+  assert.equal(f.calls.length, 1);
+  f.current.nextSequence = 1;
+  let reconciles = 0;
+  f.reconcile = async () => { reconciles++; return terminal; };
+  assert.equal((await f.run(first)).state, "completed");
+  assert.equal(reconciles, 1);
+  assert.equal(f.calls.length, 1);
+  f.current.nextSequence = 2;
+  f.effects = async (value) => { f.calls.push(value); return f.terminal(); };
+  assert.equal((await f.run()).state, "completed");
+  assert.equal(f.calls.length, 2);
+});
+
+test("a version-3 known request reconciles after its original physical workspace disappeared", async (t) => {
+  const f = fixture(t);
+  f.effects = async (value) => { f.calls.push(value); throw new Error("uncertain"); };
+  await f.run();
+  const rows = f.journal().trim().split("\n").map((line) => JSON.parse(line));
+  rows[0].version = 3; rows[0].workspaceDigest = rows[0].aliasDigest; delete rows[0].aliasDigest;
+  writeFileSync(join(f.stateDir, "assignment-intents.jsonl"), rows.map((row) => JSON.stringify(row)).join("\n") + "\n");
+  const retired = join(f.root, "retired"); fs.renameSync(f.workspace, retired);
+  mkdirSync(f.workspace); rmSync(retired, { recursive: true });
+  let reconciles = 0;
+  f.reconcile = async () => { reconciles++; return f.terminal(); };
+  assert.equal((await f.run()).state, "completed");
+  assert.equal(reconciles, 1);
+  assert.equal(f.calls.length, 1);
+});
+
+test("runAssignment excludes two workspace spellings during dispatch and across unresolved intents", async (t) => {
+  const f = fixture(t);
+  const reader: typeof assignmentDirectory = (path) => {
+    const value = assignmentDirectory(path);
+    return path.endsWith(sep) ? { ...value, path: value.path + sep } : value;
+  };
+  f.directory = reader;
+  const next = structuredClone(f.request); next.id = id(11); next.binding.connection = id(12);
+  const nextCurrent = { ...structuredClone(f.current), confirmedWorkspace: f.workspace + sep, binding: next.binding };
+  let secondary = 0;
+  const other = () => runAssignment({ stateDir: f.stateDir, raw: JSON.stringify(next), secrets: [], now: () => 1000,
+    adapter: { kind: "fabricated-harness", readCurrent: async () => nextCurrent,
+      execute: async () => { secondary++; return { id: next.id, sequence: 1, result: "completed", writersContained: true }; }, reconcile: async () => null } }, reader);
+  let release!: () => void; let ready!: () => void;
+  const entered = new Promise<void>((resolve) => { ready = resolve; });
+  const wait = new Promise<void>((resolve) => { release = resolve; });
+  f.effects = async (value) => { f.calls.push(value); ready(); await wait; throw new Error("uncertain"); };
+  const first = f.run(); await entered;
+  try { assert.equal((await other()).state, "held"); }
+  finally { release(); }
+  assert.equal((await first).state, "held");
+  const before = f.journal();
+  assert.equal((await other()).state, "held");
+  assert.equal(f.journal(), before);
+  assert.equal(secondary, 0);
+  assert.equal(f.calls.length, 1);
+});
+
+test("foreign live PID needs a matching birth before it can retain a preparation", async (t) => {
+  for (const match of ["wrong", "right", "missing"]) {
+    const f = fixture(t);
+    const child = spawn(process.execPath, ["-e", "process.stdout.write('ready');process.stdin.resume()"], { stdio: ["pipe", "pipe", "pipe"] });
+    const exited = new Promise((resolve) => child.once("exit", resolve));
+    t.after(() => { if (child.exitCode === null) child.kill(); });
+    await new Promise<void>((resolve) => child.stdout.once("data", () => resolve()));
+    f.effects = async () => { throw new Error("uncertain"); };
+    await f.run();
+    const [intent] = f.journal().trim().split("\n").map((line) => JSON.parse(line));
+    intent.pid = child.pid;
+    const birth = processBirth(child.pid!); assert.ok(birth);
+    if (match === "missing") delete intent.birth;
+    else intent.birth = match === "right" ? birth : differentBirth(birth);
+    const before = JSON.stringify(intent) + "\n";
+    writeFileSync(join(f.stateDir, "assignment-intents.jsonl"), before);
+    f.effects = async (value) => { f.calls.push(value); return f.terminal(); };
+    let reconciles = 0;
+    f.reconcile = async () => { reconciles++; return f.terminal(); };
+    assert.equal((await f.run()).state, match === "wrong" ? "not-started" : "held");
+    assert.equal(f.calls.length, 0);
+    assert.equal(reconciles, 0);
+    if (match !== "wrong") assert.equal(f.journal(), before);
+    child.stdin.end(); await exited;
+  }
+});
+
 test("ambiguous start history and contradictory terminals preserve bytes and hold", async (t) => {
   const f = fixture(t);
   await f.run();
   const [intent, started, result] = f.journal().trim().split("\n").map((line) => JSON.parse(line));
   for (const rows of [
-    [{ ...intent, version: 3 }], [intent, result], [started],
+    [{ ...intent, version: 5 }], [{ ...intent, birth: "invalid" }], [intent, result], [started],
     [intent, { ...started, id: id(99) }], [intent, { ...started, sequence: 2 }],
     [intent, { ...started, requestDigest: "a".repeat(64) }], [intent, { ...started, extra: true }],
     [intent, started, started], [intent, { ...result, outcome: "not-started" }, started],
@@ -413,8 +579,14 @@ test("a controller paused after reading an empty journal cannot overwrite a comp
   const marker = join(f.root, "effects");
   const release = join(f.root, "release");
   const child = spawn(process.execPath, [fileURLToPath(new URL("./assignment-race-fixture.ts", import.meta.url)), f.stateDir, JSON.stringify(f.request), JSON.stringify(f.current), marker, release], { stdio: ["ignore", "pipe", "pipe"] });
+  let errors = ""; child.stderr.on("data", (data: Buffer) => { errors += data.toString(); });
+  t.after(() => { if (child.exitCode === null) child.kill(); });
   const done = new Promise<number | null>((resolve, reject) => { child.once("exit", resolve); child.once("error", reject); });
-  await new Promise<void>((resolve) => child.stdout.once("data", () => resolve()));
+  await new Promise<void>((resolve, reject) => {
+    child.stdout.once("data", () => resolve());
+    child.once("exit", (code) => reject(new Error(`Race fixture exited before its barrier: ${code}: ${errors}`)));
+    child.once("error", reject);
+  });
   const other = spawnSync(process.execPath, [fileURLToPath(new URL("./assignment-crash-fixture.ts", import.meta.url)), f.stateDir, JSON.stringify(f.request), JSON.stringify(f.current)], { encoding: "utf8" });
   writeFileSync(release, "go");
   const firstCode = await done;
@@ -505,7 +677,7 @@ test("symlinked workspace and journal never redirect writes or effects", async (
   assert.equal((await f.run()).state, "held");
   f.current.confirmedWorkspace = f.workspace;
   const sentinel = join(f.root, "sentinel"); writeFileSync(sentinel, "", { mode: 0o600 });
-  symlinkSync(sentinel, join(f.stateDir, "assignment-intents.jsonl"));
+  fileSymlink(sentinel, join(f.stateDir, "assignment-intents.jsonl"));
   assert.equal((await f.run()).state, "held");
   assert.equal(readFileSync(sentinel, "utf8"), "");
   assert.equal(f.calls.length, 0);

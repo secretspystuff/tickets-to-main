@@ -5,6 +5,7 @@ import { join } from "node:path";
 import { install, type InstallInput, type ReleaseManifest, type ReleaseServices } from "../src/install.ts";
 import { emptyLedger, loadLedger, saveLedger, type Ledger } from "../src/ledger.ts";
 import type { CheckAttemptRecord } from "../src/check-attempt.ts";
+import { windowsPrivacy } from "../src/windows-privacy.ts";
 
 export const NOW = "2026-11-07T12:00:00.000Z";
 export const REPOSITORY = "https://github.com/fabricated-owner/tickets-to-main";
@@ -59,10 +60,11 @@ export function fixture(stateDir: string, version = "0.2.0") {
 export function snapshot(root: string): unknown {
   const listed = lstatSync(root);
   if (listed.isSymbolicLink()) return { link: readlinkSync(root) };
+  const privacy = process.platform === "win32" ? { acl: windowsPrivacy(root, "snapshot") } : { mode: listed.mode & 0o777 };
   if (listed.isDirectory()) {
-    return { mode: listed.mode & 0o777, entries: Object.fromEntries(readdirSync(root).sort().map((name) => [name, snapshot(join(root, name))])) };
+    return { ...privacy, entries: Object.fromEntries(readdirSync(root).sort().map((name) => [name, snapshot(join(root, name))])) };
   }
-  return { mode: listed.mode & 0o777, size: listed.size, digest: digest(readFileSync(root)) };
+  return { ...privacy, size: listed.size, digest: digest(readFileSync(root)) };
 }
 
 export function active(stateDir: string) {

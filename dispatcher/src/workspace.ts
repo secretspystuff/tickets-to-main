@@ -1,6 +1,6 @@
 import { lstatSync, realpathSync, rmdirSync } from "node:fs";
 import { isAbsolute, resolve, sep } from "node:path";
-import { StateError, ensurePrivateDirectory } from "./fs-safety.ts";
+import { StateError, assertPrivateAccess, ensurePrivateDirectory } from "./fs-safety.ts";
 import { loadLedger, updateLedger, type Ledger } from "./ledger.ts";
 
 function nested(parent: string, child: string): boolean {
@@ -68,7 +68,7 @@ function assertCurrentWorkspace(stateDir: string, path: string): void {
   if (listed.isSymbolicLink() || !listed.isDirectory()) {
     throw new StateError("The workspace is a link. The writer was not recorded.");
   }
-  if ((listed.mode & 0o077) !== 0) throw new StateError("The workspace is not private. The writer was not recorded.");
+  assertPrivateAccess(path);
   const stateReal = realpathSync(stateDir);
   const workspaceReal = realpathSync(path);
   if (nested(stateReal, workspaceReal) || nested(workspaceReal, stateReal)) {

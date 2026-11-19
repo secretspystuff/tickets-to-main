@@ -630,7 +630,7 @@ test("an actual check subprocess and supported installer preserve each other's l
     process.send({ kind: "finished", state: result.state, publishable: result.publishable }, () => process.disconnect());
   `;
   const child = spawn(process.execPath, ["--experimental-strip-types", "--input-type=module", "-e", childProgram], {
-    cwd: root, env: { PATH: process.env.PATH ?? "" }, stdio: ["pipe", "ignore", "ignore", "ipc"],
+    cwd: root, env: { PATH: process.env.PATH ?? "", SystemRoot: process.env.SystemRoot ?? "" }, stdio: ["pipe", "ignore", "ignore", "ipc"],
   });
   let enter!: () => void;
   const entered = new Promise<void>((resolve) => { enter = resolve; });

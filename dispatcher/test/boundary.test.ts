@@ -34,7 +34,7 @@ test("the public surface imports no private app code and opens no network stack"
     assert.equal(text.includes("tp_"), false, path);
   }
   const processUsers = combined.filter((path) => readFileSync(path, "utf8").includes("node:child_process"));
-  assert.deepEqual(processUsers.map((path) => basename(path)).sort(), ["command.ts", "custody.ts", "native-transport.ts"]);
+  assert.deepEqual(processUsers.map((path) => basename(path)).sort(), ["command.ts", "custody.ts", "native-transport.ts", "process-identity.ts", "windows-privacy-worker.ts", "windows-privacy.ts"]);
   const outside = combined.flatMap((path) => {
     const text = readFileSync(path, "utf8");
     return [...text.matchAll(/from "([^"]+)"/g)].map((match) => match[1] ?? "").filter((spec) => /src\/lib\/|workers\//.test(spec))

@@ -1,3 +1,4 @@
+import { fileURLToPath } from "node:url";
 import assert from "node:assert/strict";
 import { readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
@@ -50,13 +51,13 @@ test("a failed board-key write preserves the exact device code and pending conne
   try {
     const context = harnessIo({ custody });
     assert.equal(await run(["install", "--state", stateDir], context), 0);
-    assert.equal(await run(["connect", "start", "--state", stateDir, "--computer", "fixture-computer", "--fixture", FIXTURE.pathname], context), 0);
-    assert.equal(await run(["connect", "poll", "--state", stateDir, "--fixture", FIXTURE.pathname], context), 0);
+    assert.equal(await run(["connect", "start", "--state", stateDir, "--computer", "fixture-computer", "--fixture", fileURLToPath(FIXTURE)], context), 0);
+    assert.equal(await run(["connect", "poll", "--state", stateDir, "--fixture", fileURLToPath(FIXTURE)], context), 0);
     const originalPending = pending(stateDir);
     const originalDevice = await custody.get(DEVICE_CODE_ACCOUNT);
     assert.ok(originalDevice);
     context.now = () => Date.parse("2026-10-25T00:00:06.000Z");
-    assert.equal(await run(["connect", "poll", "--state", stateDir, "--fixture", FIXTURE.pathname], context), 1);
+    assert.equal(await run(["connect", "poll", "--state", stateDir, "--fixture", fileURLToPath(FIXTURE)], context), 1);
     assert.deepEqual(identity(pending(stateDir)), identity(originalPending));
     assert.equal(await custody.get(DEVICE_CODE_ACCOUNT), originalDevice);
     assert.equal(await custody.get(BOARD_KEY_ACCOUNT), null);

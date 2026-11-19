@@ -1,6 +1,6 @@
 import { closeSync, fsyncSync, lstatSync, openSync, readFileSync } from "node:fs";
 import { createHash } from "node:crypto";
-import { resolve } from "node:path";
+import { isAbsolute, resolve } from "node:path";
 import { withStateLease } from "./state-lease.ts";
 import { join } from "node:path";
 import { KEY_MARK, unfold } from "./secret-text.ts";
@@ -143,7 +143,7 @@ function isWorkspace(value: unknown): value is WorkspaceRecord {
   const row = value as Record<string, unknown>;
   const pid = row.writerPid === null || (typeof row.writerPid === "number" && Number.isInteger(row.writerPid) && row.writerPid > 0);
   return typeof row.path === "string"
-    && row.path.startsWith("/")
+    && isAbsolute(row.path)
     && row.path.length <= 4096
     && pid
     && row.qualified === false;

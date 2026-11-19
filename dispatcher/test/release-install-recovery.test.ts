@@ -7,7 +7,7 @@ import { test } from "node:test";
 import { fileURLToPath } from "node:url";
 import { install, recoverInstall } from "../src/install.ts";
 import { loadLedger } from "../src/ledger.ts";
-import { removeDir, tempDir } from "./helpers.ts";
+import { fileSymlink, removeDir, tempDir } from "./helpers.ts";
 import { active, activeDirectory, assertNonInstallState, digest, FILES, fixture, installFixture, nonInstallState, rejectedUnchanged, seedRetainedLedger, snapshot } from "./release-test-fixtures.ts";
 
 test("selecting an explicit version preserves all existing connection, tool and workspace fields", () => {
@@ -100,18 +100,18 @@ for (const target of ["state-root", "release-root", "selected-directory", "selec
     writeFileSync(join(outside, "keep.txt"), "preserve external bytes", { mode: 0o600 });
     try {
       const sample = fixture(dir);
-      if (target === "state-root") { symlinkSync(outside, join(parent, "linked-state")); sample.input.stateDir = join(parent, "linked-state"); }
-      if (target === "release-root") symlinkSync(outside, join(dir, "releases"));
-      if (target === "ledger") symlinkSync(join(outside, "keep.txt"), join(dir, "ledger.json"));
+      if (target === "state-root") { symlinkSync(outside, join(parent, "linked-state"), "junction"); sample.input.stateDir = join(parent, "linked-state"); }
+      if (target === "release-root") symlinkSync(outside, join(dir, "releases"), "junction");
+      if (target === "ledger") fileSymlink(join(outside, "keep.txt"), join(dir, "ledger.json"));
       if (target === "selected-directory" || target === "selected-file") {
         install(sample.signed(), sample.services);
         if (target === "selected-directory") {
           renameSync(activeDirectory(dir), join(dir, "retained-release"));
-          symlinkSync(outside, activeDirectory(dir));
+          symlinkSync(outside, activeDirectory(dir), "junction");
         } else {
           const path = join(activeDirectory(dir), FILES[0]!.path);
           unlinkSync(path);
-          symlinkSync(join(outside, "keep.txt"), path);
+          fileSymlink(join(outside, "keep.txt"), path);
         }
       }
       const outsideBefore = snapshot(outside);
@@ -209,7 +209,7 @@ test("recovery preserves unrelated files and never follows an unknown staging sy
   try {
     const sample = installFixture(dir);
     writeFileSync(join(dir, "releases", "person-file.txt"), "preserve");
-    symlinkSync(outside, join(dir, "releases", ".stage-person-owned"));
+    symlinkSync(outside, join(dir, "releases", ".stage-person-owned"), "junction");
     writeFileSync(join(outside, "keep.txt"), "preserve");
     const before = snapshot(dir);
     const external = snapshot(outside);
