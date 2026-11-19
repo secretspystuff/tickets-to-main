@@ -5,7 +5,7 @@ import { join } from "node:path";
 import { test } from "node:test";
 import { run } from "../src/cli.ts";
 import { SecretToolCustody, type SecretToolRunner, BOARD_KEY_ACCOUNT } from "../src/custody.ts";
-import { parseLedger } from "../src/ledger.ts";
+import { parseLedger, type ToolRecord } from "../src/ledger.ts";
 import { assertPrivateMode, harnessIo, io, removeDir, tempDir } from "./helpers.ts";
 
 const FIXTURE = new URL("../fixtures/device-login.json", import.meta.url);
@@ -192,12 +192,11 @@ test("a workspace stays outside the state directory and admits one live writer",
     const status = io({ pidAlive: (pid) => alive.has(pid) });
     await run(["status", "--state", dir], status);
     assert.match(status.out, /Workspace: prepared, unqualified/);
-    assert.match(status.out, /Writer: running/);
     assert.match(status.out, /Ready for an assignment: no/);
     alive.delete(40);
     const stopped = io({ pidAlive: () => false });
     await run(["status", "--state", dir], stopped);
-    assert.match(stopped.out, /Writer: stopped/);
+    const statusAfterRootDisappeared = stopped.out;
     const replaced = await run(["workspace", "claim", "--state", dir, "--pid", "41"], stopped);
     assert.equal(replaced, 0, stopped.err);
     stopped.out = "";
@@ -210,10 +209,97 @@ test("a workspace stays outside the state directory and admits one live writer",
     assert.equal(kept.workspace.path, realpathSync(workspace));
     assert.equal(kept.workspace.writerPid, null);
     assert.equal(kept.workspace.qualified, false);
+    assert.match(status.out, /^Writer: unknown \(including helpers\)$/m);
+    assert.match(status.out, /^Recorded writer PID: present \(process identity unverified\)$/m);
+    assert.match(statusAfterRootDisappeared, /^Writer: unknown \(including helpers\)$/m);
+    assert.match(statusAfterRootDisappeared, /^Recorded writer PID: absent$/m);
   } finally {
     removeDir(dir);
     removeDir(workspace);
     removeDir(scratch);
+  }
+});
+
+test("status and health report the recorded PID separately from writer custody", async t => {
+  const dir = tempDir();
+  const workspace = tempDir();
+  const ledgerPath = join(dir, "ledger.json");
+  const writerPid = 42017;
+  try {
+    const setup = io();
+    assert.equal(await run(["install", "--state", dir], setup), 0, setup.err);
+    const installed = JSON.parse(readFileSync(ledgerPath, "utf8"));
+
+    await t.test("no prepared workspace", async probe => {
+      const observe = probe.mock.method(process, "kill", () => true);
+      for (const command of ["status", "health"]) {
+        const context = io();
+        assert.equal(await run([command, "--state", dir], context), 0, context.err);
+        assert.match(context.out, /^Workspace: none$/m);
+        assert.match(context.out, /^Writer: none$/m);
+      }
+      assert.equal(observe.mock.callCount(), 0);
+    });
+
+    const documentedCli = {
+      vendor: "codex", interfaceId: "cli", qualification: "documented", experimental: "unknown",
+      version: null, limit: "fabricated documented interface",
+    } satisfies ToolRecord;
+    const cases = [
+      { name: "no recorded PID", pid: null, error: null, observation: "none" },
+      { name: "observed PID", pid: writerPid, error: null, observation: "present (process identity unverified)" },
+      { name: "permission denied", pid: writerPid, error: "EPERM", observation: "present (process identity unverified)" },
+      { name: "absent PID", pid: writerPid, error: "ESRCH", observation: "absent" },
+      { name: "failed observation", pid: writerPid, error: "EIO", observation: "unavailable" },
+    ] as const;
+
+    for (const entry of cases) {
+      await t.test(entry.name, async probe => {
+        const bytes = Buffer.from(JSON.stringify({
+          ...installed,
+          tools: [documentedCli],
+          workspace: { path: workspace, writerPid: entry.pid, qualified: false },
+        }) + "\n");
+        writeFileSync(ledgerPath, bytes);
+        const stateEntries = readdirSync(dir);
+        const calls: [pid: number, signal: unknown][] = [];
+        probe.mock.method(process, "kill", (pid: number, signal: unknown) => {
+          calls.push([pid, signal]);
+          if (entry.error) throw Object.assign(new Error("fabricated process diagnostic"), { code: entry.error });
+          return true;
+        });
+        const lines: string[][] = [];
+        for (const command of ["status", "health"]) {
+          const context = io();
+          assert.equal(await run([command, "--state", dir], context), 0, context.err);
+          assert.equal(context.err, "");
+          lines.push(context.out.trimEnd().split("\n"));
+        }
+        assert.deepEqual(calls, entry.pid === null ? [] : [[entry.pid, 0], [entry.pid, 0]]);
+        assert.deepEqual(readFileSync(ledgerPath), bytes);
+        assert.deepEqual(readdirSync(dir), stateEntries);
+        assert.deepEqual(readdirSync(workspace), []);
+        assert.deepEqual(lines[0], lines[1]);
+        for (const output of lines) {
+          assert.ok(output.includes("Installed: yes"));
+          assert.ok(output.includes("Signed in: no"));
+          assert.ok(output.includes("Codex cli: documented"));
+          assert.ok(output.includes("Codex app-server: undiscovered"));
+          assert.ok(output.includes("Compatible: no"));
+          assert.ok(output.includes("Ready for an assignment: no"));
+          assert.ok(output.includes("Workspace: prepared, unqualified"));
+          assert.ok(output.includes("Health: local record ok"));
+          assert.ok(output.every(line => !line.includes("fabricated process diagnostic")));
+          assert.deepEqual(output.filter(line => line.startsWith("Writer:") || line.startsWith("Recorded writer PID:")), [
+            "Writer: unknown (including helpers)",
+            `Recorded writer PID: ${entry.observation}`,
+          ]);
+        }
+      });
+    }
+  } finally {
+    removeDir(dir);
+    removeDir(workspace);
   }
 });
 
