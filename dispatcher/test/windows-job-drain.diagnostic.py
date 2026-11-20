@@ -104,6 +104,11 @@ def command(role, fixture, owner):
 
 
 def open_root(job, fixture):
+    return open_job_process(job, command("parent", fixture, os.getpid()), fixture / "workspace",
+                            {"SystemRoot": os.environ["SystemRoot"]})
+
+
+def open_job_process(job, argv, cwd, environment):
     size = c.c_size_t()
     result = init_attributes(None, 1, 0, c.byref(size))
     if result or c.get_last_error() != 122 or size.value == 0:
@@ -118,11 +123,11 @@ def open_root(job, fixture):
         startup.info.cb = c.sizeof(startup)
         startup.attributes = c.addressof(attributes)
         info = ProcessInfo()
-        args = c.create_unicode_buffer(subprocess.list2cmdline(command("parent", fixture, os.getpid())))
-        environment = c.create_unicode_buffer("SystemRoot=" + os.environ["SystemRoot"] + "\0\0")
+        args = c.create_unicode_buffer(subprocess.list2cmdline(argv))
+        env_block = c.create_unicode_buffer("\0".join(f"{key}={value}" for key, value in environment.items()) + "\0\0")
         flags = EXTENDED_STARTUPINFO_PRESENT | CREATE_UNICODE_ENVIRONMENT | subprocess.DETACHED_PROCESS
-        check_os(create_process(sys.executable, args, None, None, False, flags, environment,
-                                str(fixture / "workspace"), c.byref(startup.info), c.byref(info)),
+        check_os(create_process(argv[0], args, None, None, False, flags, env_block,
+                                str(cwd), c.byref(startup.info), c.byref(info)),
                  "CreateProcessW with job list")
         close(info.thread)
         return info
