@@ -96,8 +96,9 @@ export async function runCodexCliAssignment(
     if (msg.type === "thread.started") {
       const id = msg.thread_id;
       if (state.threadId !== null || !opaqueId(id) || id === prompt) { invalid(); return; }
-      // Short input can match part of a serialized native UUID by chance.
-      if (safeNativeText(id, secrets, CLI_THREAD_UUID.test(id) ? undefined : prompt) !== id) { invalid(); return; }
+      // One input character can match part of a serialized native UUID by chance.
+      const promptToRedact = prompt.length === 1 && CLI_THREAD_UUID.test(id) ? undefined : prompt;
+      if (safeNativeText(id, secrets, promptToRedact) !== id) { invalid(); return; }
       state.threadId = id;
     } else if (msg.type === "turn.started") {
       if (state.threadId === null || started) { invalid(); return; }

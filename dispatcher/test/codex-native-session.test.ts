@@ -561,11 +561,12 @@ test("CLI root thread metadata excludes fabricated assignment and held values", 
     { name: "root metadata equals the assignment", input: REQUEST.prompt, id: REQUEST.prompt, hidden: REQUEST.prompt },
     { name: "root metadata embeds the assignment", input: REQUEST.prompt, id: `fixture-${REQUEST.prompt}-end`, hidden: REQUEST.prompt },
     { name: "UUID-shaped assignment echoed verbatim", input: pinnedId, id: pinnedId, hidden: pinnedId },
+    { name: "canonical UUID embeds the entire assignment", input: pinnedId.slice(0, 13), id: pinnedId, hidden: pinnedId.slice(0, 13) },
     { name: "root metadata embeds a held value", input: REQUEST.prompt, id: `fixture-${held}`, hidden: held },
     { name: "root metadata contains a credential shape", input: REQUEST.prompt, id: credential, hidden: credential },
     { name: "exact pinned ID and valid root result", input: REQUEST.prompt, id: pinnedId, hidden: null },
     { name: "a restored canonical ID and valid root result", input: REQUEST.prompt, id: restoredId, hidden: null },
-    { name: "short input can occur by chance in a genuine pinned ID", input: "f", id: pinnedId, hidden: null },
+    { name: "one input character can occur by chance in a genuine pinned ID", input: "f", id: pinnedId, hidden: null },
   ];
   for (const { name, input, id, hidden } of cases) {
     await t.test(name, async () => {
