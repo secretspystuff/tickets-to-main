@@ -304,7 +304,8 @@ function announcement(status: Awaited<ReturnType<typeof statusOf>>): unknown {
 }
 
 for (const [installed, offered, newer] of [
-  ["1.9.0", "1.10.0", true], ["1.10.1", "1.9.9", false], ["1.3.0", "1.3.0", false],
+  ["1.9.0", "1.10.0", true], ["1.10.1", "1.9.9", false], ["1.3.0", "1.3.1", true],
+  ["1.3.1", "1.3.0", false], ["1.3.0", "1.3.0", false],
   ["1.3.0+original", "1.3.0+foreign", false], ["1.3.0-rc.2", "1.3.0-rc.10", true],
   ["1.3.0-1", "1.3.0-beta", true], ["1.3.0-alpha", "1.3.0-alpha.1", true],
   ["1.3.0-release-B", "1.3.0-release-a", true], ["1.3.0", "1.3.0-rc.1", false],
@@ -333,7 +334,7 @@ for (const [installed, offered, newer] of [
 
 for (const problem of [
   "invalid signature", "untrusted signing key", "revoked signing key", "wrong repository", "wrong workflow", "wrong tag",
-  "wrong source commit", "absent source commit", "wrong version", "wrong platform", "wrong architecture", "incompatible state",
+  "wrong source commit", "absent source commit", "wrong version", "absent version", "wrong platform", "wrong architecture", "incompatible state",
 ] as const) {
   test(`supplied release announcement omits ${problem} without changing a verified selection`, async () => {
     const dir = tempDir();
@@ -351,6 +352,7 @@ for (const problem of [
       if (problem === "wrong source commit") offeredRelease.sourceCommit = "e".repeat(40);
       if (problem === "absent source commit") Reflect.deleteProperty(offeredRelease, "sourceCommit");
       if (problem === "wrong version") offeredRelease.requestedVersion = "1.3.1";
+      if (problem === "absent version") Reflect.deleteProperty(offeredRelease, "requestedVersion");
       if (problem === "wrong platform") offeredRelease = suppliedMetadata(supplied, { platform: "darwin" });
       if (problem === "wrong architecture") offeredRelease = suppliedMetadata(supplied, { arch: "arm64" });
       if (problem === "incompatible state") offeredRelease = suppliedMetadata(supplied, { dataCompatibility: { min: 2, max: 2 } });
