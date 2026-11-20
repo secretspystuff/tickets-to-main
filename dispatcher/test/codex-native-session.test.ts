@@ -552,7 +552,8 @@ test("CLI parses native events incrementally and rejects fake result, failed and
 });
 
 test("CLI root thread metadata excludes fabricated assignment and held values", async t => {
-  const pinnedId = "f913b8de-08c5-4bd2-a1ea-4cdb6b84470c";
+  const pinnedId = "0194b797-f913-7ba1-a1ea-4cdb6b84470c";
+  const restoredId = "f913b8de-08c5-4bd2-a1ea-4cdb6b84470c";
   const held = "fabricated-held-thread-value";
   const credential = `tp_${"s".repeat(24)}`;
   const tail = CLI_RESULT.trimEnd().split("\n").slice(1).map(line => JSON.parse(line));
@@ -563,6 +564,7 @@ test("CLI root thread metadata excludes fabricated assignment and held values", 
     { name: "root metadata embeds a held value", input: REQUEST.prompt, id: `fixture-${held}`, hidden: held },
     { name: "root metadata contains a credential shape", input: REQUEST.prompt, id: credential, hidden: credential },
     { name: "exact pinned ID and valid root result", input: REQUEST.prompt, id: pinnedId, hidden: null },
+    { name: "a restored canonical ID and valid root result", input: REQUEST.prompt, id: restoredId, hidden: null },
     { name: "short input can occur by chance in a genuine pinned ID", input: "f", id: pinnedId, hidden: null },
   ];
   for (const { name, input, id, hidden } of cases) {

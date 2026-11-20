@@ -17,6 +17,7 @@ export const CODEX_INTERFACE_RULE = "Codex cli and Codex app-server are separate
 export type CodexInterfaceId = typeof CODEX_CLI | typeof CODEX_APP_SERVER;
 
 const VERSION = /\bcodex-cli (\d+\.\d+\.\d+(?:[-+][A-Za-z0-9.]+)?)/;
+const CLI_THREAD_UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
 
 export function documentedCodexClaim(interfaceId: CodexInterfaceId, extra?: { experimental?: true | "unknown"; qualification?: "documented" | "unavailable" | "unknown" }): InterfaceClaim {
   const qualification = extra?.qualification ?? "documented";
@@ -93,8 +94,11 @@ export async function runCodexCliAssignment(
     const msg = record(value);
     if (!msg || typeof msg.type !== "string") { invalid(); return; }
     if (msg.type === "thread.started") {
-      if (state.threadId !== null || !opaqueId(msg.thread_id) || safeNativeText(msg.thread_id, secrets) !== msg.thread_id) { invalid(); return; }
-      state.threadId = msg.thread_id;
+      const id = msg.thread_id;
+      if (state.threadId !== null || !opaqueId(id) || id === prompt) { invalid(); return; }
+      // Short input can match part of a serialized native UUID by chance.
+      if (safeNativeText(id, secrets, CLI_THREAD_UUID.test(id) ? undefined : prompt) !== id) { invalid(); return; }
+      state.threadId = id;
     } else if (msg.type === "turn.started") {
       if (state.threadId === null || started) { invalid(); return; }
       started = true;
