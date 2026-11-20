@@ -10,7 +10,7 @@ import { install } from "../src/install.ts";
 import { parseLedger, updateLedger } from "../src/ledger.ts";
 import type { OriginalGroup, WindowsOwnedNativeProcess } from "../src/native-transport.ts";
 import { currentProcessOwner } from "../src/process-identity.ts";
-import { stateLeaseStatus } from "../src/state-lease.ts";
+import { stateLeaseStatus, withStateLease } from "../src/state-lease.ts";
 import * as workspace from "../src/workspace.ts";
 import { io, removeDir, tempDir } from "./helpers.ts";
 
@@ -88,6 +88,57 @@ function delayedObservation(t: TestContext) {
   return { started, answer, observe: { observeOriginalGroup() { observing(); return sample; } } };
 }
 
+function traceRelease(f: Sandbox, sampled: () => number, onReaderLeaseReleased?: () => void) {
+  const epochs = () => readdirSync(f.leaseRoot).filter(name => /^epoch-[0-9]+$/.test(name)
+    && existsSync(join(f.leaseRoot, name, "owner.json")) && !existsSync(join(f.leaseRoot, name, "released")));
+  const events: { action: "read journal" | "replace ledger"; epochs: string[]; samples: number }[] = [];
+  const journalDescriptors = new Set<number>(), readerReleaseMarkers = new Set<string>();
+  const { openSync: originalOpen, readFileSync: originalRead, closeSync: originalClose, renameSync: originalRename } = fs;
+  let reading = true, replaced = false, contended = false;
+  fs.openSync = (path, flags, mode) => {
+    const fd = originalOpen(path, flags, mode);
+    if (path === f.journal) journalDescriptors.add(fd);
+    return fd;
+  };
+  fs.readFileSync = ((path: fs.PathOrFileDescriptor, options: unknown) => {
+    const bytes = Reflect.apply(originalRead, fs, [path, options]);
+    if (reading && (path === f.journal || (typeof path === "number" && journalDescriptors.has(path)))) {
+      const owners = epochs(), samples = sampled();
+      events.push({ action: "read journal", epochs: owners, samples });
+      if (samples === 1 && owners.length === 1) readerReleaseMarkers.add(join(f.leaseRoot, owners[0]!, "released"));
+    }
+    return bytes;
+  }) as typeof fs.readFileSync;
+  fs.closeSync = fd => {
+    originalClose(fd);
+    journalDescriptors.delete(fd);
+  };
+  fs.renameSync = (source, destination) => {
+    originalRename(source, destination);
+    if (destination === f.ledger) {
+      events.push({ action: "replace ledger", epochs: epochs(), samples: sampled() });
+      replaced = true;
+    }
+    if (onReaderLeaseReleased && !replaced && !contended && typeof destination === "string" && readerReleaseMarkers.has(destination)) {
+      contended = true;
+      reading = false;
+      try { onReaderLeaseReleased(); }
+      finally { reading = true; }
+    }
+  };
+  syncBuiltinESMExports();
+  return {
+    events, stopReads() { reading = false; },
+    restore() {
+      fs.openSync = originalOpen;
+      fs.readFileSync = originalRead;
+      fs.closeSync = originalClose;
+      fs.renameSync = originalRename;
+      syncBuiltinESMExports();
+    },
+  };
+}
+
 test("legacy workspace release keeps its existing CLI contract", async t => {
   const f = sandbox(t);
   const console = io({ pidAlive: () => true });
@@ -109,36 +160,11 @@ for (const outcome of ["completed", "failed"] as const) {
     } }, outcome);
     assert.equal(samples, 0, "binding cannot use a pre-launch sample for later release");
     const before = f.snapshot();
-    const epochs = () => readdirSync(f.leaseRoot).filter(name => /^epoch-[0-9]+$/.test(name)
-      && existsSync(join(f.leaseRoot, name, "owner.json")) && !existsSync(join(f.leaseRoot, name, "released")));
-    const trace: { action: "read journal" | "replace ledger"; epochs: string[]; samples: number }[] = [];
-    const journalDescriptors = new Set<number>();
-    const { openSync: originalOpen, readFileSync: originalRead, closeSync: originalClose, renameSync: originalRename } = fs;
-    let tracing = true;
-    fs.openSync = (path, flags, mode) => {
-      const fd = originalOpen(path, flags, mode);
-      if (path === f.journal) journalDescriptors.add(fd);
-      return fd;
-    };
-    fs.readFileSync = ((path: fs.PathOrFileDescriptor, options: unknown) => {
-      const bytes = Reflect.apply(originalRead, fs, [path, options]);
-      if (tracing && (path === f.journal || (typeof path === "number" && journalDescriptors.has(path)))) {
-        trace.push({ action: "read journal", epochs: epochs(), samples });
-      }
-      return bytes;
-    }) as typeof fs.readFileSync;
-    fs.closeSync = fd => {
-      originalClose(fd);
-      journalDescriptors.delete(fd);
-    };
-    fs.renameSync = (source, destination) => {
-      if (destination === f.ledger) trace.push({ action: "replace ledger", epochs: epochs(), samples });
-      originalRename(source, destination);
-    };
-    syncBuiltinESMExports();
+    const observed = traceRelease(f, () => samples);
+    const trace = observed.events;
     try {
       assert.deepEqual(await port.release(authority), released);
-      tracing = false;
+      observed.stopReads();
       assert.equal(samples, 1);
       assert.deepEqual(parseLedger(readFileSync(f.ledger, "utf8"))?.workspace, { ...f.legacy, writerPid: null });
       assert.deepEqual(f.snapshot().journal, before.journal);
@@ -159,14 +185,57 @@ for (const outcome of ["completed", "failed"] as const) {
       assert.deepEqual(f.snapshot(), after);
       assert.equal(trace.filter(event => event.action === "replace ledger").length, 1);
     } finally {
-      fs.openSync = originalOpen;
-      fs.readFileSync = originalRead;
-      fs.closeSync = originalClose;
-      fs.renameSync = originalRename;
-      syncBuiltinESMExports();
+      observed.restore();
     }
   });
 }
+
+function startContender(f: Sandbox) {
+  const contender = f.newIntent(2);
+  f.prepare(contender);
+  startAssignment(f.state, contender, 1003);
+  return f.snapshot();
+}
+
+test("the lease-gap fixture starts a competing intent when the journal reader releases first", t => {
+  const f = sandbox(t);
+  const initial = f.newIntent(1);
+  f.prepare(initial);
+  startAssignment(f.state, initial, 1001);
+  completeAssignment(f.state, initial, "completed", 1002);
+  const before = f.snapshot();
+  let contender: ReturnType<Sandbox["snapshot"]> | undefined;
+  const observed = traceRelease(f, () => 1, () => { contender = startContender(f); });
+  try {
+    withStateLease(f.state, "ledger", () => { readFileSync(f.journal); });
+    assert.ok(contender, "the callback must enter after the first reader releases");
+    assert.notDeepEqual(contender.journal, before.journal);
+    assert.deepEqual(contender.ledger, before.ledger);
+    assert.deepEqual(f.snapshot(), contender);
+  } finally { observed.restore(); }
+});
+
+test("owned release holds if another assignment starts between the post-observation read and clear", async t => {
+  const port = ownedRelease(), f = sandbox(t);
+  let samples = 0;
+  const authority = bind(f, port, { observeOriginalGroup: async () => { samples++; return zero; } });
+  const before = f.snapshot();
+  let contender: ReturnType<Sandbox["snapshot"]> | undefined;
+  const observed = traceRelease(f, () => samples, () => { contender = startContender(f); });
+  try {
+    const result = await port.release(authority);
+    observed.stopReads();
+    if (contender) {
+      assert.deepEqual(result, held);
+      assert.deepEqual(f.snapshot(), contender);
+      assert.equal(observed.events.filter(event => event.action === "replace ledger").length, 0);
+    } else {
+      assert.deepEqual(result, released);
+      assert.deepEqual(f.snapshot().journal, before.journal);
+      assert.equal(observed.events.filter(event => event.action === "replace ledger").length, 1);
+    }
+  } finally { observed.restore(); }
+});
 
 const failure = new Error("fabricated native observation failed");
 const refusalSamples: Record<string, OriginalObserver["observeOriginalGroup"]> = {
