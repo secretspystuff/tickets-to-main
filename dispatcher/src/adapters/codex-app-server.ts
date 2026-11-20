@@ -8,6 +8,7 @@ export const CODEX_APP_SERVER_SCHEMA_VERSION = "0.163.0";
 
 export type CodexAppServerLaunch = { executable: string; version: string };
 export type CodexAppServerObservation = NativeObservation & {
+  appServerTerminalLineage: { vendor: "codex"; interfaceId: "app-server"; threadId: string; turnId: string } | null;
   appServerModelEvidence: {
     beforeTurn: { model: string | null; reasoningEffort: string | null } | null;
     reroute: { fromModel: string; toModel: string; reason: "highRiskCyberActivity" } | null;
@@ -51,6 +52,7 @@ export function startCodexAppServerAssignment(
   let initializationSent = false;
   let stage: "initialize" | "thread" | "turn" | "active" = "initialize";
   let terminalObserved = false;
+  let terminalLineage: CodexAppServerObservation["appServerTerminalLineage"] = null;
   let interruptSent = false;
   const pending = new Set<number>();
   const helpers = new Map<string, string>();
@@ -59,6 +61,7 @@ export function startCodexAppServerAssignment(
     const { beforeTurn, reroute } = modelEvidence;
     return {
       ...copyObservation(state),
+      appServerTerminalLineage: terminalLineage && { ...terminalLineage },
       appServerModelEvidence: {
         beforeTurn: beforeTurn && { ...beforeTurn },
         reroute: reroute && { ...reroute },
@@ -74,7 +77,11 @@ export function startCodexAppServerAssignment(
   function outcome(value: NativeOutcome, reason: string | null): void {
     state.outcome = value;
     state.reason = reason;
-    if (value !== "completed") { delete state.observed.assignment; delete state.observed.streamResult; }
+    if (value !== "completed") {
+      terminalLineage = null;
+      delete state.observed.assignment;
+      delete state.observed.streamResult;
+    }
     boundary();
   }
   function invalid(): void {
@@ -180,7 +187,7 @@ export function startCodexAppServerAssignment(
       item(params, method === "item/completed");
     } else if (method === "turn/completed") {
       const turn = record(params?.turn);
-      if (!params || params.threadId !== state.threadId || !turn || turn.id !== state.turnId || state.turnId === null
+      if (!params || state.threadId === null || params.threadId !== state.threadId || !turn || turn.id !== state.turnId || state.turnId === null
         || !Array.isArray(turn.items) || !["completed", "interrupted", "failed"].includes(String(turn.status))) { invalid(); return; }
       if (state.outcome === "completed" || state.outcome === "failed" || state.outcome === "interrupted") { invalid(); return; }
       // A native turn can finish while the assignment stays held.
@@ -188,6 +195,7 @@ export function startCodexAppServerAssignment(
       if (turn.status === "completed" && state.resultText !== null && state.outcome !== "held") {
         state.observed.assignment = "supported";
         state.observed.streamResult = "supported";
+        terminalLineage = { vendor: "codex", interfaceId: "app-server", threadId: state.threadId, turnId: state.turnId };
         outcome("completed", null);
       } else if (turn.status === "failed" || turn.status === "interrupted") {
         outcome(turn.status, turn.status === "failed" ? "The native tool reported a failed turn." : "The native tool reported an interrupted turn.");
