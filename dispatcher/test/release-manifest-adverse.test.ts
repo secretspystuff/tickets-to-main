@@ -1,9 +1,11 @@
 import assert from "node:assert/strict";
 import { generateKeyPairSync, sign } from "node:crypto";
-import { existsSync, mkdirSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { test } from "node:test";
 import { install } from "../src/install.ts";
+import { loadLedger, saveLedger } from "../src/ledger.ts";
+import { releaseDirectory, SIGNATURE_FILE } from "../src/release-manifest.ts";
 import { statusOf } from "../src/status.ts";
 import { io, removeDir, tempDir } from "./helpers.ts";
 import { run } from "../src/cli.ts";
@@ -207,22 +209,37 @@ test("status verifies the exact selected release with separate fixture trust", a
   } finally { removeDir(dir); }
 });
 
-for (const problem of ["missing trust", "revoked trust", "changed content", "missing content", "wrong architecture"] as const) {
+for (const problem of [
+  "missing trust", "revoked trust", "invalid signature", "changed content", "missing content",
+  "wrong platform", "wrong architecture", "wrong version",
+] as const) {
   test("selected release preflight refuses " + problem + " without changing state", async () => {
     const dir = tempDir();
     try {
       const sample = installFixture(dir);
       const trust = sample.services.releaseTrust!;
       const artifact = join(activeDirectory(dir), FILES[0]!.path);
-      if (problem === "changed content") {
-        const bytes = readFileSync(artifact);
+      if (problem === "invalid signature" || problem === "changed content") {
+        const path = problem === "invalid signature" ? join(activeDirectory(dir), SIGNATURE_FILE) : artifact;
+        const bytes = readFileSync(path);
         bytes[0] = bytes[0]! ^ 1;
-        writeFileSync(artifact, bytes);
+        writeFileSync(path, bytes);
       }
       if (problem === "missing content") unlinkSync(artifact);
+      if (problem === "wrong version") {
+        const loaded = loadLedger(dir);
+        assert.ok(loaded.ok && loaded.ledger.install?.release);
+        const record = loaded.ledger.install;
+        const selected = record.release!;
+        const oldDirectory = selected.directory;
+        record.packageVersion = "0.4.2";
+        selected.directory = releaseDirectory(record.packageVersion, selected.manifestDigest);
+        renameSync(join(dir, oldDirectory), join(dir, selected.directory));
+        saveLedger(dir, loaded.ledger, []);
+      }
       const before = snapshot(dir);
       const status = await statusOf(dir, io().custody!, undefined, {
-        platform: sample.input.platform,
+        platform: problem === "wrong platform" ? "darwin" : sample.input.platform,
         arch: problem === "wrong architecture" ? "arm64" : sample.input.arch,
         trust: problem === "missing trust" ? undefined : problem === "revoked trust" ? {
           ...trust, revokedKeyIds: [sample.manifest.keyId],
