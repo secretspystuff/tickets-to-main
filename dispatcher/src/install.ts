@@ -6,7 +6,7 @@ import { stateLeaseStatus } from "./state-lease.ts";
 import { PACKAGE_VERSION } from "./version.ts";
 import {
   releaseDirectory, releaseError, releaseVersion, sha256, verifiedArtifacts, verifyManifest,
-  type ReleaseManifest, type ReleaseRequest, type ReleaseServices,
+  type ReleaseManifest, type ReleaseRequest, type ReleaseServices, type ReleaseTrust,
 } from "./release-manifest.ts";
 import {
   assertReleaseRoot, exists, publishRelease, readReleaseMetadata,
@@ -48,17 +48,21 @@ function result(ledger: Ledger): InstallResult {
   };
 }
 
-function selectedRelease(input: InstallInput, ledger: Ledger, services: ReleaseServices): void {
+export type VerifiedSelectedRelease = { version: string; manifestDigest: string; sourceCommit: string };
+
+export function verifySelectedRelease(input: Pick<InstallInput, "stateDir" | "platform" | "arch">, ledger: Ledger,
+  trust: ReleaseTrust | undefined): VerifiedSelectedRelease | undefined {
   const selected = ledger.install?.release;
   if (!selected || !ledger.install) return;
   const directory = join(input.stateDir, selected.directory);
   const { manifestBytes, signatureBytes } = readReleaseMetadata(directory);
   if (sha256(manifestBytes) !== selected.manifestDigest || selected.directory !== releaseDirectory(ledger.install.packageVersion, selected.manifestDigest)
     || ledger.install.platform !== osLabel(input.platform) || ledger.install.arch !== input.arch) throw releaseError();
-  const manifest = verifyManifest(manifestBytes, signatureBytes, services.releaseTrust, {
+  const manifest = verifyManifest(manifestBytes, signatureBytes, trust, {
     version: ledger.install.packageVersion, platform: input.platform, arch: input.arch, dataVersion: ledger.version,
   });
   verifyReleaseTree(directory, manifest, manifestBytes, signatureBytes);
+  return { version: manifest.version, manifestDigest: selected.manifestDigest, sourceCommit: manifest.provenance.sourceCommit };
 }
 
 function sameSelection(a: Ledger, b: Ledger): boolean {
@@ -95,7 +99,7 @@ function installPrepared(input: InstallInput, services: ReleaseServices): Instal
   const relative = releaseDirectory(manifest.version, manifestDigest);
   const destination = join(input.stateDir, relative);
   assertReleaseRoot(input.stateDir);
-  selectedRelease(input, ledger, services);
+  verifySelectedRelease(input, ledger, services.releaseTrust);
   if (ledger.install?.packageVersion === manifest.version && ledger.install.release?.manifestDigest !== undefined
     && ledger.install.release.manifestDigest !== manifestDigest) throw releaseError();
   if (ledger.install?.release?.manifestDigest === manifestDigest) return result(ledger);
@@ -116,7 +120,7 @@ function installPrepared(input: InstallInput, services: ReleaseServices): Instal
   return withReleaseLock(input.stateDir, false, () => {
     const initial = localLedger(input.stateDir);
     if (!sameSelection(initial, ledger)) throw releaseError();
-    selectedRelease(input, initial, services);
+    verifySelectedRelease(input, initial, services.releaseTrust);
     let directory = destination;
     if (!exists(destination)) {
       const stage = stageRelease(input.stateDir, manifest, manifestBytes, signatureBytes, artifacts, services);
@@ -169,7 +173,7 @@ function recoverableStages(input: InstallInput, ledger: Ledger, services: Releas
 function recoverPrepared(input: InstallInput, services: ReleaseServices): InstallResult {
   assertReleaseRoot(input.stateDir);
   const before = localLedger(input.stateDir);
-  selectedRelease(input, before, services);
+  verifySelectedRelease(input, before, services.releaseTrust);
   const stages = recoverableStages(input, before, services);
   const lease = stateLeaseStatus(input.stateDir, "release");
   if (lease === "active") throw releaseError();
@@ -178,7 +182,7 @@ function recoverPrepared(input: InstallInput, services: ReleaseServices): Instal
     assertReleaseRoot(input.stateDir);
     const ledger = localLedger(input.stateDir);
     if (!sameSelection(before, ledger)) throw releaseError();
-    selectedRelease(input, ledger, services);
+    verifySelectedRelease(input, ledger, services.releaseTrust);
     for (const stage of recoverableStages(input, ledger, services)) cleanupOwnedStage(input.stateDir, stage, services);
     return result(ledger);
   });
