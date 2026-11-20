@@ -23,7 +23,8 @@ import { removeDir } from "./helpers.ts";
 type PeerMode = "complete" | "other completion" | "private identity" | "wrong workspace" | "invalid initialize" | "wrong turn" | "wrong thread" | "interrupt"
   | "missing turn reply" | "rejected turn reply" | "foreign turn reply" | "matching late reply" | "abnormal exit";
 type Scenario = Exclude<PeerMode, "private identity"> | "refused preparation" | "refused activation" | "observer closed before release"
-  | "cached original zero" | "echoed identity" | "embedded identity" | "held identity" | "foreign callbacks" | "public pipe rewrite";
+  | "cached original zero" | "echoed identity" | "embedded identity" | "held identity" | "foreign callbacks" | "public pipe rewrite"
+  | "prestarted turn";
 type PredecessorTerminal = "exact" | "missing" | "absent reader" | "unmarked" | "unmarked observer wrapper" | (() => CodexAssignmentHandle);
 const executable = realpathSync(process.execPath);
 const peer = fileURLToPath(new URL("./owned-app-server-peer.fixture.mjs", import.meta.url));
@@ -148,7 +149,7 @@ function fixture(t: TestContext, scenario: Scenario, predecessor: PredecessorTer
       let peerMode: PeerMode;
       if (exposesIdentity) peerMode = "private identity";
       else if (scenario === "refused activation" || scenario === "observer closed before release" || scenario === "cached original zero"
-        || scenario === "foreign callbacks" || scenario === "public pipe rewrite") peerMode = "complete";
+        || scenario === "foreign callbacks" || scenario === "public pipe rewrite" || scenario === "prestarted turn") peerMode = "complete";
       else peerMode = scenario;
       const suspended = deferred<void>(), permit = deferred<boolean>(), closed = deferred<NativeExit>();
       let receiver: NativeEvents | undefined;
@@ -251,45 +252,47 @@ function fixture(t: TestContext, scenario: Scenario, predecessor: PredecessorTer
         receiver = events;
         return child;
       } };
+      async function execute(assignment: Pick<AssignmentRequest, "id" | "sequence" | "input"> & { workspace: string }) {
+        attach++;
+        assert.equal(attach, 1);
+        const handle = startCodexAppServerAssignment({ assignmentId: assignment.id, prompt: assignment.input,
+          workspace: assignment.workspace, model: "fixture-model", effort: "low" }, scenario === "foreign callbacks" ? bridge : child, env, [],
+        { executable, version: CODEX_APP_SERVER_SCHEMA_VERSION });
+        nativeHandle = handle;
+        connected = handle.snapshot();
+        assert.deepEqual(connected.argv, [executable, "app-server"]);
+        if (connected.outcome !== "starting" || beforeActivation.length !== 0) throw new Error("The adapter wrote before owned activation.");
+        permit.resolve(true);
+        if (scenario === "interrupt") {
+          await until(() => handle.snapshot().outcome === "running", "The app-server did not start the fabricated turn.");
+          assert.equal(handle.interrupt(), true);
+          assert.equal(handle.interrupt(), false);
+        }
+        settled = await bounded(handle.settled);
+        live = await child.observeOriginalGroup();
+        handle.closeInput();
+        finished = await bounded(handle.closed);
+        const afterClose = await child.observeOriginalGroup();
+        if (scenario === "interrupt") afterInterruptedClose = afterClose;
+        else drained = afterClose;
+        if (finished.outcome !== "completed" || settled.outcome !== "completed" || settled.resultText !== answer || settled.threadId !== threadId
+          || settled.turnId !== turnId || afterClose.state !== "verified" || afterClose.activeProcesses !== 0) {
+          throw new Error("The original Job or app-server did not provide exact terminal evidence.");
+        }
+        if (scenario === "observer closed before release" || scenario === "cached original zero") {
+          priorSample = afterClose;
+          child.closeObservation();
+        }
+        return { id: assignment.id, sequence: assignment.sequence, result: "completed" as const, writersContained: true };
+      }
+      const earlier = scenario === "prestarted turn" ? await execute({ ...request, workspace }) : null;
       return {
         ...(predecessor !== "absent reader" && declaresAppServer && { nativePredecessor: { readHandle() {
           if (typeof predecessor === "function") return predecessor();
           return predecessor === "exact" ? nativeHandle : null;
         } } }),
         original: predecessor === "unmarked observer wrapper" ? { observeOriginalGroup: () => child.observeOriginalGroup() } : child,
-        async execute(assignment) {
-          attach++;
-          assert.equal(attach, 1);
-          const handle = startCodexAppServerAssignment({ assignmentId: assignment.id, prompt: assignment.input,
-            workspace: assignment.workspace, model: "fixture-model", effort: "low" }, scenario === "foreign callbacks" ? bridge : child, env, [],
-          { executable, version: CODEX_APP_SERVER_SCHEMA_VERSION });
-          nativeHandle = handle;
-          connected = handle.snapshot();
-          assert.deepEqual(connected.argv, [executable, "app-server"]);
-          if (connected.outcome !== "starting" || beforeActivation.length !== 0) throw new Error("The adapter wrote before owned activation.");
-          permit.resolve(true);
-          if (scenario === "interrupt") {
-            await until(() => handle.snapshot().outcome === "running", "The app-server did not start the fabricated turn.");
-            assert.equal(handle.interrupt(), true);
-            assert.equal(handle.interrupt(), false);
-          }
-          settled = await bounded(handle.settled);
-          live = await child.observeOriginalGroup();
-          handle.closeInput();
-          finished = await bounded(handle.closed);
-          const afterClose = await child.observeOriginalGroup();
-          if (scenario === "interrupt") afterInterruptedClose = afterClose;
-          else drained = afterClose;
-          if (finished.outcome !== "completed" || settled.outcome !== "completed" || settled.resultText !== answer || settled.threadId !== threadId
-            || settled.turnId !== turnId || afterClose.state !== "verified" || afterClose.activeProcesses !== 0) {
-            throw new Error("The original Job or app-server did not provide exact terminal evidence.");
-          }
-          if (scenario === "observer closed before release" || scenario === "cached original zero") {
-            priorSample = afterClose;
-            child.closeObservation();
-          }
-          return { id: assignment.id, sequence: assignment.sequence, result: "completed", writersContained: true };
-        },
+        async execute(assignment) { return earlier ?? execute(assignment); },
         close,
       };
     } },
@@ -497,6 +500,55 @@ test("reopening after a failed predecessor replacement preserves the original cl
   assert.deepEqual(f.bytes(), f.releaseBytes);
   assert.deepEqual(await f.run("native.resume"), { state: "refused", ...noPublication });
   assert.equal(f.launches, 1);
+  assert.deepEqual(f.bytes(), f.releaseBytes);
+});
+
+test("a completed turn begun before durable claim start cannot supply predecessor evidence", onWindows, async t => {
+  const f = fixture(t, "prestarted turn");
+  assert.deepEqual(await f.run(), { state: "completed", ...noPublication });
+  const turn = f.writes.find(({ value }) => Reflect.get(value as object, "method") === "turn/start");
+  assert.ok(turn);
+  assert.deepEqual(turn.snapshot.rows.map(row => row.kind), ["intent"]);
+  assert.equal(turn.snapshot.ledger.workspace?.claimGeneration, undefined);
+  assert.equal(f.finished?.outcome, "completed");
+  assert.deepEqual(f.drained, zero);
+  assert.ok(f.release && f.releaseBytes);
+  assert.equal(f.release.rows[2]?.outcome, "completed");
+  const reopened = reopenLedger(f);
+  assert.ok(reopened.ok);
+  assert.deepEqual(reopened.ledger, f.release.ledger);
+  assert.equal(reopened.ledger.nativePredecessor, undefined);
+  assert.deepEqual(f.bytes(), f.releaseBytes);
+});
+
+test("checkout turnover during predecessor handle resolution preserves the durable claim", onWindows, async t => {
+  let changed = false;
+  const f = fixture(t, "complete", () => {
+    const handle = f.nativeHandle;
+    assert.ok(handle);
+    const original = assignmentDirectory(f.workspace);
+    const parent = dirname(f.workspace);
+    assert.equal(dirname(realpathSync(parent)), realpathSync(tmpdir()));
+    assert.equal(realpathSync(f.workspace), f.workspace);
+    const moved = join(parent, "original-workspace");
+    assert.equal(existsSync(moved), false);
+    fs.renameSync(f.workspace, moved);
+    mkdirSync(f.workspace);
+    assert.notEqual(assignmentDirectory(f.workspace).identity, original.identity);
+    assert.equal(readFileSync(join(moved, "answer.txt"), "utf8"), answer);
+    changed = true;
+    return handle;
+  });
+  assert.deepEqual(await f.run(), { state: "completed", ...noPublication });
+  assert.equal(changed, true);
+  assert.equal(f.finished?.outcome, "completed");
+  assert.deepEqual(f.releaseGroup, zero);
+  assert.ok(f.release && f.releaseBytes);
+  assert.equal(f.release.rows[2]?.outcome, "completed");
+  const reopened = reopenLedger(f);
+  assert.ok(reopened.ok);
+  assert.deepEqual(reopened.ledger, f.release.ledger);
+  assert.equal(reopened.ledger.nativePredecessor, undefined);
   assert.deepEqual(f.bytes(), f.releaseBytes);
 });
 
