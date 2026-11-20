@@ -15,7 +15,7 @@ import { processNativeTransport, windowsOwnedNativeTransport, windowsProcessLaun
 import { claimWorkspace, prepareWorkspace } from "../src/workspace.ts";
 import { removeDir } from "./helpers.ts";
 
-type PeerMode = "complete" | "wrong workspace" | "invalid initialize" | "wrong turn";
+type PeerMode = "complete" | "wrong workspace" | "invalid initialize" | "wrong turn" | "wrong thread";
 type Scenario = PeerMode | "refused preparation" | "refused activation" | "observer closed before release";
 const executable = realpathSync(process.execPath);
 const peer = fileURLToPath(new URL("./owned-app-server-peer.fixture.mjs", import.meta.url));
@@ -31,10 +31,15 @@ function dialogue(workspace: string, scenario: PeerMode): unknown[] {
   if (scenario !== "invalid initialize") {
     expected.push({ method: "initialized" }, { id: 2, method: "thread/start", params: { cwd: workspace, model: "fixture-model" } });
   }
-  if (scenario === "complete" || scenario === "wrong turn") {
+  if (scenario === "complete" || scenario === "wrong turn" || scenario === "wrong thread") {
     expected.push({ id: 3, method: "turn/start", params: { threadId: "fixture-thread", input: [{ type: "text", text: prompt }], effort: "low" } });
   }
   return expected;
+}
+
+function terminalLineage(observation: NativeObservation | undefined): unknown {
+  assert.ok(observation);
+  return Reflect.get(observation, "appServerTerminalLineage") ?? null;
 }
 
 function deferred<T>() {
@@ -228,7 +233,7 @@ test("the same fabricated peer completes the app-server handshake on the existin
   assert.equal((await handle.closed).outcome, "completed");
 });
 
-for (const scenario of ["complete", "wrong workspace", "invalid initialize", "wrong turn", "observer closed before release"] as const) {
+for (const scenario of ["complete", "wrong workspace", "invalid initialize", "wrong turn", "wrong thread", "observer closed before release"] as const) {
   test(`owned app-server ${scenario} uses the first post-activation handshake`, onWindows, async t => {
     const f = fixture(t, scenario);
     const result = await f.run();
@@ -238,6 +243,7 @@ for (const scenario of ["complete", "wrong workspace", "invalid initialize", "wr
     assert.equal(f.closes, 1);
     assert.deepEqual(f.beforeActivation, [], "initialize must never be attempted while the verified Job is suspended");
     assert.equal(f.connected?.outcome, "starting");
+    assert.equal(terminalLineage(f.connected), null);
     assert.ok(f.prepared && f.activated);
     const [intent] = f.prepared.rows;
     assert.deepEqual(f.prepared.ledger.workspace, { path: f.workspace, writerPid: process.pid, qualified: false });
@@ -261,6 +267,8 @@ for (const scenario of ["complete", "wrong workspace", "invalid initialize", "wr
       assert.deepEqual(result, { state: "completed", ...noPublication });
       assert.equal(f.settled?.outcome, "completed");
       assert.equal(f.settled?.resultText, answer);
+      assert.equal(f.settled?.vendor, "codex");
+      assert.equal(f.settled?.interfaceId, "app-server");
       assert.equal(f.settled?.threadId, "fixture-thread");
       assert.equal(f.settled?.turnId, "fixture-turn");
       assert.equal(f.settled?.writerState, "unknown");
@@ -273,6 +281,9 @@ for (const scenario of ["complete", "wrong workspace", "invalid initialize", "wr
         assert.deepEqual(after.ledger.workspace, { path: f.workspace, writerPid: null, qualified: false });
         assert.equal(after.ledger.boundWorkspaceIntents, undefined);
         assert.deepEqual(f.groupIdentity, [true, true, true]);
+        const lineage = { vendor: "codex", interfaceId: "app-server", threadId: "fixture-thread", turnId: "fixture-turn" };
+        assert.deepEqual([terminalLineage(f.settled), terminalLineage(f.finished)], [lineage, lineage],
+          "only the correlated successful native terminal can report exact app-server lineage");
       } else {
         assert.deepEqual(f.releaseGroup, { state: "unavailable" });
         assert.deepEqual(f.groupIdentity, [true, true]);
@@ -296,6 +307,12 @@ for (const scenario of ["complete", "wrong workspace", "invalid initialize", "wr
       assert.equal(f.release, undefined);
       assert.deepEqual(f.snapshot(), f.activated);
       assert.deepEqual(f.groupIdentity, [true, true]);
+      if (scenario === "wrong thread" || scenario === "wrong turn") {
+        assert.equal(f.settled?.interfaceId, "app-server");
+        assert.equal(f.settled?.threadId, "fixture-thread");
+        assert.equal(f.settled?.turnId, "fixture-turn");
+      }
+      assert.deepEqual([terminalLineage(f.settled), terminalLineage(f.finished)], [null, null]);
     }
   });
 }

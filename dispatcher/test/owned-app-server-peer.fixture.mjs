@@ -11,7 +11,7 @@ assert.equal(process.argv.length, 4);
 assert.equal(cwd, expected);
 assert.equal(basename(cwd), "workspace");
 assert.ok(basename(dirname(cwd)).startsWith("ttm-owned-app-server-"));
-assert.ok(["complete", "wrong workspace", "invalid initialize", "wrong turn"].includes(mode));
+assert.ok(["complete", "wrong workspace", "invalid initialize", "wrong turn", "wrong thread"].includes(mode));
 
 const received = join(dirname(cwd), "requests.jsonl");
 const send = value => process.stdout.write(JSON.stringify(value) + "\n");
@@ -35,7 +35,7 @@ for await (const line of createInterface({ input: process.stdin })) {
     const text = readFileSync(join(cwd, "answer.txt"), "utf8");
     send({ id: message.id, result: { turn: { id: turnId, items: [], status: "inProgress" } } });
     send({ method: "item/completed", params: { threadId, turnId, item: { id: "fixture-answer", type: "agentMessage", text } } });
-    send({ method: "turn/completed", params: { threadId,
+    send({ method: "turn/completed", params: { threadId: mode === "wrong thread" ? "other-thread" : threadId,
       turn: { id: mode === "wrong turn" ? "other-turn" : turnId, status: "completed", items: [] } } });
   }
 }
