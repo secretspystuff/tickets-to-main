@@ -3,7 +3,7 @@ import { test } from "node:test";
 import { startCodexAppServerAssignment, runCodexCliAssignment } from "../src/adapters/codex.ts";
 import { applyHarnessEvidence, claimCovers, type AssignmentRequest } from "../src/adapters/contract.ts";
 import { documentedCodexClaim } from "../src/adapters/codex.ts";
-import { safeNativeText, type NativeObservation } from "../src/adapters/native-result.ts";
+import { safeNativeText } from "../src/adapters/native-result.ts";
 import { processNativeTransport, type NativeEvents, type NativeTransport } from "../src/native-transport.ts";
 import { CLI_RESULT, scriptedTransport } from "./native-fixtures.ts";
 
@@ -32,9 +32,6 @@ function compaction(events: NativeEvents, phase: "started" | "completed", itemId
     [`${phase}AtMs`]: phase === "started" ? 100 : 200, ...fields,
   } });
 }
-function compactionEvidence(observation: NativeObservation): unknown {
-  return Reflect.get(observation, "appServerCompactionEvidence");
-}
 function server(
   turn: (events: NativeEvents) => void,
   options: { observedModel?: string; reasoningEffort?: unknown; workspace?: string; threadId?: string;
@@ -61,7 +58,7 @@ function server(
     }
   });
 }
-async function finish(transport: NativeTransport, request = REQUEST, secrets: readonly string[] = []): Promise<NativeObservation> {
+async function finish(transport: NativeTransport, request = REQUEST, secrets: readonly string[] = []) {
   const handle = startCodexAppServerAssignment(request, transport, {}, secrets, LAUNCH);
   await handle.settled;
   handle.closeInput();
@@ -94,27 +91,27 @@ test("app-server observes the first exact in-turn compaction pair without settli
   const handle = startCodexAppServerAssignment(REQUEST, transport, {}, [], LAUNCH);
   const native = await turn;
   const before = handle.snapshot();
-  assert.equal(compactionEvidence(before), null);
+  assert.equal(before.appServerCompactionEvidence, null);
   compaction(native, "completed");
   compaction(native, "started", COMPACTION.itemId, { startedAtMs: undefined });
-  assert.equal(compactionEvidence(handle.snapshot()), null);
+  assert.equal(handle.snapshot().appServerCompactionEvidence, null);
 
   compaction(native, "started");
   const started = handle.snapshot();
-  assert.deepEqual(compactionEvidence(started), { ...COMPACTION, state: "started" });
+  assert.deepEqual(started.appServerCompactionEvidence, { ...COMPACTION, state: "started" });
   compaction(native, "started", "another-compaction");
   compaction(native, "completed", "another-compaction");
   compaction(native, "completed", COMPACTION.itemId, { completedAtMs: 1.5 });
-  assert.deepEqual(compactionEvidence(handle.snapshot()), compactionEvidence(started));
+  assert.deepEqual(handle.snapshot().appServerCompactionEvidence, started.appServerCompactionEvidence);
   assert.equal(handle.snapshot().outcome, "running");
 
   compaction(native, "completed");
   const completed = { ...COMPACTION, state: "completed" };
-  assert.deepEqual(compactionEvidence(handle.snapshot()), completed);
-  assert.deepEqual(compactionEvidence(started), { ...COMPACTION, state: "started" });
+  assert.deepEqual(handle.snapshot().appServerCompactionEvidence, completed);
+  assert.deepEqual(started.appServerCompactionEvidence, { ...COMPACTION, state: "started" });
   compaction(native, "started");
   compaction(native, "completed");
-  assert.deepEqual(compactionEvidence(handle.snapshot()), completed);
+  assert.deepEqual(handle.snapshot().appServerCompactionEvidence, completed);
   assert.equal(handle.snapshot().outcome, "running");
   assert.equal(handle.snapshot().appServerTerminalLineage, null);
   assert.deepEqual(handle.snapshot().observed, before.observed);
@@ -128,7 +125,7 @@ test("app-server observes the first exact in-turn compaction pair without settli
     assert.equal(observation.resultText, null);
     assert.equal(observation.writerState, "unknown");
     assert.equal(observation.appServerTerminalLineage, null);
-    assert.deepEqual(compactionEvidence(observation), completed);
+    assert.deepEqual(observation.appServerCompactionEvidence, completed);
   }
   assert.deepEqual(transport.calls[0]!.input.map((line) => JSON.parse(line).method),
     ["initialize", "initialized", "thread/start", "turn/start"]);
@@ -144,7 +141,7 @@ test("app-server refuses compaction evidence from a different thread or turn", a
       const result = await finish(transport);
       assert.equal(result.outcome, "protocol-error");
       assert.equal(result.writerState, "unknown");
-      assert.deepEqual(compactionEvidence(result), { ...COMPACTION, state: "started" });
+      assert.deepEqual(result.appServerCompactionEvidence, { ...COMPACTION, state: "started" });
     });
   }
 });
@@ -156,14 +153,14 @@ test("app-server compaction evidence requires a correlated turn and safe item ID
         startedBeforeReply, beforeTurnReply: events => compaction(events, "started"),
       }));
       assert.equal(result.outcome, startedBeforeReply ? "completed" : "protocol-error");
-      assert.deepEqual(compactionEvidence(result), startedBeforeReply ? { ...COMPACTION, state: "completed" } : null);
+      assert.deepEqual(result.appServerCompactionEvidence, startedBeforeReply ? { ...COMPACTION, state: "completed" } : null);
     });
   }
   await t.test("reserved held value", async () => {
     const held = "fabricated-held-compaction-id";
     const result = await finish(server(events => compaction(events, "started", held)), REQUEST, [held]);
     assert.equal(result.outcome, "protocol-error");
-    assert.equal(compactionEvidence(result), null);
+    assert.equal(result.appServerCompactionEvidence, null);
     assert.equal(JSON.stringify(result).includes(held), false);
   });
   await t.test("assignment text echoed as an item ID", async () => {
@@ -174,7 +171,7 @@ test("app-server compaction evidence requires a correlated turn and safe item ID
       terminal(events);
     }));
     assert.equal(result.outcome, "completed");
-    assert.equal(compactionEvidence(result), null);
+    assert.equal(result.appServerCompactionEvidence, null);
     assert.equal(JSON.stringify(result).includes(REQUEST.prompt), false);
   });
 });
@@ -193,7 +190,7 @@ test("app-server compaction evidence stops advancing on terminal or held assignm
       const settled = await handle.settled;
       const expected = outcome === "completed" ? { ...COMPACTION, state: "started" } : null;
       assert.equal(settled.outcome, outcome);
-      assert.deepEqual(compactionEvidence(settled), expected);
+      assert.deepEqual(settled.appServerCompactionEvidence, expected);
       compaction(native, "started");
       compaction(native, "completed");
       assert.deepEqual(handle.snapshot(), settled);
@@ -211,7 +208,7 @@ test("a refused app-server workspace has no compaction evidence or turn input", 
   const transport = server(() => assert.fail("a foreign workspace must receive no assignment"), { workspace: "C:\\unexpected-workspace" });
   const result = await finish(transport);
   assert.equal(result.outcome, "refused");
-  assert.equal(compactionEvidence(result), null);
+  assert.equal(result.appServerCompactionEvidence, null);
   assert.deepEqual(transport.calls[0]!.input.map((line) => JSON.parse(line).method),
     ["initialize", "initialized", "thread/start"]);
 });
