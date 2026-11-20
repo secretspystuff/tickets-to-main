@@ -300,10 +300,18 @@ for (const method of ["item/commandExecution/requestApproval", "item/fileChange/
 
 for (const status of ["failed", "interrupted"]) {
   test(`native ${status} is not successful assignment evidence`, async () => {
-    const result = await finish(server((events) => terminal(events, status)));
-    assert.equal(result.outcome, status);
-    assert.equal(result.observed.assignment, undefined);
-    assert.equal(result.writerState, "unknown");
+    const handle = startCodexAppServerAssignment(REQUEST, server((events) => terminal(events, status)), {}, [], LAUNCH);
+    const settled = await handle.settled;
+    handle.closeInput();
+    const closed = await handle.closed;
+    for (const result of [settled, closed]) {
+      assert.equal(result.outcome, status);
+      assert.equal(result.observed.assignment, undefined);
+      assert.equal(result.writerState, "unknown");
+      assert.equal(result.threadId, THREAD);
+      assert.equal(result.turnId, TURN);
+      assert.equal(Reflect.get(result, "appServerTerminalLineage") ?? null, null);
+    }
   });
 }
 
@@ -413,6 +421,9 @@ for (const status of ["completed", "failed", "interrupted"]) {
       emit(events, { id, error: { code: -32600, message: "Synthetic interrupt rejection" } });
       const stillRunning = handle.snapshot();
       assert.equal(stillRunning.outcome, "running");
+      assert.equal(stillRunning.threadId, THREAD);
+      assert.equal(stillRunning.turnId, TURN);
+      assert.equal(Reflect.get(stillRunning, "appServerTerminalLineage") ?? null, null);
       assert.equal(stillRunning.interruptRequest, "rejected");
       assert.equal(stillRunning.resultText, null);
       assert.equal(stillRunning.writerState, "unknown");
