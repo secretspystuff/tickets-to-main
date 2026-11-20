@@ -95,10 +95,10 @@ export async function runCodexCliAssignment(
     if (!msg || typeof msg.type !== "string") { invalid(); return; }
     if (msg.type === "thread.started") {
       const id = msg.thread_id;
-      if (state.threadId !== null || !opaqueId(id) || id === prompt) { invalid(); return; }
+      if (state.threadId !== null || !opaqueId(id)) { invalid(); return; }
       // One input character can match part of a serialized native UUID by chance.
-      const promptToRedact = prompt.length === 1 && CLI_THREAD_UUID.test(id) ? undefined : prompt;
-      if (safeNativeText(id, secrets, promptToRedact) !== id) { invalid(); return; }
+      const assignmentEcho = prompt.length > 0 && id.includes(prompt) && !(prompt.length === 1 && CLI_THREAD_UUID.test(id));
+      if (assignmentEcho || hasHeldSecret(id, secrets) || safeNativeText(id, []) !== id) { invalid(); return; }
       state.threadId = id;
     } else if (msg.type === "turn.started") {
       if (state.threadId === null || started) { invalid(); return; }
