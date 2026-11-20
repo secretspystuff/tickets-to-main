@@ -1,0 +1,27 @@
+import assert from "node:assert/strict";
+import { appendFileSync, existsSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
+import { basename, dirname, join } from "node:path";
+import { setTimeout as pause } from "node:timers/promises";
+
+const [mode, expected] = process.argv.slice(2);
+const cwd = realpathSync(process.cwd()), root = dirname(cwd);
+assert.equal(process.platform, "win32");
+assert.equal(process.version, "v24.18.0");
+assert.equal(process.argv.length, 4);
+assert.equal(cwd, expected);
+assert.equal(basename(cwd), "workspace");
+assert.ok(basename(root).startsWith("ttm-owned-cli-"));
+assert.ok(mode === "complete" || mode === "wrong result");
+
+const receipt = join(root, "received.bin");
+for await (const chunk of process.stdin) appendFileSync(receipt, chunk);
+writeFileSync(join(root, "reached-eof"), "fixture EOF", { flag: "wx" });
+assert.equal(readFileSync(receipt, "utf8"), "Read the fabricated answer file.");
+const answer = readFileSync(join(cwd, "answer.txt"), "utf8");
+for (const event of [
+  { type: "thread.started", thread_id: "fixture-cli-thread" },
+  { type: "turn.started" },
+  { type: "item.completed", item: { id: "fixture-cli-answer", type: "agent_message", text: mode === "complete" ? answer : "other result" } },
+  { type: "turn.completed" },
+]) process.stdout.write(JSON.stringify(event) + "\n");
+while (!existsSync(join(root, "allow-exit"))) await pause(20);
