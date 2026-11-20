@@ -14,6 +14,7 @@ import { processNativeTransport, windowsOwnedNativeTransport, windowsProcessLaun
   type NativeTransport, type OriginalGroup } from "../src/native-transport.ts";
 import { claimWorkspace, prepareWorkspace } from "../src/workspace.ts";
 import { removeDir } from "./helpers.ts";
+import { CLI_RESULT } from "./native-fixtures.ts";
 
 type Scenario = "complete" | "wrong result" | "refused activation" | "refused preparation";
 const executable = realpathSync(process.execPath);
@@ -291,4 +292,33 @@ test("unsupported CLI selections and held text remain refused before transport e
     assert.equal((await runCodexCliAssignment(input, unused, {}, [held], executable)).outcome, "refused");
   }
   assert.equal(starts, 0);
+});
+
+test("delayed CLI readiness sends the validated prompt exactly once and preserves its redaction", async () => {
+  const request = { assignmentId: id(1), prompt, workspace: "C:\\fixture-workspace", model: null, effort: null };
+  const held = "fixture-opaque-held-text";
+  const ready = deferred<NativeEvents>();
+  const trace: string[] = [];
+  const run = runCodexCliAssignment(request, { start(_argv, _options, events) {
+    ready.resolve(events);
+    return {
+      write(text) { trace.push(text); return true; },
+      endInput() {
+        trace.push("EOF");
+        queueMicrotask(() => {
+          events.stdout(CLI_RESULT.replace("Ready.", prompt));
+          events.closed({ code: 0, signal: null, error: null });
+        });
+      },
+    };
+  } }, {}, [held], executable);
+  const events = await bounded(ready.promise);
+  assert.deepEqual(trace, []);
+  request.prompt = held;
+  events.spawned();
+  events.spawned();
+  const result = await bounded(run);
+  assert.deepEqual(trace, [prompt, "EOF"]);
+  assert.equal(result.outcome, "completed");
+  assert.equal(result.resultText, "[assignment input omitted]");
 });
