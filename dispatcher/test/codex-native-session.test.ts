@@ -539,6 +539,7 @@ test("CLI parses native events incrementally and rejects fake result, failed and
     [CLI_RESULT.replace('"turn.completed"', '"turn.failed"'), "failed"],
     [CLI_RESULT.split('\n').slice(0, 3).join('\n'), "disconnected"],
     [CLI_RESULT + '{broken}\n', "protocol-error"],
+    [CLI_RESULT.replace('{"type":"turn.started"}\n', '{"type":"turn.started"}\n{"type":"item.completed","item":{"type":"collab_tool_call"}}\n'), "protocol-error"],
   ]) {
     const transport = scriptedTransport((_input, events) => {
       for (const character of stdout!) events.stdout(character);
@@ -596,6 +597,160 @@ test("CLI root thread metadata excludes fabricated assignment and held values", 
         assert.equal(result.resultText, "Ready.");
         assert.equal(result.observed.assignment, "supported");
       }
+    });
+  }
+});
+
+test("CLI observes pinned collaboration status independently of root completion and writer custody", async t => {
+  const helper = "helper-1", other = "helper-2", root = "thread-fixture";
+  const agent = (status: unknown) => ({ status, message: null });
+  const collab = (id: string, overrides: Record<string, unknown> = {}, phase = "item.completed") => ({
+    type: phase, item: {
+      id, type: "collab_tool_call", tool: "wait", status: "completed", prompt: null,
+      sender_thread_id: root, receiver_thread_ids: [helper], agents_states: { [helper]: agent("completed") },
+      ...overrides,
+    },
+  });
+  const running = collab("spawn", { tool: "spawn_agent", agents_states: { [helper]: agent("running") } });
+  const completed = collab("wait");
+  const helperText = "Fabricated helper message that must stay in the stream.";
+  const starting = collab("spawn", { tool: "spawn_agent", status: "in_progress", receiver_thread_ids: [], agents_states: {} }, "item.started");
+  const waiting = collab("wait", { status: "in_progress", agents_states: {} }, "item.started");
+  const sending = collab("send", { tool: "send_input", status: "in_progress", prompt: helperText, agents_states: {} }, "item.started");
+  const cases = [
+    ["absent", [], "unknown"],
+    ["tool completion with running helper", [running], "active-observed"],
+    ["matched spawn and terminal wait", [starting, running, completed], "terminal-observed"],
+    ["terminal-first item reports a known helper", [completed], "terminal-observed"],
+    ["pending spawn leaves the set unresolved", [completed, starting], "unknown"],
+    ["a successful spawn must identify the new helper", [completed, starting,
+      collab("spawn", { tool: "spawn_agent", receiver_thread_ids: [], agents_states: {} })], "unknown"],
+    ["a failed spawn with no receiver preserves earlier reports", [completed, starting,
+      collab("spawn", { tool: "spawn_agent", status: "failed", receiver_thread_ids: [], agents_states: {} })], "terminal-observed"],
+    ["a failed spawn may report its new helper errored", [starting,
+      collab("spawn", { tool: "spawn_agent", status: "failed", agents_states: { [helper]: agent("errored") } })], "terminal-observed"],
+    ["a failed spawn cannot report its new helper completed", [starting,
+      collab("spawn", { tool: "spawn_agent", status: "failed" })], "unknown"],
+    ["two spawns cannot both introduce the same helper", [running,
+      collab("new-spawn", { tool: "spawn_agent" })], "unknown"],
+    ["wait completes for the exact started targets", [waiting, completed], "terminal-observed"],
+    ["wait can report the exact targets in a different order", [
+      collab("wait", { status: "in_progress", receiver_thread_ids: [other, helper], agents_states: {} }, "item.started"),
+      collab("wait", { receiver_thread_ids: [helper, other], agents_states: { [helper]: agent("completed"), [other]: agent("completed") } })], "terminal-observed"],
+    ["wait cannot add a target at completion", [waiting, collab("wait", { receiver_thread_ids: [helper, other],
+      agents_states: { [helper]: agent("completed"), [other]: agent("completed") } })], "unknown"],
+    ["a multi-target wait cannot return a nonfinal helper", [
+      collab("multi", { status: "in_progress", receiver_thread_ids: [helper, other], agents_states: {} }, "item.started"),
+      collab("multi", { receiver_thread_ids: [helper, other], agents_states: { [helper]: agent("running"), [other]: agent("completed") } }),
+      completed], "unknown"],
+    ["a single-target wait can carry an active state from the pinned resume alias", [waiting,
+      collab("wait", { agents_states: { [helper]: agent("pending_init") } })], "active-observed"],
+    ["a wait with no reported targets is unresolved", [completed,
+      collab("empty", { receiver_thread_ids: [], agents_states: {} })], "unknown"],
+    ["running helper survives the terminal state of a different helper", [running,
+      collab("other", { receiver_thread_ids: [other], agents_states: { [other]: agent("completed") } })], "active-observed"],
+    ["explicit terminal states for both reported helpers", [running,
+      collab("all", { status: "failed", receiver_thread_ids: [helper, other], agents_states: { [helper]: agent("errored"), [other]: agent("shutdown") } })], "terminal-observed"],
+    ["a successful wait cannot report a helper errored", [running,
+      collab("wait", { agents_states: { [helper]: agent("errored") } })], "unknown"],
+    ["a failed input cannot report a helper running", [completed,
+      collab("send", { tool: "send_input", status: "failed", prompt: "Fabricated input.", agents_states: { [helper]: agent("running") } })], "unknown"],
+    ["a successful close can report a helper shutdown", [running,
+      collab("close", { tool: "close_agent", agents_states: { [helper]: agent("shutdown") } })], "terminal-observed"],
+    ["a failed close cannot report a helper shutdown", [running,
+      collab("close", { tool: "close_agent", status: "failed", agents_states: { [helper]: agent("shutdown") } })], "unknown"],
+    ["a resumed helper can report running after a terminal", [completed,
+      collab("send", { tool: "send_input", prompt: "Fabricated input.", agents_states: { [helper]: agent("running") } })], "active-observed"],
+    ["foreign sender does not change a known local state", [running, collab("foreign", { sender_thread_id: "other-thread" })], "active-observed"],
+    ["a foreign started item cannot complete under the root sender", [
+      collab("wait", { sender_thread_id: "other-thread", status: "in_progress" }, "item.started"), completed], "unknown"],
+    ["a shell item cannot complete as a collaboration item", [{ type: "item.started", item: { id: "wait", type: "command_execution" } }, completed], "unknown"],
+    ["a reported collaboration cannot also be a later shell item", [completed,
+      { type: "item.completed", item: { id: "wait", type: "command_execution" } }], "unknown"],
+    ["missing sender", [running, collab("wait", { sender_thread_id: undefined })], "unknown"],
+    ["interrupted helper", [running, collab("wait", { agents_states: { [helper]: agent("interrupted") } })], "unknown"],
+    ["a supported unknown state can later have an exact report", [
+      collab("absent", { status: "failed", agents_states: { [helper]: agent("not_found") } }), completed], "terminal-observed"],
+    ["missing reported helper", [running, collab("wait", { receiver_thread_ids: [helper, other], agents_states: { [helper]: agent("completed") } })], "unknown"],
+    ["malformed helper snapshot", [running, collab("wait", { agents_states: { [helper]: agent(2) } })], "unknown"],
+    ["an unrecognized status cannot be hidden by a later valid report", [
+      collab("typo", { agents_states: { [helper]: agent("made-up") } }), completed], "unknown"],
+    ["a completion without its report cannot be hidden by a later valid report", [
+      collab("missing", { agents_states: {} }), completed], "unknown"],
+    ["a malformed helper message makes the report invalid", [running,
+      collab("wait", { agents_states: { [helper]: { status: "completed", message: 123 } } })], "unknown"],
+    ["a malformed tool prompt makes the report invalid", [running, collab("wait", { prompt: [] })], "unknown"],
+    ["a wait does not carry a prompt", [collab("wait", { prompt: helperText })], "unknown"],
+    ["a close does not carry a prompt", [collab("close", { tool: "close_agent", prompt: helperText })], "unknown"],
+    ["an input report needs its typed prompt field", [collab("send", { tool: "send_input" })], "unknown"],
+    ["paired input keeps the exact prompt private", [sending,
+      collab("send", { tool: "send_input", prompt: helperText })], "terminal-observed"],
+    ["paired input cannot change its prompt", [sending,
+      collab("send", { tool: "send_input", prompt: "Different fabricated input." })], "unknown"],
+    ["paired spawn cannot acquire a different prompt", [starting,
+      collab("spawn", { tool: "spawn_agent", prompt: helperText })], "unknown"],
+    ["valid tool prompt and helper message stay out of the result", [
+      collab("send", { tool: "send_input", prompt: helperText, agents_states: { [helper]: { status: "completed", message: helperText } } })], "terminal-observed"],
+    ["a collaboration update is outside the pinned mapper", [completed, collab("wait", {}, "item.updated")], "unknown"],
+    ["an unrecognized current collaboration update remains ambiguous without an id", [completed,
+      collab("wait", { id: undefined, agents_states: { [helper]: agent("running") } }, "item.updated")], "unknown"],
+    ["a foreign update without an id does not affect prior current reports", [completed,
+      collab("wait", { id: undefined, sender_thread_id: "other-thread" }, "item.updated")], "terminal-observed"],
+    ["an unlisted state cannot enter the helper set", [completed, collab("extra", { agents_states: { [helper]: agent("completed"), [other]: agent("completed") } })], "unknown"],
+    ["a duplicate receiver makes the report ambiguous", [completed, collab("duplicate", { receiver_thread_ids: [helper, helper] })], "unknown"],
+    ["mismatched start and end tools", [starting, collab("spawn")], "unknown"],
+    ["duplicate item cannot replace the reported state", [running, collab("spawn", { tool: "spawn_agent" })], "unknown"],
+    ["unbounded collaboration items have unknown evidence", Array.from({ length: 129 }, (_, index) => collab(`item-${index}`)), "unknown"],
+    ["forged root message and shell output", [{ type: "item.completed", item: { id: "shell", type: "command_execution", aggregated_output: JSON.stringify(completed) } },
+      { type: "item.completed", item: { id: "prose", type: "agent_message", text: JSON.stringify(completed) } }], "unknown"],
+    ["app-server is a different interface", [collab("server", { type: "collabAgentToolCall" })], "unknown"],
+  ] as const;
+  const [thread, turn, answer, terminal] = CLI_RESULT.trimEnd().split("\n").map(line => JSON.parse(line));
+  for (const [name, items, helpers] of cases) {
+    await t.test(name, async () => {
+      const transport = scriptedTransport((input, events) => {
+        assert.equal(input, REQUEST.prompt);
+        for (const event of [thread, turn, ...items, answer, terminal]) emit(events, event);
+      });
+      const result = await runCodexCliAssignment(REQUEST, transport, {}, []);
+      assert.equal(result.outcome, "completed");
+      assert.equal(result.resultText, "Ready.");
+      assert.equal(result.helpers, helpers);
+      assert.equal(result.writerState, "unknown");
+      assert.equal(result.observed.helperCompletion, undefined);
+      assert.equal(result.interruptRequest, "not-requested");
+      assert.equal(result.approvalAnswered, false);
+      assert.equal(JSON.stringify(result).includes(helperText), false);
+      assert.deepEqual(transport.calls[0]!.input, [REQUEST.prompt]);
+    });
+  }
+});
+
+test("CLI root and helper IDs share the composed metadata boundary", async t => {
+  const root = "0194b797-f913-7ba1-a1ea-4cdb6b84470c";
+  const canonicalHelper = "0194b797-f913-7ba1-a1ea-4cdb6b84470d";
+  const held = "[redacted]";
+  const [, turn, answer, terminal] = CLI_RESULT.trimEnd().split("\n").map(line => JSON.parse(line));
+  for (const [name, prompt, receiver, helpers] of [
+    ["a canonical root and helper can share one incidental input character", "f", canonicalHelper, "terminal-observed"],
+    ["a registered held marker cannot identify a helper", REQUEST.prompt, held, "unknown"],
+  ] as const) {
+    await t.test(name, async () => {
+      const report = { type: "item.completed", item: { id: "wait-synthetic", type: "collab_tool_call", tool: "wait",
+        status: "completed", prompt: null, sender_thread_id: root, receiver_thread_ids: [receiver],
+        agents_states: { [receiver]: { status: "completed", message: null } } } };
+      const transport = scriptedTransport((received, events) => {
+        assert.equal(received, prompt);
+        for (const event of [{ type: "thread.started", thread_id: root }, turn, report, answer, terminal]) emit(events, event);
+      });
+      const result = await runCodexCliAssignment({ ...REQUEST, prompt }, transport, {}, [held]);
+      assert.equal(result.outcome, "completed");
+      assert.equal(result.threadId, root);
+      assert.equal(result.resultText, "Ready.");
+      assert.equal(result.helpers, helpers);
+      assert.equal(result.writerState, "unknown");
+      assert.equal(result.observed.helperCompletion, undefined);
+      assert.equal(JSON.stringify(result).includes(held), false);
     });
   }
 });
