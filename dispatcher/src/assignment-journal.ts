@@ -73,6 +73,11 @@ function matching(left: Intent, right: Intent): boolean {
     && left.aliasDigest === right.aliasDigest;
 }
 
+function sameReservation(left: Intent, right: Intent): boolean {
+  return matching(left, right) && left.version === right.version && left.pid === right.pid
+    && left.birth === right.birth && left.at === right.at;
+}
+
 function overlap(a: Intent, b: Intent): boolean {
   if (a.version === 4 && b.version === 4) return a.workspaceDigest === b.workspaceDigest || a.aliasDigest === b.aliasDigest;
   return a.version === b.version && a.workspaceDigest === b.workspaceDigest;
@@ -81,8 +86,7 @@ function overlap(a: Intent, b: Intent): boolean {
 function ownedAssignmentUnderLease(stateDir: string, intent: Intent): { entries: Map<string, Entry>; entry: Entry } | null {
   const entries = readExistingPrivateJournalUnderLease(stateDir, "assignment-intents.jsonl", records);
   const entry = entries.get(intent.id);
-  if (!entry || entry.intent.version !== 4 || intent.version !== 4 || !matching(entry.intent, intent)
-    || entry.intent.pid !== intent.pid || entry.intent.birth !== intent.birth || entry.intent.at !== intent.at) return null;
+  if (!entry || entry.intent.version !== 4 || !sameReservation(entry.intent, intent)) return null;
   return { entries, entry };
 }
 
@@ -145,10 +149,11 @@ export function reserveAssignment(stateDir: string, intent: Intent, legacyWorksp
 export function startAssignment(stateDir: string, intent: Intent, at: number, claimIsCurrent?: () => boolean): void {
   transact(stateDir, (entries, append) => {
     const entry = entries.get(intent.id);
-    if (!entry || !matching(entry.intent, intent) || entry.intent.version === undefined || !owned(entry.intent)
+    if (!entry || entry.intent.version === undefined || !owned(entry.intent)
       || entry.started || entry.result || !integer(at, 0) || at < entry.intent.at) throw unavailable();
-    if (claimIsCurrent && (entry.intent.version !== 4 || entry.intent.pid !== intent.pid
-      || entry.intent.birth !== intent.birth || entry.intent.at !== intent.at || !claimIsCurrent())) throw unavailable();
+    if (claimIsCurrent) {
+      if (entry.intent.version !== 4 || !sameReservation(entry.intent, intent) || !claimIsCurrent()) throw unavailable();
+    } else if (!matching(entry.intent, intent)) throw unavailable();
     append({ kind: "started", id: intent.id, sequence: intent.sequence, requestDigest: intent.requestDigest, at });
   }, { existingOnly: claimIsCurrent !== undefined });
 }
@@ -157,7 +162,8 @@ export function completeAssignment(stateDir: string, intent: Intent, outcome: Re
   stateIsCurrent?: () => boolean): void {
   transact(stateDir, (entries, append) => {
     const previous = entries.get(intent.id);
-    if (!previous || !matching(previous.intent, intent) || !integer(at, 0) || at < previous.intent.at) throw unavailable();
+    if (!previous || !integer(at, 0) || at < previous.intent.at
+      || !(stateIsCurrent ? sameReservation(previous.intent, intent) : matching(previous.intent, intent))) throw unavailable();
     if (outcome === "not-started" ? previous.intent.version === undefined || !owned(previous.intent) : !previous.started) throw unavailable();
     if (previous.result) {
       if (previous.result.outcome !== outcome) throw unavailable();

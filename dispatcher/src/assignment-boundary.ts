@@ -37,6 +37,7 @@ export type AssignmentResult = { state: "completed" | "failed" | "not-started" |
 
 const BINDING = ["board", "repo", "activation", "connection", "job", "claim", "requirements", "candidate", "policy", "fence"];
 const active = new Set<string>();
+const disposalHeld = new Set<string>();
 const outcome = (state: AssignmentResult["state"]): AssignmentResult => ({ state, qualification: "unqualified-harness", publishable: false });
 const opaque = (value: unknown): value is string => typeof value === "string" && /^[a-f0-9]{32}$/.test(value);
 const whole = (value: unknown, min: number): value is number => Number.isSafeInteger(value) && (value as number) >= min;
@@ -116,8 +117,11 @@ export async function runAssignment(input: AssignmentInput, directory = assignme
   const request = decode(input.raw, input.secrets);
   if (!request || input.adapter.kind !== "fabricated-harness") return outcome("refused");
   const locks: string[] = [];
+  let workspaceKeys: string[] = [];
   let unstarted: { stateDir: string; intent: Intent } | null = null;
-  let prepared: PreparedOwnedAssignment | null = null;
+  let staged = false;
+  let executePrepared: PreparedOwnedAssignment["execute"] | undefined;
+  let closePrepared: PreparedOwnedAssignment["close"] | undefined;
   let stateIsCurrent: (() => boolean) | undefined;
   try {
     const optedIn = "owned" in input;
@@ -132,8 +136,9 @@ export async function runAssignment(input: AssignmentInput, directory = assignme
     }
     const workspace = await current(input, request, state, directory);
     if (workspace === null) return outcome("held");
-    const keys = [state.identity + ":path:" + workspace.path, state.identity + ":file:" + workspace.identity];
-    if (keys.some((key) => active.has(key))) return outcome("held");
+    workspaceKeys = ["path:" + workspace.path, "file:" + workspace.identity];
+    const keys = workspaceKeys.map(key => state.identity + ":" + key);
+    if (workspaceKeys.some(key => disposalHeld.has(key)) || keys.some(key => active.has(key))) return outcome("held");
     for (const key of keys) { active.add(key); locks.push(key); }
     const at = input.now();
     if (!whole(at, 0)) return outcome("held");
@@ -150,8 +155,11 @@ export async function runAssignment(input: AssignmentInput, directory = assignme
     let ownedClaim: object | null = null;
     if (reserved.state === "new") {
       if (optedIn) {
-        prepared = await prepare?.({ intent: structuredClone(intent), workspace: workspace.path }) ?? null;
+        const prepared = await prepare?.({ intent: structuredClone(intent), workspace: workspace.path });
         if (!prepared) throw new Error("Owned assignment preparation is unavailable.");
+        staged = true;
+        closePrepared = prepared.close.bind(prepared);
+        executePrepared = prepared.execute.bind(prepared);
         ownedClaim = bindOwnedWorkspaceClaim(stateDir, intent, prepared.original, stateIsCurrent);
         if (!ownedClaim || (await current(input, request, state, directory))?.identity !== workspace.identity) {
           throw new Error("Assignment authority changed.");
@@ -166,7 +174,7 @@ export async function runAssignment(input: AssignmentInput, directory = assignme
     const execution = { id: request.id, sequence: request.sequence, input: request.input, workspace: workspace.path };
     const observed: unknown = structuredClone(reserved.state === "pending"
       ? await input.adapter.reconcile({ id: request.id, sequence: request.sequence, requestDigest: reserved.intent.requestDigest })
-      : await (prepared ?? input.adapter).execute(execution));
+      : optedIn ? await executePrepared?.(execution) : await input.adapter.execute(execution));
     if (!terminal(observed, request) || (await current(input, request, state, directory))?.identity !== workspace.identity) return outcome("held");
     completeAssignment(stateDir, reserved.intent, observed.result, input.now(), stateIsCurrent);
     if (ownedClaim) await releaseOwnedWorkspaceClaim(ownedClaim);
@@ -181,9 +189,15 @@ export async function runAssignment(input: AssignmentInput, directory = assignme
     return outcome("held");
   }
   finally {
-    if (prepared) {
-      try { await prepared.close(); }
-      catch { return outcome("held"); } // An unconfirmed disposal keeps the workspace fenced in this controller.
+    if (staged) {
+      try {
+        if (!closePrepared) throw new Error("Owned assignment disposal is unavailable.");
+        await closePrepared();
+      } catch {
+        // A replacement state directory cannot clear a fence on the outstanding workspace writer.
+        for (const key of workspaceKeys) disposalHeld.add(key);
+        return outcome("held");
+      }
     }
     for (const key of locks) active.delete(key);
   }
