@@ -5,17 +5,24 @@ import { osWords } from "./platform.ts";
 import { PACKAGE_VERSION, PRODUCT_LINE } from "./version.ts";
 import { confirmHello } from "./coordination.ts";
 import { verifySelectedRelease, type VerifiedSelectedRelease } from "./install.ts";
-import type { ReleaseTrust } from "./release-manifest.ts";
+import { isNewerReleaseVersion, verifyManifest, type ReleaseRequest, type ReleaseTrust } from "./release-manifest.ts";
 import { assertReleaseRoot } from "./release-store.ts";
 import { observeRecordedPid, type PidObservation } from "./process-identity.ts";
 
 export const CODEX_INTERFACE_RULE = "Codex cli and Codex app-server are separate interfaces.";
 
-export type ReleaseStatusContext = { platform: NodeJS.Platform; arch: string; trust?: ReleaseTrust };
+export type ReleaseStatusContext = {
+  platform: NodeJS.Platform;
+  arch: string;
+  trust?: ReleaseTrust;
+  offeredRelease?: Pick<ReleaseRequest, "requestedVersion" | "sourceCommit" | "manifestBytes" | "signatureBytes">;
+};
 
 type ReleaseVerification =
   | { state: "bootstrap" | "unavailable" | "refused" }
   | ({ state: "verified" } & VerifiedSelectedRelease);
+
+type SuppliedReleaseAnnouncement = { version: string; sourceCommit: string };
 
 export type StatusSnapshot = {
   lines: string[];
@@ -23,6 +30,7 @@ export type StatusSnapshot = {
   signedIn: boolean;
   readyForAssignment: false;
   releaseVerification?: ReleaseVerification;
+  newerSuppliedRelease?: SuppliedReleaseAnnouncement;
 };
 
 function toolLine(tool: ToolRecord | undefined, interfaceId: "cli" | "app-server"): string {
@@ -57,6 +65,20 @@ function selectedReleaseLine(verification: ReleaseVerification): string {
   return `Selected release: verification ${verification.state}.`;
 }
 
+function observeSuppliedRelease(ledger: Ledger, context: ReleaseStatusContext, selectedVersion: string): SuppliedReleaseAnnouncement | undefined {
+  const offered = context.offeredRelease;
+  if (!offered || typeof offered.sourceCommit !== "string") return;
+  try {
+    const manifest = verifyManifest(offered.manifestBytes, offered.signatureBytes, context.trust, {
+      version: offered.requestedVersion, sourceCommit: offered.sourceCommit, platform: context.platform, arch: context.arch,
+      dataVersion: ledger.version,
+    });
+    if (isNewerReleaseVersion(manifest.version, selectedVersion)) {
+      return { version: manifest.version, sourceCommit: manifest.provenance.sourceCommit };
+    }
+  } catch { /* An offered release supplies no evidence when verification fails. */ }
+}
+
 export async function statusOf(stateDir: string, custody: Custody, pidAlive?: (pid: number) => boolean,
   releaseContext?: ReleaseStatusContext): Promise<StatusSnapshot> {
   const hello = confirmHello();
@@ -78,6 +100,8 @@ export async function statusOf(stateDir: string, custody: Custody, pidAlive?: (p
     return { exitCode: 1, signedIn: false, readyForAssignment: false, lines: render({ installed: false, health: "not installed", protocolLine: hello.protocolLine, runtimeLine: hello.runtimeLine, servedLine: hello.servedLine }) };
   }
   const releaseVerification = releaseContext && observeSelectedRelease(stateDir, ledger, releaseContext);
+  const newerSuppliedRelease = releaseContext && releaseVerification?.state === "verified"
+    ? observeSuppliedRelease(ledger, releaseContext, releaseVerification.version) : undefined;
   const releaseFailure = releaseVerification?.state === "unavailable" || releaseVerification?.state === "refused"
     ? releaseVerification.state : null;
   const approved = ledger.connection?.phase === "approved";
@@ -93,6 +117,7 @@ export async function statusOf(stateDir: string, custody: Custody, pidAlive?: (p
     writerPidObservation: ledger.workspace ? observeRecordedPid(ledger.workspace.writerPid, pidAlive) : undefined,
     tools: ledger.tools,
     releaseVerification,
+    newerSuppliedRelease,
     health: releaseFailure ? `selected release verification ${releaseFailure}` : "local record ok",
     protocolLine: hello.protocolLine,
     runtimeLine: hello.runtimeLine,
@@ -101,6 +126,7 @@ export async function statusOf(stateDir: string, custody: Custody, pidAlive?: (p
   return {
     exitCode: releaseFailure ? 1 : 0, signedIn, readyForAssignment: false, lines,
     ...(releaseVerification && { releaseVerification }),
+    ...(newerSuppliedRelease && { newerSuppliedRelease }),
   };
 }
 
@@ -122,6 +148,7 @@ function render(input: {
   keychain?: string;
   writerPidObservation?: PidObservation;
   releaseVerification?: ReleaseVerification;
+  newerSuppliedRelease?: SuppliedReleaseAnnouncement;
   tools?: ToolRecord[];
   protocolLine: string;
   runtimeLine: string;
@@ -131,6 +158,7 @@ function render(input: {
   if (input.installed && input.os) {
     lines.push(`Operating system: ${input.os}`, "Signed installers: unqualified.", "Startup: unregistered.");
     if (input.releaseVerification) lines.push(selectedReleaseLine(input.releaseVerification));
+    if (input.newerSuppliedRelease) lines.push(`Verified newer release ${input.newerSuppliedRelease.version} was supplied.`);
     if (input.writerPidObservation === undefined) lines.push("Workspace: none", "Writer: none");
     else {
       const observation = input.writerPidObservation === "present" ? "present (process identity unverified)" : input.writerPidObservation;

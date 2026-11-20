@@ -5,7 +5,7 @@ import { join } from "node:path";
 import { test } from "node:test";
 import { install } from "../src/install.ts";
 import { loadLedger, saveLedger } from "../src/ledger.ts";
-import { releaseDirectory, SIGNATURE_FILE } from "../src/release-manifest.ts";
+import { releaseDirectory, SIGNATURE_FILE, type ReleaseManifest } from "../src/release-manifest.ts";
 import { statusOf } from "../src/status.ts";
 import { io, removeDir, tempDir } from "./helpers.ts";
 import { run } from "../src/cli.ts";
@@ -284,3 +284,103 @@ test("release preflight preserves bootstrap and leaves existing callers unchange
     assert.deepEqual(snapshot(dir), selected);
   } finally { removeDir(dir); }
 });
+
+const suppliedCommit = "d".repeat(40);
+
+function suppliedMetadata(sample: ReturnType<typeof fixture>, changes: Partial<ReleaseManifest> = {}) {
+  const release = sample.signed({ ...sample.manifest, provenance: { ...sample.manifest.provenance, sourceCommit: suppliedCommit },
+    ...changes }).release!;
+  return { requestedVersion: release.requestedVersion, sourceCommit: suppliedCommit,
+    manifestBytes: release.manifestBytes, signatureBytes: release.signatureBytes };
+}
+
+function combinedReleaseTrust(selected: ReturnType<typeof fixture>, supplied: ReturnType<typeof fixture>) {
+  const trust = selected.services.releaseTrust!;
+  return { ...trust, keys: new Map([...trust.keys, ...supplied.services.releaseTrust!.keys]) };
+}
+
+function announcement(status: Awaited<ReturnType<typeof statusOf>>): unknown {
+  return Reflect.get(status, "newerSuppliedRelease");
+}
+
+for (const [installed, offered, newer] of [
+  ["1.9.0", "1.10.0", true], ["1.10.1", "1.9.9", false], ["1.3.0", "1.3.1", true],
+  ["1.3.1", "1.3.0", false], ["1.3.0", "1.3.0", false],
+  ["1.3.0+original", "1.3.0+foreign", false], ["1.3.0-rc.2", "1.3.0-rc.10", true],
+  ["1.3.0-1", "1.3.0-beta", true], ["1.3.0-alpha", "1.3.0-alpha.1", true],
+  ["1.3.0-release-B", "1.3.0-release-a", true], ["1.3.0", "1.3.0-rc.1", false],
+  ["1.3.0-rc.1", "1.3.0", true], ["9007199254740992.0.0", "9007199254740993.0.0", true],
+] as const) {
+  test(`supplied release announcement uses signed precedence for ${installed} and ${offered}`, async () => {
+    const dir = tempDir();
+    try {
+      const selected = installFixture(dir, installed), supplied = fixture(dir, offered);
+      const before = snapshot(dir);
+      const context = { platform: selected.input.platform, arch: selected.input.arch, trust: combinedReleaseTrust(selected, supplied),
+        offeredRelease: suppliedMetadata(supplied) };
+      const status = await statusOf(dir, io().custody!, undefined, context);
+      assert.deepEqual(status.releaseVerification, { state: "verified", version: installed, manifestDigest: active(dir).manifestDigest,
+        sourceCommit: selected.manifest.provenance.sourceCommit });
+      assert.deepEqual(announcement(status), newer ? { version: offered, sourceCommit: suppliedCommit } : undefined);
+      assert.equal(status.lines.includes(`Verified newer release ${offered} was supplied.`), newer);
+      assert.ok(status.lines.includes("Startup: unregistered."));
+      assert.ok(status.lines.includes("Signed installers: unqualified."));
+      assert.equal(status.readyForAssignment, false);
+      assert.equal(status.exitCode, 0);
+      assert.deepEqual(snapshot(dir), before);
+    } finally { removeDir(dir); }
+  });
+}
+
+for (const problem of [
+  "invalid signature", "untrusted signing key", "revoked signing key", "wrong repository", "wrong workflow", "wrong tag",
+  "wrong source commit", "absent source commit", "wrong version", "absent version", "wrong platform", "wrong architecture", "incompatible state",
+] as const) {
+  test(`supplied release announcement omits ${problem} without changing a verified selection`, async () => {
+    const dir = tempDir();
+    try {
+      const selected = installFixture(dir, "1.2.0"), supplied = fixture(dir, "1.3.0");
+      const trust = combinedReleaseTrust(selected, supplied);
+      const provenance = supplied.manifest.provenance;
+      let offeredRelease = suppliedMetadata(supplied);
+      if (problem === "invalid signature") offeredRelease.signatureBytes = Buffer.alloc(64);
+      if (problem === "untrusted signing key") trust.keys.delete(supplied.manifest.keyId);
+      if (problem === "revoked signing key") trust.revokedKeyIds = [supplied.manifest.keyId];
+      if (problem === "wrong repository") offeredRelease = suppliedMetadata(supplied, { provenance: { ...provenance, sourceCommit: suppliedCommit, repository: "https://fabricated.invalid" } });
+      if (problem === "wrong workflow") offeredRelease = suppliedMetadata(supplied, { provenance: { ...provenance, sourceCommit: suppliedCommit, workflow: ".github/workflows/other.yml" } });
+      if (problem === "wrong tag") offeredRelease = suppliedMetadata(supplied, { provenance: { ...provenance, sourceCommit: suppliedCommit, ref: "refs/tags/v1.3.1" } });
+      if (problem === "wrong source commit") offeredRelease.sourceCommit = "e".repeat(40);
+      if (problem === "absent source commit") Reflect.deleteProperty(offeredRelease, "sourceCommit");
+      if (problem === "wrong version") offeredRelease.requestedVersion = "1.3.1";
+      if (problem === "absent version") Reflect.deleteProperty(offeredRelease, "requestedVersion");
+      if (problem === "wrong platform") offeredRelease = suppliedMetadata(supplied, { platform: "darwin" });
+      if (problem === "wrong architecture") offeredRelease = suppliedMetadata(supplied, { arch: "arm64" });
+      if (problem === "incompatible state") offeredRelease = suppliedMetadata(supplied, { dataCompatibility: { min: 2, max: 2 } });
+      const before = snapshot(dir);
+      const custody = io().custody!;
+      const context = { platform: selected.input.platform, arch: selected.input.arch, trust };
+      const withOffer = { ...context, offeredRelease };
+      assert.deepEqual(await statusOf(dir, custody, undefined, withOffer), await statusOf(dir, custody, undefined, context));
+      assert.deepEqual(snapshot(dir), before);
+    } finally { removeDir(dir); }
+  });
+}
+
+for (const issue of ["bootstrap", "missing trust", "changed selected tree"] as const) {
+  test(`supplied release announcement requires a verified selection over ${issue}`, async () => {
+    const dir = tempDir();
+    try {
+      const selected = issue === "bootstrap" ? fixture(dir, "1.2.0") : installFixture(dir, "1.2.0");
+      if (issue === "bootstrap") install(selected.input);
+      if (issue === "changed selected tree") writeFileSync(join(activeDirectory(dir), FILES[0]!.path), "fabricated changed content");
+      const supplied = fixture(dir, "1.3.0");
+      const before = snapshot(dir);
+      const custody = io().custody!;
+      const context = { platform: selected.input.platform, arch: selected.input.arch,
+        trust: issue === "missing trust" ? undefined : combinedReleaseTrust(selected, supplied) };
+      const withOffer = { ...context, offeredRelease: suppliedMetadata(supplied) };
+      assert.deepEqual(await statusOf(dir, custody, undefined, withOffer), await statusOf(dir, custody, undefined, context));
+      assert.deepEqual(snapshot(dir), before);
+    } finally { removeDir(dir); }
+  });
+}

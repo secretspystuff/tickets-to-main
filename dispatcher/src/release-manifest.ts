@@ -47,10 +47,34 @@ function exact(value: unknown, keys: readonly string[]): value is Record<string,
     && Object.keys(value).length === keys.length && keys.every((key) => Object.hasOwn(value, key));
 }
 
-export function releaseVersion(value: unknown): value is string {
-  if (typeof value !== "string" || value.length > 128) return false;
+function releaseVersionParts(value: unknown): RegExpExecArray | null {
+  if (typeof value !== "string" || value.length > 128) return null;
   const match = /^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(?:-([0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*))?(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$/.exec(value);
-  return match !== null && (match[4] === undefined || match[4].split(".").every((part) => !/^0[0-9]+$/.test(part)));
+  if (match?.[4]?.split(".").some((part) => /^0[0-9]+$/.test(part))) return null;
+  return match;
+}
+
+export function releaseVersion(value: unknown): value is string {
+  return releaseVersionParts(value) !== null;
+}
+
+export function isNewerReleaseVersion(offered: string, selected: string): boolean {
+  const offer = releaseVersionParts(offered), current = releaseVersionParts(selected);
+  if (!offer || !current) return false;
+  for (const index of [1, 2, 3]) {
+    if (offer[index] !== current[index]) return BigInt(offer[index]!) > BigInt(current[index]!);
+  }
+  const offeredPrerelease = offer[4]?.split("."), selectedPrerelease = current[4]?.split(".");
+  if (!offeredPrerelease || !selectedPrerelease) return offeredPrerelease === undefined && selectedPrerelease !== undefined;
+  for (const [index, offeredPart] of offeredPrerelease.entries()) {
+    const selectedPart = selectedPrerelease[index];
+    if (selectedPart === undefined) return true;
+    if (offeredPart === selectedPart) continue;
+    const offeredNumeric = /^[0-9]+$/.test(offeredPart), selectedNumeric = /^[0-9]+$/.test(selectedPart);
+    if (offeredNumeric !== selectedNumeric) return selectedNumeric;
+    return offeredNumeric ? BigInt(offeredPart) > BigInt(selectedPart) : offeredPart > selectedPart;
+  }
+  return false;
 }
 
 export function portableReleasePath(value: unknown): value is string {
