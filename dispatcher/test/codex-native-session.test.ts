@@ -89,7 +89,7 @@ test("model and effort preserve exact native values without permission or auth o
 
 test("app-server model evidence separates pre-turn thread configuration from the request", async () => {
   const request = { ...REQUEST, model: "requested-model", effort: "low" };
-  const transport = server((events) => { message(events); terminal(events); }, { observedModel: request.model, reasoningEffort: "high" });
+  const transport = server((events) => { message(events); terminal(events); }, { observedModel: request.model, reasoningEffort: "medium" });
   const handle = startCodexAppServerAssignment(request, transport, {}, [], LAUNCH);
   const settled = await handle.settled;
   handle.closeInput();
@@ -104,13 +104,13 @@ test("app-server model evidence separates pre-turn thread configuration from the
     assert.equal(result.approvalAnswered, false);
     assert.equal(result.observed.modelSelection, undefined);
   }
-  const beforeTurn = { model: request.model, reasoningEffort: "high" };
+  const beforeTurn = { model: request.model, reasoningEffort: "medium" };
   assert.deepEqual([Reflect.get(settled, "appServerModelEvidence"), Reflect.get(closed, "appServerModelEvidence")],
     [{ beforeTurn, reroute: null }, { beforeTurn, reroute: null }]);
 });
 
 test("app-server model evidence keeps only an exact turn's well-formed reroute", async t => {
-  const reroute = { fromModel: "native-model", toModel: "changed-model", reason: "highRiskCyberActivity" };
+  const reroute = { fromModel: "reroute-source-model", toModel: "changed-model", reason: "highRiskCyberActivity" };
   const heldValue = "fabricated-held-model";
   for (const [name, change, outcome, evidence] of [
     ["matching", {}, "held", reroute],
