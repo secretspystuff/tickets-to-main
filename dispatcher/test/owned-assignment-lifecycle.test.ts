@@ -505,11 +505,11 @@ test("an owned opt-in stays selected when its input property is withdrawn during
   assert.equal(f.disposed, 1);
 });
 
-function successorAttempt(f: Space) {
+function successorAttempt(f: Space, { stateDir = f.base.stateDir, owned = true } = {}) {
   const later = { ...f.request, id: id(21), sequence: 2 };
   let reads = 0, prepares = 0, effects = 0;
-  const input: OwnedInput = {
-    ...f.base, raw: JSON.stringify(later),
+  const input: AssignmentInput = {
+    ...f.base, stateDir, raw: JSON.stringify(later),
     adapter: {
       kind: "fabricated-harness",
       async readCurrent() {
@@ -517,12 +517,20 @@ function successorAttempt(f: Space) {
         return { binding: later.binding, nextSequence: later.sequence, authorized: true, seat: "member",
           confirmedWorkspace: f.workspace, writersContained: true };
       },
-      async execute() { effects++; throw new Error("unexpected successor execution"); },
+      async execute(value) { effects++; return owned ? assert.fail("unexpected successor execution") : f.receipt(value); },
       async reconcile() { effects++; return null; },
     },
-    owned: { async prepare() { prepares++; throw new Error("stop the fabricated successor without launch"); } },
   };
+  if (owned) input.owned = { async prepare() { prepares++; throw new Error("stop the fabricated successor without launch"); } };
   return { run: () => runAssignment(input), counts: () => ({ reads, prepares, effects }), id: later.id };
+}
+
+function otherPreparedState(f: Space) {
+  const stateDir = join(dirname(f.base.stateDir), "other-state");
+  install({ stateDir, platform: process.platform, arch: process.arch, nowIso: new Date(0).toISOString() });
+  prepareWorkspace(stateDir, f.workspace, () => false);
+  claimWorkspace(stateDir, process.pid, () => true);
+  return { stateDir, ledger: join(stateDir, "ledger.json"), journal: join(stateDir, "assignment-intents.jsonl") };
 }
 
 for (const mode of ["close rejected", "close rejected with changed state"] as const) {
@@ -586,16 +594,44 @@ test("pending disposal fences the workspace across state identity changes until 
   assert.deepEqual(f.rows().filter(row => row.id === next.id).map(row => row.kind), ["intent", "result"]);
 });
 
+test("pending owned disposal fences a legacy successor through another state until the exact child closes", onWindows, async t => {
+  const f = ownedCase(t, "wrong writer", true);
+  const other = otherPreparedState(f);
+  const otherLedgerBefore = readFileSync(other.ledger);
+  const next = successorAttempt(f, { stateDir: other.stateDir, owned: false });
+  const run = f.run();
+  try {
+    assert.equal(await bounded(Promise.race([f.closing.then(() => "closing"), run.then(() => "returned")])), "closing");
+    assert.equal(f.childExits, 0);
+    const before = f.snapshot();
+    assert.deepEqual(await bounded(next.run()), { state: "held", ...unqualified });
+    assert.deepEqual(next.counts(), { reads: 1, prepares: 0, effects: 0 });
+    assert.equal(existsSync(other.journal), false);
+    assert.deepEqual(readFileSync(other.ledger), otherLedgerBefore);
+    assert.deepEqual(f.snapshot(), before);
+    assert.equal(f.childExits, 0);
+    assert.equal(f.activations, 0);
+    assert.equal(existsSync(f.marker), false);
+  } finally {
+    f.permitClose();
+    await run;
+  }
+  assert.deepEqual(await run, { state: "not-started", ...unqualified });
+  assert.equal(f.childExits, 1);
+  assert.equal(f.disposed, 1);
+  assert.deepEqual(await next.run(), { state: "completed", ...unqualified });
+  assert.deepEqual(next.counts(), { reads: 4, prepares: 0, effects: 1 });
+  const journal = readFileSync(other.journal, "utf8").trim().split("\n").map(line => JSON.parse(line) as JournalRow);
+  assert.deepEqual(journal.map(row => row.kind), ["intent", "started", "result"]);
+  assert.ok(journal.every(row => row.id === next.id));
+});
+
 for (const laterOwned of [true, false]) {
   test(`an active legacy writer preserves ${laterOwned ? "owned isolation" : "separate legacy behavior"} across local state directories`, onWindows, async t => {
     const f = space(t);
     const snapshot = () => ({ ledger: readFileSync(f.ledger), journal: f.journalText() });
-    const otherState = join(dirname(f.base.stateDir), "other-state");
-    install({ stateDir: otherState, platform: process.platform, arch: process.arch, nowIso: new Date(0).toISOString() });
-    prepareWorkspace(otherState, f.workspace, () => false);
-    claimWorkspace(otherState, f.owner, () => true);
-    const otherLedger = join(otherState, "ledger.json"), otherJournal = join(otherState, "assignment-intents.jsonl");
-    const otherLedgerBefore = readFileSync(otherLedger);
+    const other = otherPreparedState(f);
+    const otherLedgerBefore = readFileSync(other.ledger);
     const writing = deferred<void>(), finish = deferred<void>();
     const authorized = (request: AssignmentRequest) => ({ binding: request.binding, nextSequence: request.sequence,
       authorized: true, seat: "member" as const, confirmedWorkspace: f.workspace, writersContained: true });
@@ -608,7 +644,7 @@ for (const laterOwned of [true, false]) {
     const later = { ...f.request, id: id(22), sequence: 2 };
     let reads = 0, executes = 0, prepares = 0;
     const laterInput: AssignmentInput = {
-      ...f.base, stateDir: otherState, raw: JSON.stringify(later), adapter: {
+      ...f.base, stateDir: other.stateDir, raw: JSON.stringify(later), adapter: {
         kind: "fabricated-harness",
         async readCurrent() { reads++; return authorized(later); },
         async execute(value) { executes++; return f.receipt(value); },
@@ -626,8 +662,8 @@ for (const laterOwned of [true, false]) {
         reads: laterOwned ? 1 : 3, prepares: 0, executes: laterOwned ? 0 : 1,
       });
       assert.deepEqual(snapshot(), before);
-      assert.deepEqual(readFileSync(otherLedger), otherLedgerBefore);
-      assert.equal(existsSync(otherJournal), !laterOwned);
+      assert.deepEqual(readFileSync(other.ledger), otherLedgerBefore);
+      assert.equal(existsSync(other.journal), !laterOwned);
     } finally {
       finish.resolve();
       await first;
