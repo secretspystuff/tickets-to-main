@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { win32 } from "node:path";
 import { toolEnv } from "../command.ts";
-import { JsonLines, type NativeTransport } from "../native-transport.ts";
+import { JsonLines, type NativeProcess, type NativeTransport } from "../native-transport.ts";
 import { unknownCapabilities, type AssignmentRequest, type InterfaceClaim } from "./contract.ts";
 import { hasHeldSecret, nativeObservation, opaqueId, record, safeNativeText, type NativeObservation, type NativeOutcome } from "./native-result.ts";
 
@@ -72,6 +72,7 @@ export function startClaudeCliAssignment(
   let successfulTerminal = false;
   const sessionId = randomUUID();
   const messageId = randomUUID();
+  const prompt = request.prompt;
 
   function snapshot(): ClaudeObservation {
     return { ...state, argv: [...state.argv], observed: { ...state.observed }, usage: state.usage === null ? null : { ...state.usage } };
@@ -148,7 +149,7 @@ export function startClaudeCliAssignment(
       return;
     }
     if (!initialized || typeof msg.result !== "string" || !nonnegative(msg.num_turns) || !Number.isInteger(msg.num_turns) || msg.num_turns < 1) { invalid(); return; }
-    state.resultText = safeNativeText(msg.result, secrets, request.prompt);
+    state.resultText = safeNativeText(msg.result, secrets, prompt);
     const usage = record(msg.usage);
     if (usage && nonnegative(usage.input_tokens) && Number.isInteger(usage.input_tokens)
       && nonnegative(usage.output_tokens) && Number.isInteger(usage.output_tokens)) {
@@ -243,7 +244,7 @@ export function startClaudeCliAssignment(
     close(snapshot());
     return handle;
   }
-  if ([request.prompt, request.workspace, request.assignmentId, request.model ?? "", request.effort ?? "", launch.executable]
+  if ([prompt, request.workspace, request.assignmentId, request.model ?? "", request.effort ?? "", launch.executable]
     .some((part) => hasHeldSecret(part, secrets) || safeNativeText(part, secrets) !== part)) {
     outcome("refused", "The assignment includes a credential. It was not sent.");
     close(snapshot());
@@ -255,8 +256,29 @@ export function startClaudeCliAssignment(
   state.argv = [launch.executable, "--print", "--input-format", "stream-json", "--output-format", "stream-json", "--verbose", "--session-id", sessionId];
   if (request.model !== null) state.argv = [...state.argv, `--model=${request.model}`];
   if (request.effort !== null) state.argv = [...state.argv, `--effort=${request.effort}`];
-  const child = transport.start(state.argv, { cwd: request.workspace, env: toolEnv(parentEnv, secrets) }, {
-    spawned() { state.spawned = true; },
+  const line = `${JSON.stringify({
+    type: "user", uuid: messageId, session_id: sessionId, parent_tool_use_id: null, client_composed: true,
+    message: { role: "user", content: prompt },
+  })}\n`;
+  let child: NativeProcess | undefined;
+  let inputAttempted = false;
+  let inputFinished = false;
+  function sendInput(): void {
+    if (!child || !state.spawned || inputAttempted || connectionClosed) return;
+    inputAttempted = true;
+    const written = child.write(line);
+    if (connectionClosed) return;
+    if (!written) outcome("disconnected", "Claude Code input is unavailable. Writer completion is unknown.");
+    // EOF can report closure inline, so record the accepted write before calling it.
+    inputFinished = written;
+    child.endInput();
+  }
+  child = transport.start(state.argv, { cwd: request.workspace, env: toolEnv(parentEnv, secrets) }, {
+    spawned() {
+      if (connectionClosed) return;
+      state.spawned = true;
+      sendInput();
+    },
     stdout(chunk) { if (!connectionClosed) parser.push(chunk); },
     stderr() {},
     inputError() { if (!connectionClosed) outcome("disconnected", "Claude Code input disconnected. Writer completion is unknown."); },
@@ -264,7 +286,7 @@ export function startClaudeCliAssignment(
       if (connectionClosed) return;
       parser.finish();
       connectionClosed = true;
-      if (successfulTerminal && state.spawned && state.outcome === "running" && exit.code === 0 && exit.signal === null && exit.error === null) {
+      if (successfulTerminal && inputFinished && state.outcome === "running" && exit.code === 0 && exit.signal === null && exit.error === null) {
         state.observed.assignment = "supported";
         state.observed.streamResult = "supported";
         state.observed.freshContext = "supported";
@@ -276,10 +298,6 @@ export function startClaudeCliAssignment(
       close(snapshot());
     },
   });
-  if (!child.write(`${JSON.stringify({
-    type: "user", uuid: messageId, session_id: sessionId, parent_tool_use_id: null, client_composed: true,
-    message: { role: "user", content: request.prompt },
-  })}\n`)) outcome("disconnected", "Claude Code input is unavailable. Writer completion is unknown.");
-  child.endInput();
+  sendInput();
   return handle;
 }

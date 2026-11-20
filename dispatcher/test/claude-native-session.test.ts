@@ -79,11 +79,12 @@ test("a native terminal is provisional until clean close, and snapshot copies do
   let ready!: () => void;
   const started = new Promise<void>((resolve) => { ready = resolve; });
   const transport: NativeTransport = { start(_argv, _options, events) {
+    events.spawned();
     return {
       write(text) {
         const input: Input = JSON.parse(text);
         queueMicrotask(() => {
-          events.spawned(); emit(events, init(input)); emit(events, terminal(input)); ready();
+          emit(events, init(input)); emit(events, terminal(input)); ready();
         });
         return true;
       },
@@ -102,6 +103,99 @@ test("a native terminal is provisional until clean close, and snapshot copies do
   release();
   assert.equal((await handle.settled).outcome, "completed");
   assert.equal((await handle.closed).writerState, "unknown");
+});
+
+test("delayed and duplicate spawn events send the original validated assignment only once", async () => {
+  let events!: NativeEvents;
+  const calls: string[] = [];
+  const request = { ...REQUEST };
+  const handle = startClaudeCliAssignment(request, { start(_argv, _options, listener) {
+    events = listener;
+    return { write(line) { calls.push(line); return true; }, endInput() { calls.push("eof"); } };
+  } }, {}, ["fabricated-private-value"], LAUNCH);
+  assert.equal(calls.length, 0);
+  request.prompt = "fabricated-private-value";
+  events.spawned();
+  events.spawned();
+  const [line, eof] = calls;
+  assert.equal(calls.length, 2);
+  assert.ok(line);
+  assert.equal(line.endsWith("\n"), true);
+  const input: Input = JSON.parse(line);
+  assert.equal(input.message.content, REQUEST.prompt);
+  assert.equal(eof, "eof");
+  emit(events, init(input));
+  emit(events, terminal(input, { result: REQUEST.prompt }));
+  events.closed({ code: 0, signal: null, error: null });
+  const result = await handle.closed;
+  assert.equal(result.outcome, "completed");
+  assert.equal(result.resultText, "[assignment input omitted]");
+});
+
+test("a transport closed before spawn receives neither assignment nor EOF even if spawn arrives late", async () => {
+  let events!: NativeEvents;
+  const handle = startClaudeCliAssignment(REQUEST, { start(_argv, _options, listener) {
+    events = listener;
+    return {
+      write() { assert.fail("A refused launch must not receive input."); },
+      endInput() { assert.fail("A refused launch must not receive EOF."); },
+    };
+  } }, {}, [], LAUNCH);
+  events.closed({ code: null, signal: null, error: "spawn" });
+  events.spawned();
+  const result = await handle.closed;
+  assert.equal(result.outcome, "disconnected");
+  assert.equal(result.spawned, false);
+  assert.deepEqual(handle.snapshot(), result);
+});
+
+for (const writeAccepted of [true, false]) {
+  test(`clean close inside an ${writeAccepted ? "accepted" : "unaccepted"} write cannot establish completion`, async () => {
+    let writes = 0;
+    const handle = startClaudeCliAssignment(REQUEST, { start(_argv, _options, events) {
+      events.spawned();
+      return {
+        write(line) {
+          writes++;
+          const input: Input = JSON.parse(line);
+          emit(events, init(input));
+          emit(events, terminal(input));
+          events.closed({ code: 0, signal: null, error: null });
+          return writeAccepted;
+        },
+        endInput() { assert.fail("A closed transport must not receive EOF."); },
+      };
+    } }, {}, [], LAUNCH);
+    const result = await handle.closed;
+    assert.equal(writes, 1);
+    assert.equal(result.outcome, "disconnected");
+    assert.equal(result.observed.assignment, undefined);
+    assert.deepEqual(await handle.settled, result);
+    assert.deepEqual(handle.snapshot(), result);
+  });
+}
+
+test("clean close inside EOF can complete an accepted and correlated assignment", async () => {
+  const calls: string[] = [];
+  const result = await finish({ start(_argv, _options, events) {
+    events.spawned();
+    return {
+      write(line) {
+        calls.push("write");
+        const input: Input = JSON.parse(line);
+        emit(events, init(input));
+        emit(events, terminal(input));
+        return true;
+      },
+      endInput() {
+        calls.push("eof");
+        events.closed({ code: 0, signal: null, error: null });
+      },
+    };
+  } });
+  assert.deepEqual(calls, ["write", "eof"]);
+  assert.equal(result.outcome, "completed");
+  assert.equal(result.observed.assignment, "supported");
 });
 
 test("native model and exact supported CLI effort remain requested versus observed, with no Dispatcher fallback", async () => {
