@@ -27,7 +27,7 @@ type OwnedInput = AssignmentInput & {
 type Scenario = "complete" | "wrong writer" | "revoked" | "claim replaced" | "successor claim" | "prepare rejected"
   | "start flush" | "interrupted" | "wrong terminal" | "revoked after execution" | "result flush" | "witness lost"
   | "state changed during staging" | "state changed during bind" | "state changed during start" | "state changed during terminal"
-  | "opt-in withdrawn" | "close rejected" | "close rejected with changed state" | "missing journal"
+  | "opt-in withdrawn" | "close rejected" | "close rejected with changed state" | "close pending with changed state" | "missing journal"
   | "prepared execute changed" | "prepared close changed"
   | "reservation pid changed" | "reservation birth changed" | "reservation time changed";
 type JournalRow = { kind: string; id: string; sequence: number; requestDigest: string; outcome?: string };
@@ -167,7 +167,8 @@ async function stage(f: Space, beforeResume: () => void) {
 
 function ownedCase(t: TestContext, mode: Scenario, gateClose = false) {
   const closeRejected = mode === "close rejected" || mode === "close rejected with changed state";
-  const f = space(t, mode === "wrong writer" || closeRejected);
+  const closePending = mode === "close pending with changed state";
+  const f = space(t, mode === "wrong writer" || closeRejected || closePending);
   const { flushes, faults, started } = observeFlushes(t, f, mode);
   const snapshot = () => ({ ledger: readFileSync(f.ledger), journal: f.journalText() });
   const savedJournal = `${f.journal}.saved`;
@@ -176,7 +177,7 @@ function ownedCase(t: TestContext, mode: Scenario, gateClose = false) {
   let changedInEpoch: string | undefined;
   let mismatchObservations = 0;
   let atJournalLoss: ReturnType<typeof snapshot> | undefined;
-  if (mode.startsWith("state changed") || mode === "close rejected with changed state") {
+  if (mode.startsWith("state changed") || mode === "close rejected with changed state" || closePending) {
     const { lstatSync: lstat, renameSync: rename } = fs;
     const leaseRoot = join(f.base.stateDir, ".state-leases", "ledger");
     fs.renameSync = (source, destination) => {
@@ -504,6 +505,26 @@ test("an owned opt-in stays selected when its input property is withdrawn during
   assert.equal(f.disposed, 1);
 });
 
+function successorAttempt(f: Space) {
+  const later = { ...f.request, id: id(21), sequence: 2 };
+  let reads = 0, prepares = 0, effects = 0;
+  const input: OwnedInput = {
+    ...f.base, raw: JSON.stringify(later),
+    adapter: {
+      kind: "fabricated-harness",
+      async readCurrent() {
+        reads++;
+        return { binding: later.binding, nextSequence: later.sequence, authorized: true, seat: "member",
+          confirmedWorkspace: f.workspace, writersContained: true };
+      },
+      async execute() { effects++; throw new Error("unexpected successor execution"); },
+      async reconcile() { effects++; return null; },
+    },
+    owned: { async prepare() { prepares++; throw new Error("stop the fabricated successor without launch"); } },
+  };
+  return { run: () => runAssignment(input), counts: () => ({ reads, prepares, effects }), id: later.id };
+}
+
 for (const mode of ["close rejected", "close rejected with changed state"] as const) {
   test(`an owned disposal rejection fences the workspace when ${mode}`, onWindows, async t => {
     const f = ownedCase(t, mode);
@@ -517,27 +538,12 @@ for (const mode of ["close rejected", "close rejected with changed state"] as co
     const before = f.snapshot();
     const replay = await f.run();
     if (mode === "close rejected with changed state") f.changeStateObservation();
-    const later = { ...f.request, id: id(21), sequence: 2 };
-    let nextReads = 0, nextWork = 0;
-    const other: OwnedInput = {
-      ...f.base, raw: JSON.stringify(later),
-      adapter: {
-        kind: "fabricated-harness",
-        async readCurrent() {
-          nextReads++;
-          return { binding: later.binding, nextSequence: later.sequence, authorized: true, seat: "member",
-            confirmedWorkspace: f.workspace, writersContained: true };
-        },
-        async execute() { nextWork++; throw new Error("unexpected successor execution"); },
-        async reconcile() { nextWork++; return null; },
-      },
-      owned: { async prepare() { nextWork++; throw new Error("unexpected successor preparation"); } },
-    };
-    const successorResult = await runAssignment(other);
+    const next = successorAttempt(f);
+    const successorResult = await next.run();
     if (mode === "close rejected with changed state") assert.ok(f.mismatchObservations > 0);
-    assert.deepEqual({ result, replay, successorResult, nextReads, nextWork }, {
+    assert.deepEqual({ result, replay, successorResult, next: next.counts() }, {
       result: { state: "held", ...unqualified }, replay: { state: "held", ...unqualified },
-      successorResult: { state: "held", ...unqualified }, nextReads: 1, nextWork: 0,
+      successorResult: { state: "held", ...unqualified }, next: { reads: 1, prepares: 0, effects: 0 },
     });
     assert.deepEqual(f.snapshot(), before);
     assert.deepEqual(f.events.map(event => event.event), ["prepared", "suspended", "close"]);
@@ -548,6 +554,37 @@ for (const mode of ["close rejected", "close rejected with changed state"] as co
     assert.equal(f.childExits, 1, "test cleanup must close the exact staged fixture once");
   });
 }
+
+test("pending disposal fences the workspace across state identity changes until the exact child closes", onWindows, async t => {
+  const f = ownedCase(t, "close pending with changed state", true);
+  const run = f.run();
+  const next = successorAttempt(f);
+  try {
+    assert.equal(await bounded(Promise.race([f.closing.then(() => "closing"), run.then(() => "returned")])), "closing");
+    assert.equal(f.childExits, 0);
+    assert.equal(f.disposed, 0);
+    f.changeStateObservation();
+    const before = f.snapshot();
+    const held = await bounded(next.run());
+    assert.ok(f.mismatchObservations > 0);
+    assert.equal(f.childExits, 0);
+    assert.deepEqual({ held, next: next.counts() }, {
+      held: { state: "held", ...unqualified }, next: { reads: 1, prepares: 0, effects: 0 },
+    });
+    assert.deepEqual(f.snapshot(), before);
+    assert.equal(f.activations, 0);
+    assert.equal(existsSync(f.marker), false);
+  } finally {
+    f.permitClose();
+    await run;
+  }
+  assert.deepEqual(await run, { state: "not-started", ...unqualified });
+  assert.equal(f.childExits, 1);
+  assert.equal(f.disposed, 1);
+  assert.deepEqual(await next.run(), { state: "not-started", ...unqualified });
+  assert.deepEqual(next.counts(), { reads: 3, prepares: 1, effects: 0 });
+  assert.deepEqual(f.rows().filter(row => row.id === next.id).map(row => row.kind), ["intent", "result"]);
+});
 
 test("an owned start refusal preserves a missing prepared journal and its saved bytes", onWindows, async t => {
   const f = ownedCase(t, "missing journal");
