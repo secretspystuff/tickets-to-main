@@ -126,7 +126,8 @@ export function releaseWorkspace(stateDir: string): string[] {
   return ["Writer released."];
 }
 
-export function bindOwnedWorkspaceClaim(stateDir: string, prepared: Intent, original: OriginalObserver): object | null {
+export function bindOwnedWorkspaceClaim(stateDir: string, prepared: Intent, original: OriginalObserver,
+  stateIsCurrent?: () => boolean): object | null {
   let committed: OwnedClaim | undefined;
   try {
     const intent = structuredClone(prepared);
@@ -141,7 +142,7 @@ export function bindOwnedWorkspaceClaim(stateDir: string, prepared: Intent, orig
       if (!ledger.install) throw new StateError("The recorded workspace is unavailable.");
       const current = ledger.workspace;
       if (!current || current.writerPid !== intent.pid || current.claimGeneration !== undefined
-        || directoryBirthTime(state) !== stateBirth) return;
+        || (stateIsCurrent && !stateIsCurrent()) || directoryBirthTime(state) !== stateBirth) return;
       assertCurrentWorkspace(state.path, current.path);
       const checkout = assignmentDirectory(current.path);
       if (checkout.path !== current.path || journalDigest(checkout.path) !== intent.workspaceDigest

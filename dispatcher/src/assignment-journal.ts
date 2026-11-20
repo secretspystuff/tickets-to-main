@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { readExistingPrivateJournalUnderLease, withPrivateJournal } from "./private-journal.ts";
+import { readExistingPrivateJournalUnderLease, withPrivateJournal, type JournalWriteOptions } from "./private-journal.ts";
 import { currentProcessOwner, validProcessBirth, type ProcessOwner } from "./process-identity.ts";
 
 export type Intent = {
@@ -63,8 +63,8 @@ function records(text: string): Map<string, Entry> {
 }
 
 function transact<T>(stateDir: string, operation: (entries: Map<string, Entry>, append: (value: Intent | Started | Result) => void) => T,
-  mode?: "append-existing"): T {
-  return withPrivateJournal(stateDir, "assignment-intents.jsonl", records, operation, mode);
+  options?: JournalWriteOptions): T {
+  return withPrivateJournal(stateDir, "assignment-intents.jsonl", records, operation, options);
 }
 
 function matching(left: Intent, right: Intent): boolean {
@@ -111,7 +111,8 @@ export function hasOwnedTerminalUnderLease(stateDir: string, intent: Intent): bo
   return true;
 }
 
-export function reserveAssignment(stateDir: string, intent: Intent, legacyWorkspaceDigest: string, ownerAlive: (owner: ProcessOwner) => boolean): { state: "new" | "pending" | Result["outcome"]; intent: Intent } {
+export function reserveAssignment(stateDir: string, intent: Intent, legacyWorkspaceDigest: string, ownerAlive: (owner: ProcessOwner) => boolean,
+  stateIsCurrent?: () => boolean): { state: "new" | "pending" | Result["outcome"]; intent: Intent } {
   return transact(stateDir, (entries, append) => {
     const sameWorkspace = (old: Intent) => old.version === 4 ? overlap(old, intent)
       : old.workspaceDigest === (old.version === 3 ? intent.aliasDigest : legacyWorkspaceDigest);
@@ -138,7 +139,7 @@ export function reserveAssignment(stateDir: string, intent: Intent, legacyWorksp
       || (prior.length > 0 && Math.max(...prior.map((entry) => entry.intent.sequence)) + 1 !== intent.sequence)) throw unavailable();
     append(intent);
     return { state: "new", intent };
-  });
+  }, { stateIsCurrent });
 }
 
 export function startAssignment(stateDir: string, intent: Intent, at: number, claimIsCurrent?: () => boolean): void {
@@ -149,10 +150,11 @@ export function startAssignment(stateDir: string, intent: Intent, at: number, cl
     if (claimIsCurrent && (entry.intent.version !== 4 || entry.intent.pid !== intent.pid
       || entry.intent.birth !== intent.birth || entry.intent.at !== intent.at || !claimIsCurrent())) throw unavailable();
     append({ kind: "started", id: intent.id, sequence: intent.sequence, requestDigest: intent.requestDigest, at });
-  }, claimIsCurrent ? "append-existing" : undefined);
+  }, { existingOnly: claimIsCurrent !== undefined });
 }
 
-export function completeAssignment(stateDir: string, intent: Intent, outcome: Result["outcome"], at: number): void {
+export function completeAssignment(stateDir: string, intent: Intent, outcome: Result["outcome"], at: number,
+  stateIsCurrent?: () => boolean): void {
   transact(stateDir, (entries, append) => {
     const previous = entries.get(intent.id);
     if (!previous || !matching(previous.intent, intent) || !integer(at, 0) || at < previous.intent.at) throw unavailable();
@@ -162,7 +164,7 @@ export function completeAssignment(stateDir: string, intent: Intent, outcome: Re
       return;
     }
     append({ kind: "result", id: intent.id, sequence: intent.sequence, requestDigest: intent.requestDigest, at, outcome });
-  });
+  }, { existingOnly: stateIsCurrent !== undefined, stateIsCurrent });
 }
 
 function owned(intent: Intent): boolean {

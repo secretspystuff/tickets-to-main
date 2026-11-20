@@ -4,6 +4,7 @@ import { assertPrivateAccess, assertPrivateDirectory } from "./fs-safety.ts";
 import { withStateLease } from "./state-lease.ts";
 
 type Journal = "assignment-intents.jsonl" | "artifact-preparation.jsonl";
+export type JournalWriteOptions = { existingOnly?: boolean; stateIsCurrent?: () => boolean };
 const MAX_BYTES = 8 * 1024 * 1024;
 const unavailable = () => new Error("The private journal is unavailable. Saved work was preserved.");
 
@@ -46,25 +47,28 @@ export function readExistingPrivateJournalUnderLease<History>(stateDir: string, 
 
 export function withPrivateJournal<History, Entry, Result>(stateDir: string, journal: Journal,
   decode: (text: string) => History, operation: (history: History, append: (entry: Entry) => void) => Result,
-  mode: "append" | "append-existing" = "append"): Result {
+  options?: JournalWriteOptions): Result {
   if (journal !== "assignment-intents.jsonl" && journal !== "artifact-preparation.jsonl") throw unavailable();
   assertPrivateDirectory(stateDir);
-  return withStateLease(stateDir, "ledger", () => withJournalFile(stateDir, journal, mode, (fd, created) => {
-    const text = readFileSync(fd, "utf8");
-    const history = decode(text);
-    // A previous holder may have died after writing bytes but before their flush completed.
-    fsyncSync(fd);
-    if (created && process.platform !== "win32") {
-      const directory = openSync(stateDir, "r");
-      try { fsyncSync(directory); } finally { closeSync(directory); }
-    }
-    let length = Buffer.byteLength(text);
-    return operation(history, entry => {
-      const bytes = JSON.stringify(entry) + "\n";
-      length += Buffer.byteLength(bytes);
-      if (length > MAX_BYTES) throw unavailable();
-      writeFileSync(fd, bytes);
+  return withStateLease(stateDir, "ledger", () => {
+    if (options?.stateIsCurrent && !options.stateIsCurrent()) throw unavailable();
+    return withJournalFile(stateDir, journal, options?.existingOnly ? "append-existing" : "append", (fd, created) => {
+      const text = readFileSync(fd, "utf8");
+      const history = decode(text);
+      // A previous holder may have died after writing bytes but before their flush completed.
       fsyncSync(fd);
+      if (created && process.platform !== "win32") {
+        const directory = openSync(stateDir, "r");
+        try { fsyncSync(directory); } finally { closeSync(directory); }
+      }
+      let length = Buffer.byteLength(text);
+      return operation(history, entry => {
+        const bytes = JSON.stringify(entry) + "\n";
+        length += Buffer.byteLength(bytes);
+        if (length > MAX_BYTES) throw unavailable();
+        writeFileSync(fd, bytes);
+        fsyncSync(fd);
+      });
     });
-  }));
+  });
 }
