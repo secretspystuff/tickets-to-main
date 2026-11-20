@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { readExistingPrivateJournalUnderLease, withPrivateJournal } from "./private-journal.ts";
+import { readExistingPrivateJournalUnderLease, withPrivateJournal, type JournalWriteOptions } from "./private-journal.ts";
 import { currentProcessOwner, validProcessBirth, type ProcessOwner } from "./process-identity.ts";
 
 export type Intent = {
@@ -62,14 +62,20 @@ function records(text: string): Map<string, Entry> {
   return entries;
 }
 
-function transact<T>(stateDir: string, operation: (entries: Map<string, Entry>, append: (value: Intent | Started | Result) => void) => T): T {
-  return withPrivateJournal(stateDir, "assignment-intents.jsonl", records, operation);
+function transact<T>(stateDir: string, operation: (entries: Map<string, Entry>, append: (value: Intent | Started | Result) => void) => T,
+  options?: JournalWriteOptions): T {
+  return withPrivateJournal(stateDir, "assignment-intents.jsonl", records, operation, options);
 }
 
 function matching(left: Intent, right: Intent): boolean {
   return left.id === right.id && left.sequence === right.sequence && left.requestDigest === right.requestDigest
     && left.bindingDigest === right.bindingDigest && left.workspaceDigest === right.workspaceDigest && left.scopeDigest === right.scopeDigest
     && left.aliasDigest === right.aliasDigest;
+}
+
+function sameReservation(left: Intent, right: Intent): boolean {
+  return matching(left, right) && left.version === right.version && left.pid === right.pid
+    && left.birth === right.birth && left.at === right.at;
 }
 
 function overlap(a: Intent, b: Intent): boolean {
@@ -80,8 +86,7 @@ function overlap(a: Intent, b: Intent): boolean {
 function ownedAssignmentUnderLease(stateDir: string, intent: Intent): { entries: Map<string, Entry>; entry: Entry } | null {
   const entries = readExistingPrivateJournalUnderLease(stateDir, "assignment-intents.jsonl", records);
   const entry = entries.get(intent.id);
-  if (!entry || entry.intent.version !== 4 || intent.version !== 4 || !matching(entry.intent, intent)
-    || entry.intent.pid !== intent.pid || entry.intent.birth !== intent.birth || entry.intent.at !== intent.at) return null;
+  if (!entry || entry.intent.version !== 4 || !sameReservation(entry.intent, intent)) return null;
   return { entries, entry };
 }
 
@@ -110,7 +115,8 @@ export function hasOwnedTerminalUnderLease(stateDir: string, intent: Intent): bo
   return true;
 }
 
-export function reserveAssignment(stateDir: string, intent: Intent, legacyWorkspaceDigest: string, ownerAlive: (owner: ProcessOwner) => boolean): { state: "new" | "pending" | Result["outcome"]; intent: Intent } {
+export function reserveAssignment(stateDir: string, intent: Intent, legacyWorkspaceDigest: string, ownerAlive: (owner: ProcessOwner) => boolean,
+  stateIsCurrent?: () => boolean): { state: "new" | "pending" | Result["outcome"]; intent: Intent } {
   return transact(stateDir, (entries, append) => {
     const sameWorkspace = (old: Intent) => old.version === 4 ? overlap(old, intent)
       : old.workspaceDigest === (old.version === 3 ? intent.aliasDigest : legacyWorkspaceDigest);
@@ -137,29 +143,34 @@ export function reserveAssignment(stateDir: string, intent: Intent, legacyWorksp
       || (prior.length > 0 && Math.max(...prior.map((entry) => entry.intent.sequence)) + 1 !== intent.sequence)) throw unavailable();
     append(intent);
     return { state: "new", intent };
-  });
+  }, { stateIsCurrent });
 }
 
-export function startAssignment(stateDir: string, intent: Intent, at: number): void {
+export function startAssignment(stateDir: string, intent: Intent, at: number, claimIsCurrent?: () => boolean): void {
   transact(stateDir, (entries, append) => {
     const entry = entries.get(intent.id);
-    if (!entry || !matching(entry.intent, intent) || entry.intent.version === undefined || !owned(entry.intent)
+    if (!entry || entry.intent.version === undefined || !owned(entry.intent)
       || entry.started || entry.result || !integer(at, 0) || at < entry.intent.at) throw unavailable();
+    if (claimIsCurrent) {
+      if (entry.intent.version !== 4 || !sameReservation(entry.intent, intent) || !claimIsCurrent()) throw unavailable();
+    } else if (!matching(entry.intent, intent)) throw unavailable();
     append({ kind: "started", id: intent.id, sequence: intent.sequence, requestDigest: intent.requestDigest, at });
-  });
+  }, { existingOnly: claimIsCurrent !== undefined });
 }
 
-export function completeAssignment(stateDir: string, intent: Intent, outcome: Result["outcome"], at: number): void {
+export function completeAssignment(stateDir: string, intent: Intent, outcome: Result["outcome"], at: number,
+  stateIsCurrent?: () => boolean): void {
   transact(stateDir, (entries, append) => {
     const previous = entries.get(intent.id);
-    if (!previous || !matching(previous.intent, intent) || !integer(at, 0) || at < previous.intent.at) throw unavailable();
+    if (!previous || !integer(at, 0) || at < previous.intent.at
+      || !(stateIsCurrent ? sameReservation(previous.intent, intent) : matching(previous.intent, intent))) throw unavailable();
     if (outcome === "not-started" ? previous.intent.version === undefined || !owned(previous.intent) : !previous.started) throw unavailable();
     if (previous.result) {
       if (previous.result.outcome !== outcome) throw unavailable();
       return;
     }
     append({ kind: "result", id: intent.id, sequence: intent.sequence, requestDigest: intent.requestDigest, at, outcome });
-  });
+  }, { existingOnly: stateIsCurrent !== undefined, stateIsCurrent });
 }
 
 function owned(intent: Intent): boolean {

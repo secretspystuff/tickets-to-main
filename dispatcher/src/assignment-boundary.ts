@@ -1,8 +1,10 @@
 import { assertPrivateDirectory } from "./fs-safety.ts";
-import { assignmentDirectory, directoriesOverlap, type DirectoryIdentity } from "./directory-identity.ts";
+import { assignmentDirectory, directoriesOverlap, directoryBirthTime, type DirectoryIdentity } from "./directory-identity.ts";
 import { currentProcessOwner, processOwnerAlive, type ProcessOwner } from "./process-identity.ts";
 import { safeNativeText } from "./adapters/native-result.ts";
 import { completeAssignment, journalDigest, reserveAssignment, startAssignment, type Intent } from "./assignment-journal.ts";
+import type { WindowsOwnedNativeProcess } from "./native-transport.ts";
+import { bindOwnedWorkspaceClaim, releaseOwnedWorkspaceClaim, startOwnedWorkspaceClaim } from "./workspace.ts";
 
 export type AssignmentBinding = {
   board: string; repo: string; activation: string; connection: string; job: string;
@@ -22,11 +24,20 @@ export type AssignmentAdapter = {
   execute(input: { id: string; sequence: number; input: string; workspace: string }): Promise<AssignmentTerminal>;
   reconcile(input: { id: string; sequence: number; requestDigest: string }): Promise<AssignmentTerminal | null>;
 };
-export type AssignmentInput = { stateDir: string; raw: string; secrets: readonly string[]; now(): number; adapter: AssignmentAdapter };
+type PreparedOwnedAssignment = {
+  original: Pick<WindowsOwnedNativeProcess, "observeOriginalGroup">;
+  execute: AssignmentAdapter["execute"];
+  close(): Promise<void>;
+};
+export type AssignmentInput = {
+  stateDir: string; raw: string; secrets: readonly string[]; now(): number; adapter: AssignmentAdapter;
+  owned?: { prepare(input: { intent: Intent; workspace: string }): Promise<PreparedOwnedAssignment | null> };
+};
 export type AssignmentResult = { state: "completed" | "failed" | "not-started" | "held" | "refused"; qualification: "unqualified-harness"; publishable: false };
 
+type LocalAdmission = { owned: boolean; state: string; workspacePath: string; workspaceIdentity: string };
 const BINDING = ["board", "repo", "activation", "connection", "job", "claim", "requirements", "candidate", "policy", "fence"];
-const active = new Set<string>();
+const active = new Set<LocalAdmission>();
 const outcome = (state: AssignmentResult["state"]): AssignmentResult => ({ state, qualification: "unqualified-harness", publishable: false });
 const opaque = (value: unknown): value is string => typeof value === "string" && /^[a-f0-9]{32}$/.test(value);
 const whole = (value: unknown, min: number): value is number => Number.isSafeInteger(value) && (value as number) >= min;
@@ -105,17 +116,32 @@ const ownerAlive = (owner: ProcessOwner) => processOwnerAlive(owner, true);
 export async function runAssignment(input: AssignmentInput, directory = assignmentDirectory): Promise<AssignmentResult> {
   const request = decode(input.raw, input.secrets);
   if (!request || input.adapter.kind !== "fabricated-harness") return outcome("refused");
-  const locks: string[] = [];
+  let admission: LocalAdmission | undefined;
   let unstarted: { stateDir: string; intent: Intent } | null = null;
+  let staged = false;
+  let executePrepared: PreparedOwnedAssignment["execute"] | undefined;
+  let closePrepared: PreparedOwnedAssignment["close"] | undefined;
+  let stateIsCurrent: (() => boolean) | undefined;
   try {
+    const optedIn = "owned" in input;
+    const port = optedIn ? input.owned : undefined;
+    const prepare = port?.prepare.bind(port);
     const state = directory(input.stateDir);
     const stateDir = state.path;
     assertPrivateDirectory(stateDir);
+    if (optedIn) {
+      const birth = directoryBirthTime(state);
+      stateIsCurrent = () => directoryBirthTime(state) === birth;
+    }
     const workspace = await current(input, request, state, directory);
     if (workspace === null) return outcome("held");
-    const keys = [state.identity + ":path:" + workspace.path, state.identity + ":file:" + workspace.identity];
-    if (keys.some((key) => active.has(key))) return outcome("held");
-    for (const key of keys) { active.add(key); locks.push(key); }
+    for (const held of active) {
+      // An owned writer can outlive the state directory that admitted it.
+      if ((optedIn || held.owned || held.state === state.identity)
+        && (held.workspacePath === workspace.path || held.workspaceIdentity === workspace.identity)) return outcome("held");
+    }
+    admission = { owned: optedIn, state: state.identity, workspacePath: workspace.path, workspaceIdentity: workspace.identity };
+    active.add(admission);
     const at = input.now();
     if (!whole(at, 0)) return outcome("held");
     const intent: Intent = {
@@ -123,28 +149,56 @@ export async function runAssignment(input: AssignmentInput, directory = assignme
       bindingDigest: journalDigest(canonical(request.binding)), workspaceDigest: journalDigest(workspace.path), aliasDigest: journalDigest(workspace.identity),
       scopeDigest: journalDigest(canonical({ board: request.binding.board, repo: request.binding.repo, connection: request.binding.connection })), at, ...currentProcessOwner(),
     };
-    const reserved = reserveAssignment(stateDir, intent, journalDigest(workspace.legacyPath), ownerAlive);
+    const reserved = reserveAssignment(stateDir, intent, journalDigest(workspace.legacyPath), ownerAlive, stateIsCurrent);
     if (reserved.state === "new") unstarted = { stateDir, intent };
     if ((await current(input, request, state, directory))?.identity !== workspace.identity) throw new Error("Assignment authority changed.");
     if (reserved.state === "completed" || reserved.state === "failed" || reserved.state === "not-started") return outcome(reserved.state);
     if (reserved.state === "pending" && ownerAlive(reserved.intent)) return outcome("held");
-    if (reserved.state === "new") startAssignment(stateDir, intent, input.now());
+    let ownedClaim: object | null = null;
+    if (reserved.state === "new") {
+      if (optedIn) {
+        const prepared = await prepare?.({ intent: structuredClone(intent), workspace: workspace.path });
+        if (!prepared) throw new Error("Owned assignment preparation is unavailable.");
+        staged = true;
+        closePrepared = prepared.close.bind(prepared);
+        executePrepared = prepared.execute.bind(prepared);
+        ownedClaim = bindOwnedWorkspaceClaim(stateDir, intent, prepared.original, stateIsCurrent);
+        if (!ownedClaim || (await current(input, request, state, directory))?.identity !== workspace.identity) {
+          throw new Error("Assignment authority changed.");
+        }
+        startOwnedWorkspaceClaim(ownedClaim, input.now());
+      } else {
+        startAssignment(stateDir, intent, input.now());
+      }
+    }
     unstarted = null;
     // An intent surviving its controller is uncertain at every age; only read-only evidence can resolve it.
+    const execution = { id: request.id, sequence: request.sequence, input: request.input, workspace: workspace.path };
     const observed: unknown = structuredClone(reserved.state === "pending"
       ? await input.adapter.reconcile({ id: request.id, sequence: request.sequence, requestDigest: reserved.intent.requestDigest })
-      : await input.adapter.execute({ id: request.id, sequence: request.sequence, input: request.input, workspace: workspace.path }));
+      : optedIn ? await executePrepared?.(execution) : await input.adapter.execute(execution));
     if (!terminal(observed, request) || (await current(input, request, state, directory))?.identity !== workspace.identity) return outcome("held");
-    completeAssignment(stateDir, reserved.intent, observed.result, input.now());
+    completeAssignment(stateDir, reserved.intent, observed.result, input.now(), stateIsCurrent);
+    if (ownedClaim) await releaseOwnedWorkspaceClaim(ownedClaim);
     return outcome(observed.result);
   } catch {
     if (unstarted) {
       try {
-        completeAssignment(unstarted.stateDir, unstarted.intent, "not-started", input.now());
+        completeAssignment(unstarted.stateDir, unstarted.intent, "not-started", input.now(), stateIsCurrent);
         return outcome("not-started");
       } catch { /* Storage failure preserves uncertainty until durable evidence can be read. */ }
     }
     return outcome("held");
   }
-  finally { for (const key of locks) active.delete(key); }
+  finally {
+    if (staged) {
+      try {
+        if (!closePrepared) throw new Error("Owned assignment disposal is unavailable.");
+        await closePrepared();
+      } catch {
+        return outcome("held");
+      }
+    }
+    if (admission) active.delete(admission);
+  }
 }
