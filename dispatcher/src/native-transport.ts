@@ -115,9 +115,52 @@ export interface WindowsOwnedNativeTransport extends NativeTransport {
   start(...args: Parameters<NativeTransport["start"]>): WindowsOwnedNativeProcess;
 }
 
+type OwnedObserver = Pick<WindowsOwnedNativeProcess, "observeOriginalGroup">;
+type OwnedProcessRecord = {
+  executable: string | undefined;
+  options: Parameters<NativeTransport["start"]>[1];
+  pipe: NativeProcess;
+  available(): boolean;
+  canAttach(): boolean;
+  receiver: NativeEvents | null;
+  last: { sample: OriginalGroup; count: number } | null;
+};
+const ownedProcesses = new WeakMap<object, OwnedProcessRecord>();
+
+export function attachOwnedNativeProcess(process: WindowsOwnedNativeProcess, executable: string,
+  options: Parameters<NativeTransport["start"]>[1], receiver: NativeEvents): NativeProcess {
+  const record = ownedProcesses.get(process);
+  if (!record || record.receiver || !record.canAttach() || record.executable !== executable || record.options.cwd !== options.cwd
+    || Object.keys(record.options.env).length !== Object.keys(options.env).length
+    || !Object.entries(record.options.env).every(([name, value]) => Object.hasOwn(options.env, name) && options.env[name] === value)) {
+    throw new Error("The staged native process cannot be attached.");
+  }
+  record.receiver = receiver;
+  return record.pipe;
+}
+
+export function isOwnedNativeProcess(process: NativeTransport | WindowsOwnedNativeProcess): process is WindowsOwnedNativeProcess {
+  return ownedProcesses.has(process);
+}
+
+export function originalOwnedGroupObserver(process: OwnedObserver): OwnedObserver["observeOriginalGroup"] | null {
+  const record = ownedProcesses.get(process);
+  if (!record) return null;
+  const observe = process.observeOriginalGroup.bind(process);
+  return async () => {
+    const previous = record.last;
+    const sample = await observe();
+    const current = record.last;
+    return current && current !== previous && current.sample === sample && record.available()
+      ? { state: "verified", activeProcesses: current.count } : { state: "unavailable" };
+  };
+}
+
 export function windowsOwnedNativeTransport(launcher: WindowsOwnedLauncher): WindowsOwnedNativeTransport {
   return {
     start(argv, options, events) {
+      argv = Object.freeze([...argv]);
+      options = Object.freeze({ cwd: options.cwd, env: Object.freeze({ ...options.env }) });
       let state: "opening" | "active" | "held" | "closed" = "opening";
       let launch: WindowsOwnedLaunch | null = null;
       let originalJob: object | undefined;
@@ -138,7 +181,9 @@ export function windowsOwnedNativeTransport(launcher: WindowsOwnedLauncher): Win
       function report(result: NativeExit) {
         if (reported) return;
         reported = true;
+        const exactExit = { ...result };
         events.closed(result);
+        record.receiver?.closed(exactExit);
       }
 
       function closeObservation() {
@@ -173,11 +218,21 @@ export function windowsOwnedNativeTransport(launcher: WindowsOwnedLauncher): Win
         try {
           launch = await launcher.start(argv, options, {
             spawned() {},
-            stdout(chunk) { if (state === "active") events.stdout(chunk); },
-            stderr(chunk) { if (state === "active") events.stderr(chunk); },
+            stdout(chunk) {
+              if (state !== "active") return;
+              events.stdout(chunk);
+              record.receiver?.stdout(chunk);
+            },
+            stderr(chunk) {
+              if (state !== "active") return;
+              events.stderr(chunk);
+              record.receiver?.stderr(chunk);
+            },
             inputError() {
               hold();
-              if (activated) events.inputError();
+              if (!activated) return;
+              events.inputError();
+              record.receiver?.inputError();
             },
             closed(result) {
               if (exit) return;
@@ -213,10 +268,10 @@ export function windowsOwnedNativeTransport(launcher: WindowsOwnedLauncher): Win
         activated = true;
         state = "active";
         events.spawned();
+        record.receiver?.spawned();
       }
 
-      queueMicrotask(() => { void open().catch(hold); });
-      return {
+      const pipe = Object.freeze<NativeProcess>({
         write(text) {
           if (state !== "active" || !launch || inputEnded) return false;
           try { if (launch.pipe.write(text)) return true; }
@@ -232,13 +287,20 @@ export function windowsOwnedNativeTransport(launcher: WindowsOwnedLauncher): Win
             inputEnded = true;
           } catch { hold(); }
         },
+      });
+      const record: OwnedProcessRecord = { executable: argv[0], options, pipe, available: canObserve,
+        canAttach: () => state === "opening", receiver: null, last: null };
+      const child: WindowsOwnedNativeProcess = {
+        ...pipe,
         async observeOriginalGroup() {
           if (!launch || !canObserve()) return unavailable;
           try {
             const sample = await launch.observe();
-            return sample && canObserve() && sample.job === originalJob
-              && sample.complete === true && Number.isSafeInteger(sample.activeProcesses) && sample.activeProcesses >= 0
-              ? { state: "verified", activeProcesses: sample.activeProcesses } : unavailable;
+            if (!sample || !canObserve() || sample.job !== originalJob || sample.complete !== true
+              || !Number.isSafeInteger(sample.activeProcesses) || sample.activeProcesses < 0) return unavailable;
+            const observed: OriginalGroup = { state: "verified", activeProcesses: sample.activeProcesses };
+            record.last = { sample: observed, count: sample.activeProcesses };
+            return observed;
           } catch {
             hold();
             return unavailable;
@@ -246,6 +308,9 @@ export function windowsOwnedNativeTransport(launcher: WindowsOwnedLauncher): Win
         },
         closeObservation,
       };
+      ownedProcesses.set(child, record);
+      queueMicrotask(() => { void open().catch(hold); });
+      return child;
     },
   };
 }

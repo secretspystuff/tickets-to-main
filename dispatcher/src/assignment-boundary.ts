@@ -2,6 +2,7 @@ import { assertPrivateDirectory } from "./fs-safety.ts";
 import { assignmentDirectory, directoriesOverlap, directoryBirthTime, type DirectoryIdentity } from "./directory-identity.ts";
 import { currentProcessOwner, processOwnerAlive, type ProcessOwner } from "./process-identity.ts";
 import { safeNativeText } from "./adapters/native-result.ts";
+import { observeAppServerUse, type CodexAssignmentHandle } from "./adapters/codex-app-server.ts";
 import { completeAssignment, journalDigest, reserveAssignment, startAssignment, type Intent } from "./assignment-journal.ts";
 import type { WindowsOwnedNativeProcess } from "./native-transport.ts";
 import { bindOwnedWorkspaceClaim, releaseOwnedWorkspaceClaim, startOwnedWorkspaceClaim } from "./workspace.ts";
@@ -28,10 +29,14 @@ type PreparedOwnedAssignment = {
   original: Pick<WindowsOwnedNativeProcess, "observeOriginalGroup">;
   execute: AssignmentAdapter["execute"];
   close(): Promise<void>;
+  nativePredecessor?: { readHandle(): CodexAssignmentHandle | null };
 };
 export type AssignmentInput = {
   stateDir: string; raw: string; secrets: readonly string[]; now(): number; adapter: AssignmentAdapter;
-  owned?: { prepare(input: { intent: Intent; workspace: string }): Promise<PreparedOwnedAssignment | null> };
+  owned?: {
+    nativeInterface?: { vendor: "codex"; interfaceId: "app-server" };
+    prepare(input: { intent: Intent; workspace: string }): Promise<PreparedOwnedAssignment | null>;
+  };
 };
 export type AssignmentResult = { state: "completed" | "failed" | "not-started" | "held" | "refused"; qualification: "unqualified-harness"; publishable: false };
 
@@ -122,9 +127,12 @@ export async function runAssignment(input: AssignmentInput, directory = assignme
   let executePrepared: PreparedOwnedAssignment["execute"] | undefined;
   let closePrepared: PreparedOwnedAssignment["close"] | undefined;
   let stateIsCurrent: (() => boolean) | undefined;
+  const appServerUse = { started: false };
   try {
     const optedIn = "owned" in input;
     const port = optedIn ? input.owned : undefined;
+    const nativeInterface = port?.nativeInterface;
+    if (nativeInterface !== undefined && (nativeInterface?.vendor !== "codex" || nativeInterface.interfaceId !== "app-server")) return outcome("held");
     const prepare = port?.prepare.bind(port);
     const state = directory(input.stateDir);
     const stateDir = state.path;
@@ -157,12 +165,16 @@ export async function runAssignment(input: AssignmentInput, directory = assignme
     let ownedClaim: object | null = null;
     if (reserved.state === "new") {
       if (optedIn) {
-        const prepared = await prepare?.({ intent: structuredClone(intent), workspace: workspace.path });
+        const prepared = await observeAppServerUse(appServerUse, () => prepare?.({ intent: structuredClone(intent), workspace: workspace.path }));
         if (!prepared) throw new Error("Owned assignment preparation is unavailable.");
         staged = true;
         closePrepared = prepared.close.bind(prepared);
         executePrepared = prepared.execute.bind(prepared);
-        ownedClaim = bindOwnedWorkspaceClaim(stateDir, intent, prepared.original, stateIsCurrent);
+        const appServer = nativeInterface && {
+          prompt: request.input, secrets: input.secrets,
+          readHandle: prepared.nativePredecessor?.readHandle?.bind(prepared.nativePredecessor) ?? (() => null),
+        };
+        ownedClaim = bindOwnedWorkspaceClaim(stateDir, intent, prepared.original, stateIsCurrent, appServer);
         if (!ownedClaim || (await current(input, request, state, directory))?.identity !== workspace.identity) {
           throw new Error("Assignment authority changed.");
         }
@@ -176,10 +188,11 @@ export async function runAssignment(input: AssignmentInput, directory = assignme
     const execution = { id: request.id, sequence: request.sequence, input: request.input, workspace: workspace.path };
     const observed: unknown = structuredClone(reserved.state === "pending"
       ? await input.adapter.reconcile({ id: request.id, sequence: request.sequence, requestDigest: reserved.intent.requestDigest })
-      : optedIn ? await executePrepared?.(execution) : await input.adapter.execute(execution));
+      : optedIn ? await observeAppServerUse(appServerUse, () => executePrepared?.(execution), nativeInterface ? ownedClaim : null)
+        : await input.adapter.execute(execution));
     if (!terminal(observed, request) || (await current(input, request, state, directory))?.identity !== workspace.identity) return outcome("held");
     completeAssignment(stateDir, reserved.intent, observed.result, input.now(), stateIsCurrent);
-    if (ownedClaim) await releaseOwnedWorkspaceClaim(ownedClaim);
+    if (ownedClaim && (nativeInterface || !appServerUse.started)) await releaseOwnedWorkspaceClaim(ownedClaim);
     return outcome(observed.result);
   } catch {
     if (unstarted) {

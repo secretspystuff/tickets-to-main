@@ -14,7 +14,9 @@ assert.equal(process.argv.length, 4);
 assert.equal(cwd, expected);
 assert.equal(basename(cwd), "workspace");
 assert.ok(basename(dirname(cwd)).startsWith("ttm-owned-app-server-"));
-assert.ok(["complete", "wrong workspace", "invalid initialize", "wrong turn", "wrong thread", "interrupt", "late writer"].includes(mode));
+const lateReplies = ["missing turn reply", "rejected turn reply", "foreign turn reply", "matching late reply"];
+assert.ok(["complete", "other completion", "private identity", "wrong workspace", "invalid initialize", "wrong turn", "wrong thread",
+  "interrupt", "late writer", "abnormal exit", ...lateReplies].includes(mode));
 
 const root = dirname(cwd);
 const writerReady = join(root, "writer-ready"), allowWrite = join(root, "allow-write"), abortWriter = join(root, "abort-writer");
@@ -34,7 +36,9 @@ if (mode === "late writer") {
 
 const received = join(root, "requests.jsonl");
 const send = value => process.stdout.write(JSON.stringify(value) + "\n");
-const threadId = "fixture-thread", turnId = "fixture-turn";
+const threadId = mode === "private identity" ? "fixture-private-identity"
+  : mode === "other completion" ? "other-fixture-thread" : "fixture-thread";
+const turnId = mode === "other completion" ? "other-fixture-turn" : "fixture-turn";
 const stages = ["initialize", "initialized", "thread/start", "turn/start"];
 if (mode === "interrupt") stages.push("turn/interrupt");
 let stage = 0;
@@ -70,13 +74,19 @@ for await (const line of requests) {
       continue;
     }
     const text = readFileSync(join(cwd, "answer.txt"), "utf8");
-    send({ id: message.id, result: { turn: { id: turnId, items: [], status: "inProgress" } } });
+    const turn = { id: turnId, items: [], status: "inProgress" };
+    if (lateReplies.includes(mode)) send({ method: "turn/started", params: { threadId, turn } });
+    else send({ id: message.id, result: { turn } });
     send({ method: "item/completed", params: { threadId, turnId, item: { id: "fixture-answer", type: "agentMessage", text } } });
     send({ method: "turn/completed", params: { threadId: mode === "wrong thread" ? "other-thread" : threadId,
       turn: { id: mode === "wrong turn" ? "other-turn" : turnId, status: "completed", items: [] } } });
+    if (mode === "rejected turn reply") send({ id: message.id, error: { code: -32600, message: "Fabricated refusal" } });
+    if (mode === "foreign turn reply") send({ id: message.id, result: { turn: { ...turn, id: "other-turn" } } });
+    if (mode === "matching late reply") send({ id: message.id, result: { turn } });
   } else if (message.method === "turn/interrupt") {
     assert.deepEqual(message, { id: 4, method: "turn/interrupt", params: { threadId, turnId } });
     send({ id: message.id, result: {} });
     send({ method: "turn/completed", params: { threadId, turn: { id: turnId, status: "interrupted", items: [] } } });
   }
 }
+if (mode === "abnormal exit") process.exitCode = 17;

@@ -8,7 +8,7 @@ export type JournalWriteOptions = { existingOnly?: boolean; stateIsCurrent?: () 
 const MAX_BYTES = 8 * 1024 * 1024;
 const unavailable = () => new Error("The private journal is unavailable. Saved work was preserved.");
 
-function withJournalFile<T>(stateDir: string, journal: Journal, mode: "read" | "append" | "append-existing",
+function withJournalFile<T>(stateDir: string, journal: Journal, mode: "inspect" | "read" | "append" | "append-existing",
   operation: (fd: number, created: boolean) => T): T {
   if (journal !== "assignment-intents.jsonl" && journal !== "artifact-preparation.jsonl") throw unavailable();
   const path = join(stateDir, journal);
@@ -21,7 +21,8 @@ function withJournalFile<T>(stateDir: string, journal: Journal, mode: "read" | "
     if (mode !== "append" || (error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
     exists = false;
   }
-  const flags = constants.O_RDWR | (mode === "read" ? 0 : constants.O_APPEND)
+  const access = mode === "inspect" ? constants.O_RDONLY : mode === "read" ? constants.O_RDWR : constants.O_RDWR | constants.O_APPEND;
+  const flags = access
     | (exists ? 0 : constants.O_CREAT | constants.O_EXCL) | (constants.O_NOFOLLOW ?? 0);
   const fd = openSync(path, flags, 0o600);
   try {
@@ -32,6 +33,11 @@ function withJournalFile<T>(stateDir: string, journal: Journal, mode: "read" | "
     assertPrivateAccess(path);
     return operation(fd, !exists);
   } finally { closeSync(fd); }
+}
+
+export function inspectPrivateJournal<History>(stateDir: string, journal: Journal, decode: (text: string) => History): History {
+  assertPrivateDirectory(stateDir);
+  return withJournalFile(stateDir, journal, "inspect", fd => decode(readFileSync(fd, "utf8")));
 }
 
 // The caller's ledger transaction keeps this history stable through the claim update.

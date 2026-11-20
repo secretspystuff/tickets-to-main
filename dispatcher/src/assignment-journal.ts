@@ -1,6 +1,7 @@
 import { createHash } from "node:crypto";
-import { readExistingPrivateJournalUnderLease, withPrivateJournal, type JournalWriteOptions } from "./private-journal.ts";
+import { inspectPrivateJournal, readExistingPrivateJournalUnderLease, withPrivateJournal, type JournalWriteOptions } from "./private-journal.ts";
 import { currentProcessOwner, validProcessBirth, type ProcessOwner } from "./process-identity.ts";
+import type { NativePredecessorRecord } from "./ledger.ts";
 
 export type Intent = {
   version?: 2 | 3 | 4;
@@ -102,17 +103,25 @@ export function preparedOwnedBindingsUnderLease(stateDir: string, intent: Intent
   return [...retained, intent.id];
 }
 
-export function hasOwnedTerminalUnderLease(stateDir: string, intent: Intent): boolean {
+export function ownedTerminalUnderLease(stateDir: string, intent: Intent): Result | null {
   const history = ownedAssignmentUnderLease(stateDir, intent);
-  if (!history) return false;
+  if (!history) return null;
   const { entry, entries } = history;
-  if (!entry.started || (entry.result?.outcome !== "completed" && entry.result?.outcome !== "failed")) return false;
+  if (!entry.started || (entry.result?.outcome !== "completed" && entry.result?.outcome !== "failed")) return null;
   let later = false;
   for (const other of entries.values()) {
     if (other === entry) later = true;
-    else if ((!other.result || (later && other.started)) && (other.intent.version !== 4 || overlap(other.intent, intent))) return false;
+    else if ((!other.result || (later && other.started)) && (other.intent.version !== 4 || overlap(other.intent, intent))) return null;
   }
-  return true;
+  return entry.result;
+}
+
+export function matchesNativePredecessorJournal(stateDir: string, receipt: NativePredecessorRecord): boolean {
+  const entry = inspectPrivateJournal(stateDir, "assignment-intents.jsonl", records).get(receipt.assignmentId);
+  return entry !== undefined && entry.started && entry.intent.version === 4 && entry.intent.sequence === receipt.sequence
+    && entry.intent.requestDigest === receipt.requestDigest && entry.intent.bindingDigest === receipt.bindingDigest
+    && entry.intent.workspaceDigest === receipt.workspaceDigest && entry.intent.aliasDigest === receipt.workspaceIdentityDigest
+    && entry.result?.outcome === "completed" && entry.result.at === receipt.completedAt;
 }
 
 export function reserveAssignment(stateDir: string, intent: Intent, legacyWorkspaceDigest: string, ownerAlive: (owner: ProcessOwner) => boolean,
