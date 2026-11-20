@@ -551,6 +551,55 @@ test("CLI parses native events incrementally and rejects fake result, failed and
   }
 });
 
+test("CLI root thread metadata excludes fabricated assignment and held values", async t => {
+  const pinnedId = "0194b797-f913-7ba1-a1ea-4cdb6b84470c";
+  const restoredId = "f913b8de-08c5-4bd2-a1ea-4cdb6b84470c";
+  const held = "fabricated-held-thread-value";
+  const assignmentMarker = "[assignment input omitted]";
+  const heldMarker = "[redacted]";
+  const credential = `tp_${"s".repeat(24)}`;
+  const tail = CLI_RESULT.trimEnd().split("\n").slice(1).map(line => JSON.parse(line));
+  const cases = [
+    { name: "root metadata equals the assignment", input: REQUEST.prompt, id: REQUEST.prompt, hidden: REQUEST.prompt },
+    { name: "root metadata embeds the assignment", input: REQUEST.prompt, id: `fixture-${REQUEST.prompt}-end`, hidden: REQUEST.prompt },
+    { name: "root metadata embeds an assignment equal to its redaction marker", input: assignmentMarker,
+      id: `fixture-${assignmentMarker}-end`, hidden: assignmentMarker },
+    { name: "UUID-shaped assignment echoed verbatim", input: pinnedId, id: pinnedId, hidden: pinnedId },
+    { name: "canonical UUID embeds the entire assignment", input: pinnedId.slice(0, 13), id: pinnedId, hidden: pinnedId.slice(0, 13) },
+    { name: "root metadata embeds a held value", input: REQUEST.prompt, id: `fixture-${held}`, hidden: held },
+    { name: "root metadata embeds a held value equal to its redaction marker", input: REQUEST.prompt,
+      id: `fixture-${heldMarker}-end`, hidden: heldMarker },
+    { name: "root metadata contains a credential shape", input: REQUEST.prompt, id: credential, hidden: credential },
+    { name: "exact pinned ID and valid root result", input: REQUEST.prompt, id: pinnedId, hidden: null },
+    { name: "a restored canonical ID and valid root result", input: REQUEST.prompt, id: restoredId, hidden: null },
+    { name: "one input character can occur by chance in a genuine pinned ID", input: "f", id: pinnedId, hidden: null },
+  ];
+  for (const { name, input, id, hidden } of cases) {
+    await t.test(name, async () => {
+      const transport = scriptedTransport((received, events) => {
+        assert.equal(received, input);
+        for (const event of [{ type: "thread.started", thread_id: id }, ...tail]) emit(events, event);
+      });
+      const result = await runCodexCliAssignment({ ...REQUEST, prompt: input }, transport, {}, [held, heldMarker]);
+      assert.equal(result.writerState, "unknown");
+      assert.equal(result.observed.helperCompletion, undefined);
+      assert.equal(result.stdin, "");
+      if (hidden !== null) {
+        assert.equal(JSON.stringify(result).includes(hidden), false);
+        assert.equal(result.outcome, "protocol-error");
+        assert.equal(result.threadId, null);
+        assert.equal(result.resultText, null);
+        assert.equal(result.observed.assignment, undefined);
+      } else {
+        assert.equal(result.outcome, "completed");
+        assert.equal(result.threadId, id);
+        assert.equal(result.resultText, "Ready.");
+        assert.equal(result.observed.assignment, "supported");
+      }
+    });
+  }
+});
+
 test("synthetic subprocess exercises the real streaming app-server transport without a native assignment", async () => {
   const script = `const rl=require('node:readline').createInterface({input:process.stdin});
 const send=x=>process.stdout.write(JSON.stringify(x)+'\\n');

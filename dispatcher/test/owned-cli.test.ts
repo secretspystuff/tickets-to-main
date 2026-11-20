@@ -16,7 +16,7 @@ import { claimWorkspace, prepareWorkspace } from "../src/workspace.ts";
 import { removeDir } from "./helpers.ts";
 import { CLI_RESULT } from "./native-fixtures.ts";
 
-type Scenario = "complete" | "wrong result" | "refused activation" | "refused preparation";
+type Scenario = "complete" | "wrong result" | "unsafe metadata" | "refused activation" | "refused preparation";
 const executable = realpathSync(process.execPath);
 const peer = fileURLToPath(new URL("./owned-cli-peer.fixture.mjs", import.meta.url));
 const onWindows = { skip: process.platform !== "win32", timeout: 24_000 };
@@ -123,7 +123,7 @@ function fixture(t: TestContext, scenario: Scenario) {
             endInput() { pipe.push("eof"); launch.pipe.endInput(); },
           },
         };
-      } }).start([executable, peer, scenario === "wrong result" ? scenario : "complete", workspace], { cwd: workspace, env }, {
+      } }).start([executable, peer, scenario === "refused activation" ? "complete" : scenario, workspace], { cwd: workspace, env }, {
         spawned() { activated = bytes(); listener?.spawned(); },
         stdout(chunk) {
           listener?.stdout(chunk);
@@ -204,7 +204,7 @@ test("the same fabricated CLI runs on the existing plain process transport", onW
   assert.equal(existsSync(f.eofFile), true);
 });
 
-for (const scenario of ["complete", "wrong result", "refused activation"] as const) {
+for (const scenario of ["complete", "wrong result", "unsafe metadata", "refused activation"] as const) {
   test(`owned CLI ${scenario} sends input and EOF only after actual activation`, onWindows, async t => {
     const f = fixture(t, scenario), result = await f.run();
     assert.equal(f.verified, true);
@@ -243,19 +243,28 @@ for (const scenario of ["complete", "wrong result", "refused activation"] as con
     assert.equal(readFileSync(f.inputFile, "utf8"), prompt);
     assert.equal(existsSync(f.eofFile), true);
     assert.equal(readFileSync(f.answerFile, "utf8"), answer);
-    assert.equal(f.observed?.outcome, "completed");
     assert.equal(f.observed?.writerState, "unknown");
     assert.deepEqual(f.exit, { code: 0, signal: null, error: null });
     assert.deepEqual(f.live, { state: "verified", activeProcesses: 1 });
     assert.deepEqual(f.drained, zero);
-    if (scenario === "wrong result") {
-      assert.equal(f.observed?.resultText, "other result");
+    if (scenario === "wrong result" || scenario === "unsafe metadata") {
       assert.deepEqual(result, { state: "held", ...unqualified });
       assert.equal(f.release, undefined);
       assert.deepEqual(f.groupIdentity, [true, true]);
       assert.deepEqual(f.bytes(), f.activationAttempt);
+      if (scenario === "unsafe metadata") {
+        assert.equal(JSON.stringify(f.observed).includes(prompt), false);
+        assert.equal(f.observed?.outcome, "protocol-error");
+        assert.equal(f.observed?.threadId, null);
+        assert.equal(f.observed?.resultText, null);
+        assert.equal(f.observed?.observed.assignment, undefined);
+      } else {
+        assert.equal(f.observed?.outcome, "completed");
+        assert.equal(f.observed?.resultText, "other result");
+      }
       return;
     }
+    assert.equal(f.observed?.outcome, "completed");
     assert.deepEqual(result, { state: "completed", ...unqualified });
     assert.equal(f.observed?.resultText, answer);
     assert.equal(f.observed?.threadId, "fixture-cli-thread");
