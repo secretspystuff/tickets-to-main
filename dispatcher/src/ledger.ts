@@ -78,6 +78,7 @@ export type Ledger = {
   connection: ConnectionRecord | null;
   tools: ToolRecord[];
   workspace: WorkspaceRecord | null;
+  boundWorkspaceIntent?: string;
   checkAttempts?: CheckAttemptRecord[];
   boardFeedCursors?: BoardFeedCursorRecord[];
 };
@@ -210,7 +211,7 @@ export function parseLedger(text: string): Ledger | null {
   }
   if (parsed === null || typeof parsed !== "object") return null;
   const row = parsed as Record<string, unknown>;
-  const fields = ["version", "install", "connection", "tools", "workspace", "checkAttempts", "boardFeedCursors"];
+  const fields = ["version", "install", "connection", "tools", "workspace", "boundWorkspaceIntent", "checkAttempts", "boardFeedCursors"];
   if (row.version !== 1 || Object.keys(row).some(key => !fields.includes(key))) return null;
   const install = row.install;
   let installRecord: InstallRecord | null = null;
@@ -250,6 +251,10 @@ export function parseLedger(text: string): Ledger | null {
     if (!isWorkspace(row.workspace)) return null;
     workspace = row.workspace;
   }
+  const boundWorkspaceIntent = row.boundWorkspaceIntent;
+  if (boundWorkspaceIntent !== undefined && (typeof boundWorkspaceIntent !== "string"
+    || !/^[a-f0-9]{32}$/.test(boundWorkspaceIntent))) return null;
+  if (workspace?.claimGeneration !== undefined && boundWorkspaceIntent === undefined) return null;
   try {
     assertPublicRecord(parsed, []);
   } catch {
@@ -261,6 +266,7 @@ export function parseLedger(text: string): Ledger | null {
     connection: row.connection === null ? null : row.connection,
     tools: row.tools,
     workspace,
+    ...(boundWorkspaceIntent === undefined ? {} : { boundWorkspaceIntent }),
     ...(row.checkAttempts === undefined ? {} : { checkAttempts: row.checkAttempts }),
     ...(cursors === undefined ? {} : { boardFeedCursors: cursors }),
   };
@@ -345,7 +351,8 @@ export function saveLedger(stateDir: string, ledger: Ledger, secrets: readonly s
   });
 }
 
-export function updateLedger(stateDir: string, secrets: readonly string[], mutate: (current: Ledger) => void): Ledger {
+export function updateLedger(stateDir: string, secrets: readonly string[], mutate: (current: Ledger) => void,
+  onPersist?: () => void): Ledger {
   currentLedger(stateDir);
   return withStateLease(stateDir, "ledger", () => {
     const current = currentLedger(stateDir);
@@ -353,7 +360,10 @@ export function updateLedger(stateDir: string, secrets: readonly string[], mutat
     const result: unknown = mutate(current);
     if (result !== null && typeof result === "object" && "then" in result) throw new StateError("The local record transaction must finish before returning.");
     validateSave(current, secrets);
-    if (JSON.stringify(current) !== before || origins.get(current)?.digest === null) persist(stateDir, current, secrets);
+    if (JSON.stringify(current) !== before || origins.get(current)?.digest === null) {
+      persist(stateDir, current, secrets);
+      onPersist?.();
+    }
     return current;
   });
 }

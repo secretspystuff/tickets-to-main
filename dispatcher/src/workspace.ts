@@ -137,16 +137,18 @@ export function bindOwnedWorkspaceClaim(stateDir: string, prepared: Intent, orig
     const observe = original.observeOriginalGroup.bind(original);
     let claim: OwnedClaim | undefined;
     updateLedger(state.path, [], ledger => {
+      if (!ledger.install) throw new StateError("The recorded workspace is unavailable.");
       const current = ledger.workspace;
-      if (!ledger.install || !current || current.writerPid !== intent.pid || current.claimGeneration !== undefined
+      if (!current || current.writerPid !== intent.pid || current.claimGeneration !== undefined
         || directoryBirthTime(state) !== stateBirth) return;
       assertCurrentWorkspace(state.path, current.path);
       const checkout = assignmentDirectory(current.path);
       if (checkout.path !== current.path || journalDigest(checkout.path) !== intent.workspaceDigest
         || journalDigest(checkout.identity) !== intent.aliasDigest
-        || !assignmentAllowsOwnedClaimUnderLease(state.path, intent, "prepared")) return;
+        || !assignmentAllowsOwnedClaimUnderLease(state.path, intent, "prepared", ledger.boundWorkspaceIntent)) return;
       const checkoutBirth = directoryBirthTime(checkout);
       ledger.workspace = { ...current, claimGeneration: generation };
+      ledger.boundWorkspaceIntent = intent.id;
       claim = { state, stateBirth, checkout, checkoutBirth, generation, intent, observe };
     });
     if (!claim) return null;
@@ -159,13 +161,15 @@ export function bindOwnedWorkspaceClaim(stateDir: string, prepared: Intent, orig
 export async function releaseOwnedWorkspaceClaim(authority: object): Promise<{ state: "released" | "held" }> {
   const claim = ownedClaims.get(authority);
   if (!claim) return { state: "held" };
+  let committed = false;
   try {
     const sample = await claim.observe();
     if (sample?.state !== "verified" || !Object.is(sample.activeProcesses, 0)) return { state: "held" };
-    let cleared = false;
     updateLedger(claim.state.path, [], ledger => {
+      if (!ledger.install) throw new StateError("The recorded workspace is unavailable.");
       const current = ledger.workspace;
-      if (!ledger.install || !current || current.path !== claim.checkout.path || current.writerPid !== claim.intent.pid
+      if (!current || current.path !== claim.checkout.path || current.writerPid !== claim.intent.pid
+        || ledger.boundWorkspaceIntent !== claim.intent.id
         || current.claimGeneration !== claim.generation || directoryBirthTime(claim.state) !== claim.stateBirth) return;
       assertCurrentWorkspace(claim.state.path, current.path);
       const checkout = assignmentDirectory(current.path);
@@ -173,12 +177,10 @@ export async function releaseOwnedWorkspaceClaim(authority: object): Promise<{ s
         || directoryBirthTime(checkout) !== claim.checkoutBirth
         || !assignmentAllowsOwnedClaimUnderLease(claim.state.path, claim.intent, "terminal")) return;
       ledger.workspace = { path: current.path, writerPid: null, qualified: false };
-      cleared = true;
-    });
-    if (cleared) {
-      ownedClaims.delete(authority);
-      return { state: "released" };
-    }
-  } catch { /* Unavailable observation or local evidence supplies no release authority. */ }
-  return { state: "held" };
+      delete ledger.boundWorkspaceIntent;
+    }, () => { committed = true; });
+  } catch { /* A failed lease release does not undo a persisted claim clear. */ }
+  if (!committed) return { state: "held" };
+  ownedClaims.delete(authority);
+  return { state: "released" };
 }

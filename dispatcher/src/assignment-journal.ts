@@ -77,15 +77,24 @@ function overlap(a: Intent, b: Intent): boolean {
   return a.version === b.version && a.workspaceDigest === b.workspaceDigest;
 }
 
-export function assignmentAllowsOwnedClaimUnderLease(stateDir: string, intent: Intent, phase: "prepared" | "terminal"): boolean {
+export function assignmentAllowsOwnedClaimUnderLease(stateDir: string, intent: Intent, phase: "prepared" | "terminal",
+  previousBinding?: string): boolean {
   const entries = readExistingPrivateJournalUnderLease(stateDir, "assignment-intents.jsonl", records);
   const entry = entries.get(intent.id);
   if (!entry || entry.intent.version !== 4 || intent.version !== 4 || !matching(entry.intent, intent)
     || entry.intent.pid !== intent.pid || entry.intent.birth !== intent.birth || entry.intent.at !== intent.at) return false;
-  if (phase === "prepared") return !entry.started && entry.result === null;
-  return entry.started && (entry.result?.outcome === "completed" || entry.result?.outcome === "failed")
-    && ![...entries.values()].some(other => other !== entry && !other.result
-      && (other.intent.version !== 4 || overlap(other.intent, intent)));
+  if (phase === "prepared") {
+    const previous = previousBinding === undefined ? null : entries.get(previousBinding);
+    return !entry.started && entry.result === null
+      && (previous === null || (previous !== undefined && (previous.started || previous.result !== null)));
+  }
+  if (!entry.started || (entry.result?.outcome !== "completed" && entry.result?.outcome !== "failed")) return false;
+  let later = false;
+  for (const other of entries.values()) {
+    if (other === entry) later = true;
+    else if ((!other.result || (later && other.started)) && (other.intent.version !== 4 || overlap(other.intent, intent))) return false;
+  }
+  return true;
 }
 
 export function reserveAssignment(stateDir: string, intent: Intent, legacyWorkspaceDigest: string, ownerAlive: (owner: ProcessOwner) => boolean): { state: "new" | "pending" | Result["outcome"]; intent: Intent } {
