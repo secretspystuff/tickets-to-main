@@ -328,6 +328,7 @@ for (const stage of stages) {
       }
       await f.end.expectOnce(heldExit, true);
       assert.equal(f.owned.write(allowed), false);
+      assert.deepEqual(await f.owned.observeOriginalGroup(), unavailable);
       assert.equal(f.trace.ready, stage === "observe" ? 1 : 0);
       assert.deepEqual(f.trace.stages, stages.slice(0, stages.indexOf(stage) + 1));
       assert.deepEqual(f.trace.writes, []);
