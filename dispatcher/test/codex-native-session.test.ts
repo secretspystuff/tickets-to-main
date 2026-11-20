@@ -142,16 +142,25 @@ test("app-server model evidence keeps only an exact turn's well-formed reroute",
   }
 });
 
-test("app-server model evidence preserves unknown effort and exact startup refusals", async t => {
-  for (const [name, reasoningEffort] of [["omitted", undefined], ["null", null], ["malformed", 7], ["unrecognized", "fixture-effort"]] as const) {
+test("app-server model evidence preserves native effort and exact startup refusals", async t => {
+  const heldEffort = "fabricated-held-effort";
+  for (const [name, reasoningEffort, expectedEffort] of [
+    ["omitted", undefined, null],
+    ["null", null, null],
+    ["malformed", 7, null],
+    ["empty", "", null],
+    ["held value", heldEffort, null],
+    ["provider-defined", "fixture-effort", "fixture-effort"],
+  ] as const) {
     await t.test(name, async () => {
       const transport = server((events) => { message(events); terminal(events); }, { reasoningEffort });
-      const result = await finish(transport, { ...REQUEST, effort: "low" });
+      const result = await finish(transport, { ...REQUEST, effort: "low" }, [heldEffort]);
       assert.equal(result.outcome, "completed");
       assert.equal(result.requestedEffort, "low");
       assert.equal(result.writerState, "unknown");
+      assert.equal(JSON.stringify(result).includes(heldEffort), false);
       assert.deepEqual(Reflect.get(result, "appServerModelEvidence"), {
-        beforeTurn: { model: "native-model", reasoningEffort: null }, reroute: null,
+        beforeTurn: { model: "native-model", reasoningEffort: expectedEffort }, reroute: null,
       });
     });
   }
