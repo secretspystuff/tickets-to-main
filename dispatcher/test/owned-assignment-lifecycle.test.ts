@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import fs, { existsSync, mkdtempSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
+import fs, { existsSync, mkdtempSync, readFileSync, realpathSync, renameSync, writeFileSync } from "node:fs";
 import { syncBuiltinESMExports } from "node:module";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
@@ -25,7 +25,8 @@ type OwnedInput = AssignmentInput & {
   owned: { prepare(input: { intent: Intent; workspace: string }): Promise<PreparedExecution> };
 };
 type Scenario = "complete" | "wrong writer" | "revoked" | "claim replaced" | "successor claim" | "prepare rejected"
-  | "start flush" | "interrupted" | "wrong terminal" | "revoked after execution" | "result flush" | "witness lost";
+  | "start flush" | "interrupted" | "wrong terminal" | "revoked after execution" | "result flush" | "witness lost"
+  | "state changed before start" | "state changed after execution" | "opt-in withdrawn" | "close rejected" | "missing journal";
 type JournalRow = { kind: string; id: string; sequence: number; requestDigest: string; outcome?: string };
 const onWindows = { skip: process.platform !== "win32", timeout: 24_000 };
 const unqualified = { qualification: "unqualified-harness", publishable: false } as const;
@@ -117,7 +118,7 @@ async function stage(f: Space, beforeResume: () => void) {
   const atResume = deferred<void>(), allowResume = deferred<boolean>();
   const ready = deferred<void>(), closed = deferred<NativeExit>();
   const argv = [realpathSync(process.execPath), fileURLToPath(new URL("./windows-owned-input.fixture.mjs", import.meta.url))];
-  let output = "", inputErrors = 0, activations = 0;
+  let output = "", inputErrors = 0, activations = 0, exits = 0;
   const owned = windowsOwnedNativeTransport({
     async start(...args) {
       const launch = await launcher.start(...args);
@@ -131,7 +132,7 @@ async function stage(f: Space, beforeResume: () => void) {
       } };
     },
   }).start(argv, { cwd: f.workspace, env: f.env }, {
-    spawned() {}, stderr() {}, inputError() { inputErrors++; }, closed: closed.resolve,
+    spawned() {}, stderr() {}, inputError() { inputErrors++; }, closed(result) { exits++; closed.resolve(result); },
     stdout(chunk) { output += chunk; if (output.includes("reader-ready\n")) ready.resolve(); },
   });
   let disposal: Promise<void> | undefined;
@@ -148,7 +149,7 @@ async function stage(f: Space, beforeResume: () => void) {
   assert.equal(await bounded(Promise.race([atResume.promise, closed.promise])), undefined,
     "existing Windows launcher must reach verified suspension");
   return {
-    owned, dispose, closed: closed.promise, get activations() { return activations; },
+    owned, dispose, closed: closed.promise, get activations() { return activations; }, get exits() { return exits; },
     async execute(input: string) {
       allowResume.resolve(true);
       assert.equal(await bounded(Promise.race([ready.promise, closed.promise])), undefined);
@@ -162,26 +163,48 @@ async function stage(f: Space, beforeResume: () => void) {
 }
 
 function ownedCase(t: TestContext, mode: Scenario, gateClose = false) {
-  const f = space(t, mode === "wrong writer");
+  const f = space(t, mode === "wrong writer" || mode === "close rejected");
   const { flushes, faults, started } = observeFlushes(t, f, mode);
+  const snapshot = () => ({ ledger: readFileSync(f.ledger), journal: f.journalText() });
+  const savedJournal = `${f.journal}.saved`;
+  let atStateChange: ReturnType<typeof snapshot> | undefined;
+  let atJournalLoss: ReturnType<typeof snapshot> | undefined;
+  if (mode === "state changed before start" || mode === "state changed after execution") {
+    const lstat = fs.lstatSync;
+    assert.equal(Reflect.set(fs, "lstatSync", (...args: Parameters<typeof lstat>) => {
+      const info = lstat(...args);
+      if (atStateChange && args[0] === f.base.stateDir && info && typeof info.ino === "bigint") info.ino += 1n;
+      return info;
+    }), true);
+    syncBuiltinESMExports();
+    t.after(() => { Reflect.set(fs, "lstatSync", lstat); syncBuiltinESMExports(); });
+  }
   const events: Trace[] = [];
   const record = (event: string) => events.push({ event, kinds: f.rows().map(r => r.kind),
     writer: f.claim()?.writerPid, generation: f.claim()?.claimGeneration, flushes: [...flushes] });
   const closing = deferred<void>(), permitClose = deferred<void>();
   t.after(() => permitClose.resolve());
-  let fallback = 0, reconciliations = 0, replaced = false, disposed = 0;
+  let fallback = 0, reconciliations = 0, replaced = false, disposed = 0, withdrawn = false;
   let replacement: Buffer | undefined;
   let staged: Awaited<ReturnType<typeof stage>> | undefined;
   const input: OwnedInput = {
     ...f.base, adapter: {
       kind: "fabricated-harness",
       async readCurrent() {
+        if (mode === "opt-in withdrawn" && !withdrawn) {
+          assert.equal(Reflect.deleteProperty(input, "owned"), true);
+          withdrawn = true;
+        }
         const bound = f.claim()?.claimGeneration !== undefined;
         const revoked = (mode === "revoked" && bound)
           || (mode === "revoked after execution" && events.some(event => event.event === "root closed"));
         if (mode === "claim replaced" && bound && !replaced) {
           claimWorkspace(f.base.stateDir, f.owner, () => true);
           replaced = true;
+        }
+        if (mode === "missing journal" && bound && !atJournalLoss) {
+          atJournalLoss = snapshot();
+          renameSync(f.journal, savedJournal);
         }
         if (mode === "successor claim" && bound && !replaced) {
           updateLedger(f.base.stateDir, [], ledger => {
@@ -213,14 +236,17 @@ function ownedCase(t: TestContext, mode: Scenario, gateClose = false) {
         assert.equal(f.claim()?.writerPid, f.owner);
       });
       record("suspended");
+      if (mode === "state changed before start") atStateChange = snapshot();
       return {
         original: { observeOriginalGroup() { record("sample"); return child.owned.observeOriginalGroup(); } },
         async execute(value) {
           record("execute");
+          assert.notEqual(mode, "state changed before start", "a different state directory cannot authorize native input");
           assert.equal(value.workspace, f.workspace);
           await child.execute(value.input);
           record("root closed");
           assert.deepEqual(readFileSync(f.marker), Buffer.from(f.request.input));
+          if (mode === "state changed after execution") atStateChange = snapshot();
           if (mode === "interrupted") throw new Error("fabricated interruption after local start");
           if (mode === "witness lost") child.owned.closeObservation();
           const result = f.receipt(value);
@@ -230,6 +256,7 @@ function ownedCase(t: TestContext, mode: Scenario, gateClose = false) {
           record("close");
           closing.resolve();
           if (gateClose) await permitClose.promise;
+          if (mode === "close rejected") throw new Error("fabricated disposal acknowledgement unavailable");
           await child.dispose();
           assert.deepEqual(await child.owned.observeOriginalGroup(), { state: "unavailable" });
           disposed++;
@@ -237,11 +264,14 @@ function ownedCase(t: TestContext, mode: Scenario, gateClose = false) {
       };
     } },
   };
-  return { ...f, events, faults, started, closing: closing.promise, permitClose: () => permitClose.resolve(),
+  return { ...f, events, faults, started, snapshot, savedJournal, get stateChange() { return atStateChange; },
+    get journalLoss() { return atJournalLoss; }, get withdrawn() { return withdrawn; },
+    closing: closing.promise, permitClose: () => permitClose.resolve(),
     run: () => runAssignment(input), get disposed() { return disposed; }, get replacement() { return replacement; },
     get fallback() { return fallback; }, get reconciliations() { return reconciliations; },
     get replaced() { return replaced; },
     get activations() { return staged?.activations ?? 0; },
+    get childExits() { return staged?.exits ?? 0; },
   };
 }
 
@@ -372,3 +402,67 @@ for (const mode of ["interrupted", "wrong terminal", "revoked after execution", 
     }
   });
 }
+
+for (const mode of ["state changed before start", "state changed after execution"] as const) {
+  test(`owned runner preserves the journal and ledger when ${mode}`, onWindows, async t => {
+    const f = ownedCase(t, mode);
+    assert.deepEqual(await f.run(), { state: "held", ...unqualified });
+    assert.ok(f.stateChange, "the state continuity observation must change at the intended barrier");
+    const executed = mode === "state changed after execution";
+    assert.deepEqual(f.events.map(event => event.event), ["prepared", "suspended",
+      ...(executed ? ["execute", "resume", "root closed"] : []), "close"]);
+    assert.deepEqual(f.rows().map(row => row.kind), executed ? ["intent", "started"] : ["intent"]);
+    assert.deepEqual(f.snapshot(), f.stateChange);
+    assert.equal(f.activations, executed ? 1 : 0);
+    assert.equal(existsSync(f.marker), executed);
+    assert.equal(f.disposed, 1);
+    assert.equal(f.fallback, 0);
+  });
+}
+
+test("an owned opt-in stays selected when its input property is withdrawn during admission", onWindows, async t => {
+  const f = ownedCase(t, "opt-in withdrawn");
+  assert.deepEqual(await f.run(), { state: "completed", ...unqualified });
+  assert.equal(f.withdrawn, true);
+  assert.deepEqual(f.events.map(event => event.event), ["prepared", "suspended", "execute", "resume", "root closed", "sample", "close"]);
+  assert.deepEqual(f.rows().map(row => row.kind), ["intent", "started", "result"]);
+  assert.equal(f.claim()?.writerPid, null);
+  assert.equal(f.fallback, 0);
+  assert.equal(f.activations, 1);
+  assert.equal(f.disposed, 1);
+});
+
+test("an owned disposal rejection holds the workspace and prevents handoff or replay", onWindows, async t => {
+  const f = ownedCase(t, "close rejected");
+  assert.deepEqual(await f.run(), { state: "held", ...unqualified });
+  assert.deepEqual(f.events.map(event => event.event), ["prepared", "suspended", "close"]);
+  assert.equal(f.childExits, 0, "the staged fixture is still awaiting cleanup");
+  assert.equal(f.claim()?.writerPid, f.owner);
+  assert.equal(f.disposed, 0);
+  assert.equal(f.activations, 0);
+  assert.equal(existsSync(f.marker), false);
+  const before = f.snapshot();
+  assert.deepEqual(await f.run(), { state: "held", ...unqualified });
+  assert.deepEqual(f.snapshot(), before);
+  assert.deepEqual(f.events.map(event => event.event), ["prepared", "suspended", "close"]);
+  assert.equal(f.fallback, 0);
+  assert.equal(f.reconciliations, 0);
+  assert.equal(f.disposals.length, 1);
+  await f.disposals[0]!();
+  assert.equal(f.childExits, 1, "test cleanup must close the exact staged fixture once");
+});
+
+test("an owned start refusal preserves a missing prepared journal and its saved bytes", onWindows, async t => {
+  const f = ownedCase(t, "missing journal");
+  assert.deepEqual(await f.run(), { state: "held", ...unqualified });
+  assert.ok(f.journalLoss, "the journal must be moved aside after the exact claim is bound");
+  assert.equal(existsSync(f.journal), false);
+  assert.equal(readFileSync(f.savedJournal, "utf8"), f.journalLoss.journal);
+  assert.deepEqual(readFileSync(f.ledger), f.journalLoss.ledger);
+  assert.deepEqual(f.events.map(event => event.event), ["prepared", "suspended", "close"]);
+  assert.equal(f.started.length, 0);
+  assert.equal(f.activations, 0);
+  assert.equal(f.disposed, 1);
+  assert.equal(f.fallback, 0);
+  assert.equal(existsSync(f.marker), false);
+});
