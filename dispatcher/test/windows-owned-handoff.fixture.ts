@@ -104,7 +104,11 @@ async function run(root: string) {
         let out = "", inputFailed = false;
         const transport = windowsOwnedNativeTransport(windowsProcessLauncher()).start(
           [executable, "--experimental-strip-types", file, "root", root], { cwd: workspace, env: env(root) }, {
-            spawned() {}, stderr() {}, inputError() { inputFailed = true; }, closed: closed.resolve,
+            spawned() {}, stderr() {}, inputError() { inputFailed = true; },
+            closed(exit) {
+              if (existsSync(join(root, "control", "withhold-close"))) signal(root, "close-withheld");
+              else closed.resolve(exit);
+            },
             stdout(chunk) { out += chunk; if (out.includes("reader-ready\n")) ready.resolve(); },
           },
         );
@@ -149,9 +153,16 @@ async function run(root: string) {
   process.stdout.write(JSON.stringify(result));
 }
 
+let watchdog: NodeJS.Timeout | undefined;
 try {
   const root = fixturePath();
+  // A stuck stream cannot keep a fabricated peer alive after its control barrier aborts.
+  const deadline = Date.now() + 30_000;
+  watchdog = setInterval(() => {
+    if (existsSync(join(root, "control", "abort")) || Date.now() >= deadline) process.exit(74);
+  }, 25);
   if (role === "controller") await run(root);
   else if (role === "root") await reader(root);
   else await writer(root);
 } catch { process.exitCode = 1; }
+finally { clearInterval(watchdog); }
