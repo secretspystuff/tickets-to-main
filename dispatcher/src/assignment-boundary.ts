@@ -35,9 +35,9 @@ export type AssignmentInput = {
 };
 export type AssignmentResult = { state: "completed" | "failed" | "not-started" | "held" | "refused"; qualification: "unqualified-harness"; publishable: false };
 
+type LocalAdmission = { owned: boolean; state: string; workspacePath: string; workspaceIdentity: string };
 const BINDING = ["board", "repo", "activation", "connection", "job", "claim", "requirements", "candidate", "policy", "fence"];
-const active = new Set<string>();
-const ownedActive = new Set<string>();
+const active = new Set<LocalAdmission>();
 const outcome = (state: AssignmentResult["state"]): AssignmentResult => ({ state, qualification: "unqualified-harness", publishable: false });
 const opaque = (value: unknown): value is string => typeof value === "string" && /^[a-f0-9]{32}$/.test(value);
 const whole = (value: unknown, min: number): value is number => Number.isSafeInteger(value) && (value as number) >= min;
@@ -116,8 +116,7 @@ const ownerAlive = (owner: ProcessOwner) => processOwnerAlive(owner, true);
 export async function runAssignment(input: AssignmentInput, directory = assignmentDirectory): Promise<AssignmentResult> {
   const request = decode(input.raw, input.secrets);
   if (!request || input.adapter.kind !== "fabricated-harness") return outcome("refused");
-  const locks: string[] = [];
-  let ownedLocks: string[] = [];
+  let admission: LocalAdmission | undefined;
   let unstarted: { stateDir: string; intent: Intent } | null = null;
   let staged = false;
   let executePrepared: PreparedOwnedAssignment["execute"] | undefined;
@@ -136,15 +135,13 @@ export async function runAssignment(input: AssignmentInput, directory = assignme
     }
     const workspace = await current(input, request, state, directory);
     if (workspace === null) return outcome("held");
-    const workspaceKeys = ["path:" + workspace.path, "file:" + workspace.identity];
-    const keys = workspaceKeys.map(key => state.identity + ":" + key);
-    if (workspaceKeys.some(key => ownedActive.has(key)) || keys.some(key => active.has(key))) return outcome("held");
-    for (const key of keys) { active.add(key); locks.push(key); }
-    if (optedIn) {
-      // The staged writer can outlive the state directory that admitted it.
-      ownedLocks = workspaceKeys;
-      for (const key of ownedLocks) ownedActive.add(key);
+    for (const held of active) {
+      // An owned writer can outlive the state directory that admitted it.
+      if ((optedIn || held.owned || held.state === state.identity)
+        && (held.workspacePath === workspace.path || held.workspaceIdentity === workspace.identity)) return outcome("held");
     }
+    admission = { owned: optedIn, state: state.identity, workspacePath: workspace.path, workspaceIdentity: workspace.identity };
+    active.add(admission);
     const at = input.now();
     if (!whole(at, 0)) return outcome("held");
     const intent: Intent = {
@@ -202,7 +199,6 @@ export async function runAssignment(input: AssignmentInput, directory = assignme
         return outcome("held");
       }
     }
-    for (const key of ownedLocks) ownedActive.delete(key);
-    for (const key of locks) active.delete(key);
+    if (admission) active.delete(admission);
   }
 }
