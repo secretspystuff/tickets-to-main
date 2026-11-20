@@ -529,10 +529,16 @@ test("a committed binding retains its original authority when the release marker
   } finally { fault.restore(); }
   assert.equal(fault.failures, 1);
   const bound = f.snapshot();
-  assert.notDeepEqual(bound.ledger, before.ledger);
+  const ledger = parseLedger(bound.ledger.toString("utf8"));
+  assert.ok(ledger?.workspace);
+  const { claimGeneration, ...writer } = ledger.workspace;
+  assert.deepEqual(writer, f.legacy);
+  assert.match(claimGeneration ?? "", /^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/);
+  assert.deepEqual(Reflect.get(ledger, "boundWorkspaceIntents"), [prepared.id]);
   assert.deepEqual(bound.journal, before.journal);
   assert.deepEqual(bound.work, before.work);
   assert.throws(() => startAssignment(f.state, prepared, 1001));
+  assert.throws(() => workspace.claimWorkspace(f.state, f.legacy.writerPid + 1, () => false));
   assert.deepEqual(await port.release(authority), held);
   assert.equal(samples, 1);
   assert.deepEqual(f.snapshot(), bound);
@@ -541,7 +547,11 @@ test("a committed binding retains its original authority when the release marker
 test("a distinct checkout can bind while the previous prepared assignment remains fenced", async t => {
   const port = ownedRelease(), f = sandbox(t);
   const first = f.newIntent(1);
-  bind(f, port, verifiedZero(), "prepared");
+  let samplesA = 0, samplesB = 0;
+  bind(f, port, { observeOriginalGroup: async () => {
+    samplesA++;
+    return { state: "verified", activeProcesses: 1 };
+  } }, "prepared");
   const otherPath = join(f.root, "other-checkout");
   workspace.releaseWorkspace(f.state);
   workspace.prepareWorkspace(f.state, otherPath, () => true);
@@ -550,11 +560,12 @@ test("a distinct checkout can bind while the previous prepared assignment remain
   writeFileSync(join(other.path, "other-work.txt"), work, { flag: "wx" });
   const second = f.newIntent(2, other);
   f.prepare(second, other);
-  const authority = port.bind(f.state, second, verifiedZero());
+  const authority = port.bind(f.state, second, { observeOriginalGroup: async () => { samplesB++; return zero; } });
   assert.ok(authority, "a different checkout may use its own prepared intent and Job");
   startAssignment(f.state, second, 1001);
   completeAssignment(f.state, second, "completed", 1002);
   assert.deepEqual(await port.release(authority), released);
+  assert.deepEqual({ samplesA, samplesB }, { samplesA: 0, samplesB: 1 });
 
   workspace.prepareWorkspace(f.state, f.checkout.path, () => true);
   workspace.claimWorkspace(f.state, f.legacy.writerPid, () => true);
