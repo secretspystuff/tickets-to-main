@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import fs, { existsSync, mkdtempSync, readFileSync, realpathSync, renameSync, writeFileSync } from "node:fs";
 import { syncBuiltinESMExports } from "node:module";
 import { tmpdir } from "node:os";
-import { dirname, join } from "node:path";
+import { basename, dirname, join } from "node:path";
 import { test, type TestContext } from "node:test";
 import { fileURLToPath } from "node:url";
 import { runAssignment, type AssignmentAdapter, type AssignmentInput, type AssignmentRequest, type AssignmentTerminal } from "../src/assignment-boundary.ts";
@@ -26,7 +26,8 @@ type OwnedInput = AssignmentInput & {
 };
 type Scenario = "complete" | "wrong writer" | "revoked" | "claim replaced" | "successor claim" | "prepare rejected"
   | "start flush" | "interrupted" | "wrong terminal" | "revoked after execution" | "result flush" | "witness lost"
-  | "state changed before start" | "state changed after execution" | "opt-in withdrawn" | "close rejected" | "missing journal";
+  | "state changed during staging" | "state changed during bind" | "state changed during start" | "state changed during terminal"
+  | "opt-in withdrawn" | "close rejected" | "missing journal";
 type JournalRow = { kind: string; id: string; sequence: number; requestDigest: string; outcome?: string };
 const onWindows = { skip: process.platform !== "win32", timeout: 24_000 };
 const unqualified = { qualification: "unqualified-harness", publishable: false } as const;
@@ -168,23 +169,38 @@ function ownedCase(t: TestContext, mode: Scenario, gateClose = false) {
   const snapshot = () => ({ ledger: readFileSync(f.ledger), journal: f.journalText() });
   const savedJournal = `${f.journal}.saved`;
   let atStateChange: ReturnType<typeof snapshot> | undefined;
+  let stateChangeArmed = false;
+  let changedInEpoch: string | undefined;
+  let mismatchObservations = 0;
   let atJournalLoss: ReturnType<typeof snapshot> | undefined;
-  if (mode === "state changed before start" || mode === "state changed after execution") {
-    const lstat = fs.lstatSync;
+  if (mode.startsWith("state changed")) {
+    const { lstatSync: lstat, renameSync: rename } = fs;
+    const leaseRoot = join(f.base.stateDir, ".state-leases", "ledger");
+    fs.renameSync = (source, destination) => {
+      rename(source, destination);
+      if (!stateChangeArmed || atStateChange || typeof source !== "string" || typeof destination !== "string"
+        || dirname(source) !== leaseRoot || !basename(source).startsWith(".claim-")
+        || dirname(destination) !== leaseRoot || !/^epoch-\d+$/.test(basename(destination))) return;
+      changedInEpoch = destination;
+      atStateChange = snapshot();
+    };
     assert.equal(Reflect.set(fs, "lstatSync", (...args: Parameters<typeof lstat>) => {
       const info = lstat(...args);
-      if (atStateChange && args[0] === f.base.stateDir && info && typeof info.ino === "bigint") info.ino += 1n;
+      if (atStateChange && args[0] === f.base.stateDir && info && typeof info.ino === "bigint") {
+        if (!changedInEpoch || !existsSync(join(changedInEpoch, "released"))) mismatchObservations++;
+        info.ino += 1n;
+      }
       return info;
     }), true);
     syncBuiltinESMExports();
-    t.after(() => { Reflect.set(fs, "lstatSync", lstat); syncBuiltinESMExports(); });
+    t.after(() => { fs.renameSync = rename; Reflect.set(fs, "lstatSync", lstat); syncBuiltinESMExports(); });
   }
   const events: Trace[] = [];
   const record = (event: string) => events.push({ event, kinds: f.rows().map(r => r.kind),
     writer: f.claim()?.writerPid, generation: f.claim()?.claimGeneration, flushes: [...flushes] });
   const closing = deferred<void>(), permitClose = deferred<void>();
   t.after(() => permitClose.resolve());
-  let fallback = 0, reconciliations = 0, replaced = false, disposed = 0, withdrawn = false;
+  let fallback = 0, reconciliations = 0, replaced = false, disposed = 0, withdrawn = false, substitutePreparations = 0;
   let replacement: Buffer | undefined;
   let staged: Awaited<ReturnType<typeof stage>> | undefined;
   const input: OwnedInput = {
@@ -192,10 +208,12 @@ function ownedCase(t: TestContext, mode: Scenario, gateClose = false) {
       kind: "fabricated-harness",
       async readCurrent() {
         if (mode === "opt-in withdrawn" && !withdrawn) {
+          input.owned.prepare = async () => { substitutePreparations++; throw new Error("fabricated substitute preparer"); };
           assert.equal(Reflect.deleteProperty(input, "owned"), true);
           withdrawn = true;
         }
         const bound = f.claim()?.claimGeneration !== undefined;
+        if (mode === "state changed during start" && bound) stateChangeArmed = true;
         const revoked = (mode === "revoked" && bound)
           || (mode === "revoked after execution" && events.some(event => event.event === "root closed"));
         if (mode === "claim replaced" && bound && !replaced) {
@@ -236,17 +254,19 @@ function ownedCase(t: TestContext, mode: Scenario, gateClose = false) {
         assert.equal(f.claim()?.writerPid, f.owner);
       });
       record("suspended");
-      if (mode === "state changed before start") atStateChange = snapshot();
+      if (mode === "state changed during staging") atStateChange = snapshot();
+      if (mode === "state changed during bind") stateChangeArmed = true;
       return {
         original: { observeOriginalGroup() { record("sample"); return child.owned.observeOriginalGroup(); } },
         async execute(value) {
           record("execute");
-          assert.notEqual(mode, "state changed before start", "a different state directory cannot authorize native input");
+          assert.ok(!mode.startsWith("state changed") || mode === "state changed during terminal",
+            "a different state directory cannot authorize native input");
           assert.equal(value.workspace, f.workspace);
           await child.execute(value.input);
           record("root closed");
           assert.deepEqual(readFileSync(f.marker), Buffer.from(f.request.input));
-          if (mode === "state changed after execution") atStateChange = snapshot();
+          if (mode === "state changed during terminal") stateChangeArmed = true;
           if (mode === "interrupted") throw new Error("fabricated interruption after local start");
           if (mode === "witness lost") child.owned.closeObservation();
           const result = f.receipt(value);
@@ -265,7 +285,8 @@ function ownedCase(t: TestContext, mode: Scenario, gateClose = false) {
     } },
   };
   return { ...f, events, faults, started, snapshot, savedJournal, get stateChange() { return atStateChange; },
-    get journalLoss() { return atJournalLoss; }, get withdrawn() { return withdrawn; },
+    get changedInEpoch() { return changedInEpoch; }, get mismatchObservations() { return mismatchObservations; },
+    get journalLoss() { return atJournalLoss; }, get withdrawn() { return withdrawn; }, get substitutePreparations() { return substitutePreparations; },
     closing: closing.promise, permitClose: () => permitClose.resolve(),
     run: () => runAssignment(input), get disposed() { return disposed; }, get replacement() { return replacement; },
     get fallback() { return fallback; }, get reconciliations() { return reconciliations; },
@@ -403,12 +424,23 @@ for (const mode of ["interrupted", "wrong terminal", "revoked after execution", 
   });
 }
 
-for (const mode of ["state changed before start", "state changed after execution"] as const) {
+for (const mode of ["state changed during staging", "state changed during bind", "state changed during start", "state changed during terminal"] as const) {
   test(`owned runner preserves the journal and ledger when ${mode}`, onWindows, async t => {
     const f = ownedCase(t, mode);
-    assert.deepEqual(await f.run(), { state: "held", ...unqualified });
+    const result = await f.run();
     assert.ok(f.stateChange, "the state continuity observation must change at the intended barrier");
-    const executed = mode === "state changed after execution";
+    if (mode !== "state changed during staging") {
+      assert.ok(f.changedInEpoch, "the guard must encounter a changed state inside the expected ledger lease");
+      const owner = readFileSync(join(f.changedInEpoch, "owner.json"));
+      assert.equal(JSON.parse(owner.toString("utf8")).pid, process.pid);
+      assert.deepEqual(readFileSync(join(f.changedInEpoch, "released")), owner);
+      assert.ok(f.mismatchObservations > 0, "the lost state instance must be observed while that epoch is held");
+    }
+    assert.deepEqual(result, { state: "held", ...unqualified });
+    const executed = mode === "state changed during terminal";
+    const alreadyBound = executed || mode === "state changed during start";
+    assert.equal(parseLedger(f.stateChange.ledger.toString("utf8"))?.workspace?.claimGeneration !== undefined, alreadyBound);
+    assert.deepEqual(f.stateChange.journal.trim().split("\n").map(line => JSON.parse(line).kind), executed ? ["intent", "started"] : ["intent"]);
     assert.deepEqual(f.events.map(event => event.event), ["prepared", "suspended",
       ...(executed ? ["execute", "resume", "root closed"] : []), "close"]);
     assert.deepEqual(f.rows().map(row => row.kind), executed ? ["intent", "started"] : ["intent"]);
@@ -424,6 +456,7 @@ test("an owned opt-in stays selected when its input property is withdrawn during
   const f = ownedCase(t, "opt-in withdrawn");
   assert.deepEqual(await f.run(), { state: "completed", ...unqualified });
   assert.equal(f.withdrawn, true);
+  assert.equal(f.substitutePreparations, 0);
   assert.deepEqual(f.events.map(event => event.event), ["prepared", "suspended", "execute", "resume", "root closed", "sample", "close"]);
   assert.deepEqual(f.rows().map(row => row.kind), ["intent", "started", "result"]);
   assert.equal(f.claim()?.writerPid, null);
@@ -434,7 +467,7 @@ test("an owned opt-in stays selected when its input property is withdrawn during
 
 test("an owned disposal rejection holds the workspace and prevents handoff or replay", onWindows, async t => {
   const f = ownedCase(t, "close rejected");
-  assert.deepEqual(await f.run(), { state: "held", ...unqualified });
+  const result = await f.run();
   assert.deepEqual(f.events.map(event => event.event), ["prepared", "suspended", "close"]);
   assert.equal(f.childExits, 0, "the staged fixture is still awaiting cleanup");
   assert.equal(f.claim()?.writerPid, f.owner);
@@ -442,7 +475,28 @@ test("an owned disposal rejection holds the workspace and prevents handoff or re
   assert.equal(f.activations, 0);
   assert.equal(existsSync(f.marker), false);
   const before = f.snapshot();
-  assert.deepEqual(await f.run(), { state: "held", ...unqualified });
+  const replay = await f.run();
+  const later = { ...f.request, id: id(21), sequence: 2 };
+  let nextReads = 0, nextWork = 0;
+  const other: OwnedInput = {
+    ...f.base, raw: JSON.stringify(later),
+    adapter: {
+      kind: "fabricated-harness",
+      async readCurrent() {
+        nextReads++;
+        return { binding: later.binding, nextSequence: later.sequence, authorized: true, seat: "member",
+          confirmedWorkspace: f.workspace, writersContained: true };
+      },
+      async execute() { nextWork++; throw new Error("unexpected successor execution"); },
+      async reconcile() { nextWork++; return null; },
+    },
+    owned: { async prepare() { nextWork++; throw new Error("unexpected successor preparation"); } },
+  };
+  const successorResult = await runAssignment(other);
+  assert.deepEqual({ result, replay, successorResult, nextReads, nextWork }, {
+    result: { state: "held", ...unqualified }, replay: { state: "held", ...unqualified },
+    successorResult: { state: "held", ...unqualified }, nextReads: 1, nextWork: 0,
+  });
   assert.deepEqual(f.snapshot(), before);
   assert.deepEqual(f.events.map(event => event.event), ["prepared", "suspended", "close"]);
   assert.equal(f.fallback, 0);
