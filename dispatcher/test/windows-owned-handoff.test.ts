@@ -105,7 +105,7 @@ function fixture(t: TestContext) {
 
 type Fixture = ReturnType<typeof fixture>;
 
-async function atRootClose(f: Fixture, initial: ReturnType<Fixture["start"]>) {
+async function atRootClose(f: Fixture, initial: ReturnType<Fixture["start"]>, owned = false) {
   await until(() => {
     assert.equal(initial.child.exitCode, null, "Controller exited before the root-close checkpoint.");
     return existsSync(f.marker("root-closed"));
@@ -125,7 +125,15 @@ async function atRootClose(f: Fixture, initial: ReturnType<Fixture["start"]>) {
   assert.equal(intent.pid, initial.child.pid);
   assert.deepEqual(started, { kind: "started", id: intent.id, sequence: 1, requestDigest: intent.requestDigest, at: 1000 });
   assert.deepEqual(remaining, []);
-  assert.deepEqual(JSON.parse(before[1].toString()).workspace, { path: f.workspace, writerPid: initial.child.pid, qualified: false });
+  const ledger = JSON.parse(before[1].toString());
+  const generation: unknown = ledger.workspace?.claimGeneration;
+  const originalClaim = { path: f.workspace, writerPid: initial.child.pid, qualified: false };
+  if (owned) {
+    assert.ok(typeof generation === "string");
+    assert.match(generation, /^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/);
+    assert.deepEqual(ledger.workspace, { ...originalClaim, claimGeneration: generation });
+    assert.deepEqual(ledger.boundWorkspaceIntents, [intent.id]);
+  } else assert.deepEqual(ledger.workspace, originalClaim);
   f.signal("attempt-handoff");
   await until(() => {
     assert.equal(initial.child.exitCode, null, "Controller accepted handoff while the late writer was live.");
@@ -194,4 +202,109 @@ test("a withheld transport close can be aborted without a terminal receipt or a 
   assert.deepEqual(await bounded(initial.result, "The waiting controller did not abort."), { code: 74, signal: null, output: "" });
   assert.deepEqual(f.snapshot(), before);
   assert.ok(!existsSync(f.marker("drain-receipt")));
+});
+
+test("the opted-in controller retains one Job from suspended preparation through the durable owned claim release", platform, async t => {
+  const f = fixture(t);
+  f.signal("owned-admission");
+  const initial = f.start();
+  await until(() => {
+    assert.equal(initial.child.exitCode, null, "Controller exited before owned preparation.");
+    assert.equal(existsSync(f.marker("reader-pid")), false, "The legacy reader started before owned preparation was admitted.");
+    return existsSync(f.marker("owned-staged"));
+  }, "The controller did not stage the verified child through owned preparation.");
+  const [preparedBytes, preparedLedger] = f.snapshot();
+  const [prepared, ...rest] = preparedBytes.toString().trimEnd().split("\n").map(line => JSON.parse(line));
+  assert.equal(prepared.kind, "intent");
+  assert.equal(prepared.pid, initial.child.pid);
+  assert.deepEqual(rest, []);
+  assert.deepEqual(JSON.parse(preparedLedger.toString()).workspace, { path: f.workspace, writerPid: initial.child.pid, qualified: false });
+  assert.equal(existsSync(f.marker("writer-pid")), false);
+  assert.equal(existsSync(join(f.workspace, "received.bin")), false);
+  writeFileSync(join(f.workspace, "work.txt"), "fabricated pre-existing work\n", { flag: "wx" });
+  f.signal("allow-owned-start");
+  await until(() => {
+    assert.equal(initial.child.exitCode, null, "Controller exited before the staged reader requested input.");
+    assert.equal(existsSync(join(f.workspace, "received.bin")), false, "Input reached the child before the durable check.");
+    return existsSync(f.marker("owned-input-ready"));
+  }, "The exact reader did not reach the owned input barrier.");
+  const [startedBytes, startedLedger] = f.snapshot();
+  const started = { kind: "started", id: prepared.id, sequence: 1, requestDigest: prepared.requestDigest, at: 1000 };
+  assert.deepEqual(startedBytes, Buffer.concat([preparedBytes, Buffer.from(JSON.stringify(started) + "\n")]));
+  const bound = JSON.parse(startedLedger.toString());
+  assert.match(bound.workspace.claimGeneration, /^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/);
+  assert.deepEqual(bound.workspace, { path: f.workspace, writerPid: initial.child.pid, qualified: false,
+    claimGeneration: bound.workspace.claimGeneration });
+  assert.deepEqual(bound.boundWorkspaceIntents, [prepared.id]);
+  assert.equal(existsSync(f.marker("writer-pid")), false);
+  const originalBroker = f.pid("broker-pid");
+  f.signal("allow-owned-input");
+
+  const { before, writer, broker, intent } = await atRootClose(f, initial, true);
+  assert.deepEqual(intent, prepared);
+  assert.equal(broker, originalBroker);
+  assert.deepEqual(before, [startedBytes, startedLedger]);
+  assert.deepEqual(await f.replay(false), { result: { state: "held", ...unqualified }, effects: 0, reconciliations: 0, readDigest: null });
+  assert.deepEqual(f.snapshot(), before);
+  await finishWriter(f, writer);
+  assert.deepEqual(f.snapshot(), before);
+  assert.equal(existsSync(f.marker("release-observation")), false);
+
+  f.signal("observe-drained");
+  await until(() => {
+    assert.equal(initial.child.exitCode, null, "Controller returned or lost the original observer before release.");
+    return existsSync(f.marker("release-observation"));
+  }, "The runner did not sample the retained original Job for owned release.");
+  assert.equal(readFileSync(f.marker("drain-receipt"), "utf8"), "original-job-active=0");
+  assert.equal(f.pid("broker-pid"), broker);
+  assert.equal(processAlive(broker), true);
+  const result = { kind: "result", id: intent.id, sequence: 1, requestDigest: intent.requestDigest, at: 1000, outcome: "completed" };
+  const terminal = Buffer.concat([before[0], Buffer.from(JSON.stringify(result) + "\n")]);
+  assert.deepEqual(f.snapshot(), [terminal, before[1]]);
+  assert.equal(existsSync(f.marker("observer-closed")), false);
+
+  f.signal("allow-release-observation");
+  const ended = await bounded(initial.result, "Controller did not dispose the original Job after release.");
+  assert.deepEqual({ code: ended.code, signal: ended.signal }, { code: 0, signal: null });
+  assert.deepEqual(JSON.parse(ended.output), { state: "completed", ...unqualified });
+  assert.equal(existsSync(f.marker("observer-closed")), true);
+  await until(() => !processAlive(broker), "The original observer broker did not exit after disposal.");
+  const expectedLedger = JSON.parse(before[1].toString());
+  expectedLedger.workspace = { path: f.workspace, writerPid: null, qualified: false };
+  delete expectedLedger.boundWorkspaceIntents;
+  const after = f.snapshot();
+  assert.deepEqual(after[0], terminal);
+  assert.deepEqual(JSON.parse(after[1].toString()), expectedLedger);
+  assert.deepEqual(await f.replay(false), { result: { state: "completed", ...unqualified }, effects: 0, reconciliations: 0, readDigest: null });
+  assert.deepEqual(f.snapshot(), after);
+  assert.equal(readFileSync(join(f.workspace, "work.txt"), "utf8"), "fabricated pre-existing work\n");
+});
+
+test("the opted-in controller cannot fall back to a legacy launch when owned preparation is refused", platform, async t => {
+  const f = fixture(t);
+  f.signal("owned-admission");
+  f.signal("refuse-owned-preparation");
+  const initial = f.start();
+  await until(() => {
+    assert.equal(existsSync(f.marker("reader-pid")), false, "Refused owned preparation fell through to the legacy reader.");
+    return initial.child.exitCode !== null;
+  }, "The controller did not produce its owned preparation refusal.");
+  const ended = await bounded(initial.result, "Controller did not settle after owned preparation was refused.");
+  assert.deepEqual({ code: ended.code, signal: ended.signal }, { code: 0, signal: null });
+  assert.deepEqual(JSON.parse(ended.output), { state: "not-started", ...unqualified });
+  const after = f.snapshot();
+  const [intent, result, ...rest] = after[0].toString().trimEnd().split("\n").map(line => JSON.parse(line));
+  assert.equal(intent.kind, "intent");
+  assert.equal(intent.pid, initial.child.pid);
+  assert.deepEqual(result, { kind: "result", id: intent.id, sequence: 1, requestDigest: intent.requestDigest, at: 1000, outcome: "not-started" });
+  assert.deepEqual(rest, []);
+  const ledger = JSON.parse(after[1].toString());
+  assert.deepEqual(ledger.workspace, { path: f.workspace, writerPid: initial.child.pid, qualified: false });
+  assert.equal(Object.hasOwn(ledger, "boundWorkspaceIntents"), false);
+  for (const name of ["owned-staged", "owned-input-ready", "reader-pid", "broker-pid", "writer-pid", "release-observation", "observer-closed"]) {
+    assert.equal(existsSync(f.marker(name)), false, `${name} was produced for refused preparation`);
+  }
+  for (const name of ["received.bin", "late.bin"]) assert.equal(existsSync(join(f.workspace, name)), false);
+  assert.deepEqual(await f.replay(false), { result: { state: "not-started", ...unqualified }, effects: 0, reconciliations: 0, readDigest: null });
+  assert.deepEqual(f.snapshot(), after);
 });
