@@ -204,10 +204,12 @@ def wait_for_report(path, parent_handle):
     return int(value)
 
 
-def wait_gate(control, name, owner):
+def wait_gate(control, name, owner, *, writer=None):
     while wait(owner, 0) == WAIT_TIMEOUT and not (control / "abort").exists():
         if (control / name).exists():
             return True
+        if writer is not None and writer.poll() is not None:
+            raise Held("writer exited before root handoff")
         time.sleep(0.015)
     return False
 
@@ -239,7 +241,7 @@ def fixture_child(role, fixture_arg, controller_pid):
                                       stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                                       creationflags=subprocess.DETACHED_PROCESS)
             publish_pid(control, "writer-spawned", writer.pid)
-            if not wait_gate(control, "parent-exit", owner):
+            if not wait_gate(control, "parent-exit", owner, writer=writer):
                 writer.wait()
     finally:
         close(owner)
