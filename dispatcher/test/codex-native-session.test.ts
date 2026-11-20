@@ -245,6 +245,32 @@ test("app-server late reroutes leave terminal model evidence intact", async t =>
   }
 });
 
+test("a malformed app-server terminal status does not close reroute evidence", async () => {
+  let native!: NativeEvents;
+  const transport = server((events) => {
+    native = events;
+    permission(events);
+    emit(events, { method: "turn/completed", params: { threadId: THREAD, turn: { id: TURN, status: ["completed"], items: [] } } });
+  });
+  const handle = startCodexAppServerAssignment(REQUEST, transport, {}, [], LAUNCH);
+  const settled = await handle.settled;
+  const reroute = { fromModel: "after-malformed-source", toModel: "after-malformed-target", reason: "highRiskCyberActivity" };
+  emit(native, { method: "model/rerouted", params: { threadId: THREAD, turnId: TURN, ...reroute } });
+  const after = handle.snapshot();
+  handle.closeInput();
+  const closed = await handle.closed;
+  assert.deepEqual(transport.calls[0]!.input.map((line) => JSON.parse(line).method),
+    ["initialize", "initialized", "thread/start", "turn/start"]);
+  for (const observation of [settled, after, closed]) {
+    assert.equal(observation.outcome, "held");
+    assert.equal(observation.approvalAnswered, false);
+    assert.equal(observation.writerState, "unknown");
+  }
+  assert.equal(settled.appServerModelEvidence.reroute, null);
+  assert.deepEqual(after.appServerModelEvidence.reroute, reroute);
+  assert.deepEqual(closed.appServerModelEvidence.reroute, reroute);
+});
+
 for (const method of ["item/commandExecution/requestApproval", "item/fileChange/requestApproval", "item/permissions/requestApproval"]) {
   test(`${method} stays held and is never answered`, async () => {
     const transport = server((events) => permission(events, method));
