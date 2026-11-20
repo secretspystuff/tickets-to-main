@@ -1,6 +1,6 @@
 import type { CommandRunner } from "../command.ts";
 import { toolEnv } from "../command.ts";
-import { JsonLines, type NativeTransport } from "../native-transport.ts";
+import { JsonLines, type NativeProcess, type NativeTransport } from "../native-transport.ts";
 import { copyObservation, hasHeldSecret, nativeObservation, opaqueId, record, safeNativeText, type NativeObservation } from "./native-result.ts";
 export { startCodexAppServerAssignment, CODEX_APP_SERVER_SCHEMA_VERSION } from "./codex-app-server.ts";
 export type { CodexAssignmentHandle, CodexAppServerLaunch } from "./codex-app-server.ts";
@@ -75,7 +75,8 @@ export async function runCodexCliAssignment(
     state.reason = request.model !== null ? "Model selection is unknown on Codex cli." : "Effort selection is unknown on Codex cli.";
     return state;
   }
-  if ([request.prompt, request.workspace, request.assignmentId, executable].some((part) => hasHeldSecret(part, secrets) || safeNativeText(part, secrets) !== part)) {
+  const prompt = request.prompt;
+  if ([prompt, request.workspace, request.assignmentId, executable].some((part) => hasHeldSecret(part, secrets) || safeNativeText(part, secrets) !== part)) {
     state.outcome = "refused";
     state.reason = "The assignment includes a Dispatcher secret or credential. It was not sent.";
     return state;
@@ -104,7 +105,7 @@ export async function runCodexCliAssignment(
       if (!item || !opaqueId(item.id) || typeof item.type !== "string") { invalid(); return; }
       if (msg.type === "item.completed" && item.type === "agent_message") {
         if (typeof item.text !== "string") { invalid(); return; }
-        state.resultText = safeNativeText(item.text, secrets, request.prompt);
+        state.resultText = safeNativeText(item.text, secrets, prompt);
       }
     } else if (msg.type === "turn.completed") {
       if (!started || terminal || state.resultText === null || state.outcome !== "running") { invalid(); return; }
@@ -118,8 +119,26 @@ export async function runCodexCliAssignment(
   }, invalid);
   state.argv = [executable, "exec", "--json", "-"];
   return new Promise((resolve) => {
-    const child = transport.start(state.argv, { cwd: request.workspace, env: toolEnv(parentEnv, secrets) }, {
-      spawned() { state.spawned = true; },
+    let child: NativeProcess | undefined;
+    let inputStarted = false;
+    let inputEnded = false;
+    let connectionClosed = false;
+    function sendInput(): void {
+      if (!child || !state.spawned || inputStarted || connectionClosed || state.outcome !== "starting") return;
+      inputStarted = true;
+      const accepted = child.write(prompt);
+      if (!accepted) {
+        state.outcome = "disconnected";
+        state.reason = "Native input is unavailable. Writer completion is unknown.";
+      }
+      if (!connectionClosed) {
+        // EOF can synchronously close the stream after the prompt was accepted.
+        inputEnded = accepted;
+        child.endInput();
+      }
+    }
+    child = transport.start(state.argv, { cwd: request.workspace, env: toolEnv(parentEnv, secrets) }, {
+      spawned() { state.spawned = true; sendInput(); },
       stdout(chunk) { parser.push(chunk); },
       stderr() {},
       inputError() {
@@ -127,8 +146,10 @@ export async function runCodexCliAssignment(
         state.reason = "Native input disconnected. Writer completion is unknown.";
       },
       closed(exit) {
+        if (connectionClosed) return;
+        connectionClosed = true;
         parser.finish();
-        if (state.outcome === "completed" && exit.code === 0 && exit.signal === null && exit.error === null) {
+        if (inputEnded && state.outcome === "completed" && exit.code === 0 && exit.signal === null && exit.error === null) {
           state.observed.assignment = "supported";
           state.observed.streamResult = "supported";
         } else if (state.outcome !== "protocol-error" && state.outcome !== "failed") {
@@ -138,10 +159,6 @@ export async function runCodexCliAssignment(
         resolve(copyObservation(state));
       },
     });
-    if (!child.write(request.prompt)) {
-      state.outcome = "disconnected";
-      state.reason = "Native input is unavailable. Writer completion is unknown.";
-    }
-    child.endInput();
+    sendInput();
   });
 }
