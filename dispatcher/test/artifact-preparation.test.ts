@@ -7,12 +7,13 @@ import { test, type TestContext } from "node:test";
 import { runArtifactPreparation } from "../src/artifact-preparation.ts";
 import { runCheckAttempt, type CheckAttemptRecord } from "../src/check-attempt.ts";
 import { processRunner } from "../src/command.ts";
-import { assignmentDirectory } from "../src/directory-identity.ts";
+import { assignmentDirectory, directoryBirthTime } from "../src/directory-identity.ts";
 import { assertPrivateDirectory } from "../src/fs-safety.ts";
 import { install } from "../src/install.ts";
 import { updateLedger } from "../src/ledger.ts";
 import { prepareWorkspace } from "../src/workspace.ts";
 import { removeDir, tempDir } from "./helpers.ts";
+import { historicalMarker, localBundle, localBundleInventory } from "./local-git-artifact-fixture.ts";
 import { failedCheckAttemptFixture } from "./release-test-fixtures.ts";
 
 const unsafe = "synthetic-held-artifact-value";
@@ -39,10 +40,13 @@ function git(workspace: string, ...args: string[]): string {
   return result.stdout.trim();
 }
 
-function fixture(t: TestContext, repository = false) {
+function fixture(t: TestContext, repository = false, providedWorkspace?: string) {
   const stateDir = tempDir();
-  const workspace = realpathSync(tempDir());
-  t.after(() => { removeDir(stateDir); removeDir(workspace); });
+  const workspace = realpathSync(providedWorkspace ?? tempDir());
+  t.after(() => {
+    removeDir(stateDir);
+    if (providedWorkspace === undefined) removeDir(workspace);
+  });
   install({ stateDir, platform: process.platform, arch: process.arch, nowIso: "2026-11-18T08:00:00.000Z" });
   prepareWorkspace(stateDir, workspace, () => false);
   const first = failedCheckAttemptFixture();
@@ -162,13 +166,14 @@ function events(path: string): Array<Record<string, unknown>> {
 
 type CheckoutObservation = { birthNs: string | null; changeNs: string; match?: true };
 
-function child(stateDir: string, request: Request, current: Current, crash: boolean, now = 100, observation?: CheckoutObservation) {
+function child(stateDir: string, request: Request, current: Current, crash: boolean, now = 100, observation?: CheckoutObservation,
+  artifacts?: ReturnType<typeof localBundleInventory>) {
   const url = new URL("../src/artifact-preparation.ts", import.meta.url).href;
   const script = `
 import { createHash } from "node:crypto";
 import fs from "node:fs";
 import { syncBuiltinESMExports } from "node:module";
-const [stateDir, request, scope, mode, now, fixture] = process.argv.slice(1);
+const [stateDir, request, scope, mode, now, fixture, supplied] = process.argv.slice(1);
 const current = JSON.parse(scope);
 const observation = JSON.parse(fixture);
 if (observation) {
@@ -189,12 +194,76 @@ const bytes = Buffer.from("fabricated restart artifact");
 const name = "fabricated-restart.txt";
 const batch = { expected: [{ name, size: bytes.byteLength, sha256: createHash("sha256").update(bytes).digest("hex") }],
   artifacts: [{ name, bytes }], secrets: observation?.match ? [bytes.toString()] : [] };
-const input = mode === "crash" ? new Proxy({}, { ownKeys() { process.exit(37); } }) : batch;
+const scanInput = supplied === "supplied" ? JSON.parse(fs.readFileSync(0, "utf8"), (key, value) =>
+  key === "bytes" ? Buffer.from(value.data) : value) : batch;
+const input = mode === "crash" ? new Proxy({}, { ownKeys() { process.exit(37); } }) : scanInput;
 const result = runArtifactPreparation({ stateDir, request: JSON.parse(request), artifacts: input,
   context: { kind: "fabricated-harness", now: () => Number(now), readCurrent: () => structuredClone(current) } });
 process.stdout.write(JSON.stringify(result));`;
   return spawnSync(process.execPath, ["--input-type=module", "--eval", script, stateDir, JSON.stringify(request), JSON.stringify(current),
-    crash ? "crash" : "read", String(now), JSON.stringify(observation ?? null)], { encoding: "utf8" });
+    crash ? "crash" : "read", String(now), JSON.stringify(observation ?? null), artifacts ? "supplied" : "default"],
+    { encoding: "utf8", input: artifacts && JSON.stringify(artifacts) });
+}
+
+for (const historicalHit of [false, true]) {
+  test(`sealed fabricated Git history ${historicalHit ? "persists a detected artifact stop" : "prepares clean artifacts without publication"}`, t => {
+    const bundle = localBundle(t, historicalHit);
+    const f = fixture(t, false, bundle.source);
+    f.first.snapshot.baseCommit = bundle.base;
+    f.first.snapshot.candidateCommit = bundle.candidate;
+    f.first.snapshot.buildReview!.candidateCommit = bundle.candidate;
+    const receipt = f.receipt("a", 90);
+    const sealedBytes = readFileSync(bundle.file);
+    const inventory = localBundleInventory(t, sealedBytes, bundle.digest, receipt.snapshot.candidateCommit);
+    const marked = inventory.artifacts.filter(({ bytes }) => bytes.includes(historicalMarker));
+    assert.deepEqual(marked.map(({ name }) => name), historicalHit ? [`blob-${bundle.historicalBlob}`] : []);
+    assert.equal(bundle.refValue(), bundle.candidate);
+    const result = f.run(receipt, inventory);
+    const journal = readFileSync(f.journal);
+    const workspace = assignmentDirectory(f.workspace);
+    const workspaceIdentity = JSON.stringify([workspace.path, workspace.identity, directoryBirthTime(workspace).toString()]);
+    assert.deepEqual(events(f.journal), [
+      { kind: "artifact.intent", sequence: 1, at: 100, jobDigest: createHash("sha256").update(receipt.jobId).digest("hex"),
+        workspaceDigest: createHash("sha256").update(workspaceIdentity).digest("hex") },
+      { kind: historicalHit ? "runner.stopped" : "artifact.checked", sequence: 1, at: 100,
+        ...(historicalHit && { reason: "secret-detected" }) },
+    ]);
+    assert.deepEqual(result, { state: historicalHit ? "stopped" : "prepared", reason: historicalHit ? "secret-detected" : null,
+      stopSequence: historicalHit ? 1 : null, qualification: "unqualified-harness", publishable: false });
+    assert.equal(journal.includes(historicalMarker), false);
+    assert.equal(journal.includes(bundle.candidate), false);
+    assert.equal(journal.includes(receipt.jobId), false);
+    assert.equal(journal.includes(receipt.attemptId), false);
+    assert.equal(JSON.stringify(result).includes(historicalMarker), false);
+    if (historicalHit) {
+      const originalInventory = structuredClone(inventory);
+      const newer = f.receipt("b", 105);
+      const restored = child(f.stateDir, f.request(newer), f.current(newer), false, 110, undefined, inventory);
+      assert.equal(restored.status, 0);
+      assert.equal(restored.stderr, "");
+      assert.equal(restored.stdout.includes(historicalMarker), false);
+      assert.deepEqual(JSON.parse(restored.stdout), result);
+      assert.deepEqual(readFileSync(f.journal), journal);
+      const ledgerPath = join(f.stateDir, "ledger.json");
+      const ledger = readFileSync(ledgerPath);
+      let scannedHistoricalBytes = 0;
+      const afterFix = runArtifactPreparation({ stateDir: f.stateDir, request: f.request(newer, 1), artifacts: { ...inventory,
+        artifacts: inventory.artifacts.map(artifact => artifact === marked[0] ? new Proxy(artifact, {
+          getOwnPropertyDescriptor(target, key) {
+            if (key === "bytes") scannedHistoricalBytes++;
+            return Reflect.getOwnPropertyDescriptor(target, key);
+          },
+        }) : artifact) }, context: { kind: "fabricated-harness", now: () => 110, readCurrent: () => f.current(newer, 1) } });
+      assert.equal(scannedHistoricalBytes, 1);
+      assert.deepEqual(afterFix, result);
+      assert.deepEqual(readFileSync(f.journal), journal);
+      assert.deepEqual(readFileSync(ledgerPath), ledger);
+      assert.equal(ledger.includes(historicalMarker), false);
+      assert.deepEqual(structuredClone(inventory), originalInventory);
+    }
+    assert.deepEqual(readFileSync(bundle.file), sealedBytes);
+    assert.equal(bundle.refValue(), bundle.candidate);
+  });
 }
 
 test("a detected artifact secret persists across a new process and blocks a queued passing receipt", async t => {
