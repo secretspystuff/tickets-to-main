@@ -50,6 +50,7 @@ export function startCodexAppServerAssignment(
   let inputClosed = false;
   let initializationSent = false;
   let stage: "initialize" | "thread" | "turn" | "active" = "initialize";
+  let terminalObserved = false;
   let interruptSent = false;
   const pending = new Set<number>();
   const helpers = new Map<string, string>();
@@ -98,9 +99,12 @@ export function startCodexAppServerAssignment(
   function safeId(value: unknown): value is string {
     return opaqueId(value) && !hasHeldSecret(value, secrets) && safeNativeText(value, secrets) === value;
   }
-  function safeModelValue(value: unknown): value is string {
-    return opaqueId(value) && !/[\u007f-\u009f]/.test(value)
+  function safeEvidenceText(value: unknown): value is string {
+    return typeof value === "string" && value.length > 0 && !/[\u0000-\u001f\u007f-\u009f]/.test(value)
       && !hasHeldSecret(value, secrets) && safeNativeText(value, secrets, request.prompt) === value;
+  }
+  function safeModelValue(value: unknown): value is string {
+    return opaqueId(value) && safeEvidenceText(value);
   }
   function threadResult(result: Record<string, unknown>): void {
     const thread = record(result.thread);
@@ -115,7 +119,7 @@ export function startCodexAppServerAssignment(
     state.observedModel = safeNativeText(result.model, secrets);
     modelEvidence.beforeTurn = {
       model: safeModelValue(result.model) ? result.model : null,
-      reasoningEffort: safeModelValue(result.reasoningEffort) ? result.reasoningEffort : null,
+      reasoningEffort: safeEvidenceText(result.reasoningEffort) ? result.reasoningEffort : null,
     };
     if (request.model !== null && result.model !== request.model) {
       outcome("refused", "The native tool reported a different model. No assignment was sent.");
@@ -179,6 +183,8 @@ export function startCodexAppServerAssignment(
       if (!params || params.threadId !== state.threadId || !turn || turn.id !== state.turnId || state.turnId === null
         || !Array.isArray(turn.items) || !["completed", "interrupted", "failed"].includes(String(turn.status))) { invalid(); return; }
       if (state.outcome === "completed" || state.outcome === "failed" || state.outcome === "interrupted") { invalid(); return; }
+      // A native turn can finish while the assignment stays held.
+      terminalObserved = true;
       if (turn.status === "completed" && state.resultText !== null && state.outcome !== "held") {
         state.observed.assignment = "supported";
         state.observed.streamResult = "supported";
@@ -189,7 +195,7 @@ export function startCodexAppServerAssignment(
     } else if (method === "model/rerouted" && params && sameContext(params)) {
       if (typeof params.toModel === "string") state.observedModel = safeNativeText(params.toModel, secrets);
       const { fromModel, toModel, reason } = params;
-      if (safeModelValue(fromModel) && safeModelValue(toModel) && reason === "highRiskCyberActivity" && safeModelValue(reason)) {
+      if (!terminalObserved && safeModelValue(fromModel) && safeModelValue(toModel) && reason === "highRiskCyberActivity" && safeModelValue(reason)) {
         modelEvidence.reroute = { fromModel, toModel, reason };
       }
       outcome("held", "The native tool reported a model change. Writer completion is unknown.");
