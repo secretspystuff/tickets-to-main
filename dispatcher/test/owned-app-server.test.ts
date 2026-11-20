@@ -81,6 +81,7 @@ function fixture(t: TestContext, scenario: Scenario) {
     ? readFileSync(path, "utf8").trimEnd().split("\n").map(line => JSON.parse(line)) : [];
   const journal = join(stateDir, "assignment-intents.jsonl"), ledger = join(stateDir, "ledger.json");
   const snapshot = () => ({ rows: readRecords(journal), ledger: parseLedger(readFileSync(ledger, "utf8"))! });
+  const bytes = () => [readFileSync(journal), readFileSync(ledger)];
   const before = readFileSync(ledger);
   const received = () => readRecords(join(root, "requests.jsonl"));
   const env = { SystemRoot: process.env.SystemRoot, TEMP: temp, TMP: temp };
@@ -92,6 +93,7 @@ function fixture(t: TestContext, scenario: Scenario) {
   let prepared: ReturnType<typeof snapshot> | undefined, activated: ReturnType<typeof snapshot> | undefined;
   let release: ReturnType<typeof snapshot> | undefined, drained: OriginalGroup | undefined, live: OriginalGroup | undefined;
   let exit: NativeExit | undefined;
+  let activationAttempt: ReturnType<typeof bytes> | undefined;
   const run = () => runAssignment({
     stateDir, raw: JSON.stringify(request), secrets: [], now: () => 1000,
     adapter: {
@@ -114,7 +116,9 @@ function fixture(t: TestContext, scenario: Scenario) {
           if (!launch) return null;
           return { ...launch, async activate() {
             suspended.resolve();
-            if (!await permit.promise || scenario === "refused activation") return false;
+            if (!await permit.promise) return false;
+            activationAttempt = bytes();
+            if (scenario === "refused activation") return false;
             return launch.activate();
           }, async verify() {
             const membership = await launch.verify();
@@ -189,9 +193,10 @@ function fixture(t: TestContext, scenario: Scenario) {
       };
     } },
   });
-  return { run, workspace, answerFile, env, snapshot, received, before, ledger, writes, beforeActivation, groupIdentity,
+  return { run, workspace, answerFile, env, snapshot, bytes, received, before, ledger, writes, beforeActivation, groupIdentity,
     get launches() { return launches; }, get legacy() { return legacy; }, get verified() { return verified; }, get attach() { return attach; },
     get closes() { return closes; }, get prepared() { return prepared; }, get activated() { return activated; },
+    get activationAttempt() { return activationAttempt; },
     get connected() { return connected; }, get settled() { return settled; }, get finished() { return finished; }, get exit() { return exit; }, get release() { return release; },
     get live() { return live; }, get drained() { return drained; } };
 }
@@ -282,10 +287,16 @@ test("a refused native activation closes the suspended app-server without any ha
   assert.deepEqual(f.exit, { code: null, signal: null, error: "spawn" });
   assert.deepEqual(f.drained, { state: "unavailable" });
   assert.equal(f.release, undefined);
+  assert.ok(f.activationAttempt, "observe the exact journal and ledger at the activation refusal");
+  assert.deepEqual(f.bytes(), f.activationAttempt);
   const after = f.snapshot();
-  assert.deepEqual(after.rows.map(row => row.kind), ["intent", "started"]);
+  const [intent, started, ...extra] = after.rows;
+  assert.equal(intent.kind, "intent");
+  assert.deepEqual(started, { kind: "started", id: intent.id, sequence: 1, requestDigest: intent.requestDigest, at: 1000 });
+  assert.deepEqual(extra, []);
   assert.equal(after.ledger.workspace?.writerPid, process.pid);
   assert.ok(after.ledger.workspace?.claimGeneration);
+  assert.deepEqual(after.ledger.boundWorkspaceIntents, [intent.id]);
 });
 
 test("refused app-server preparation starts no native process or turn", onWindows, async t => {
