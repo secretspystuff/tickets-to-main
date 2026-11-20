@@ -322,3 +322,31 @@ test("delayed CLI readiness sends the validated prompt exactly once and preserve
   assert.equal(result.outcome, "completed");
   assert.equal(result.resultText, "[assignment input omitted]");
 });
+
+for (const phase of ["rejected write", "accepted write", "accepted EOF"] as const) {
+  test(`synchronous CLI close during ${phase} settles from the exact input boundary`, async () => {
+    const normal = phase === "accepted EOF";
+    const request = { assignmentId: id(1), prompt, workspace: "C:\\fixture-workspace", model: null, effort: null };
+    const trace: string[] = [];
+    const result = await bounded(runCodexCliAssignment(request, { start(_argv, _options, events) {
+      const close = () => {
+        events.stdout(CLI_RESULT);
+        events.closed({ code: 0, signal: null, error: null });
+      };
+      events.spawned();
+      return {
+        write(text) {
+          trace.push(text);
+          if (!normal) close();
+          return phase !== "rejected write";
+        },
+        endInput() { trace.push("EOF"); close(); },
+      };
+    } }, {}, [], executable));
+    assert.deepEqual(trace, normal ? [prompt, "EOF"] : [prompt]);
+    assert.equal(result.outcome, normal ? "completed" : "disconnected");
+    assert.equal(result.observed.assignment, normal ? "supported" : undefined);
+    assert.equal(result.observed.streamResult, normal ? "supported" : undefined);
+    assert.equal(result.writerState, "unknown");
+  });
+}
