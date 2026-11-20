@@ -184,7 +184,7 @@ export function startCodexAppServerAssignment(
         || !Array.isArray(turn.items) || !["completed", "interrupted", "failed"].includes(String(turn.status))) { invalid(); return; }
       if (state.outcome === "completed" || state.outcome === "failed" || state.outcome === "interrupted") { invalid(); return; }
       // A native turn can finish while the assignment stays held.
-      terminalObserved = true;
+      if (typeof turn.status === "string") terminalObserved = true;
       if (turn.status === "completed" && state.resultText !== null && state.outcome !== "held") {
         state.observed.assignment = "supported";
         state.observed.streamResult = "supported";
