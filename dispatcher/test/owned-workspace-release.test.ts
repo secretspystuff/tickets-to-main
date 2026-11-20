@@ -446,3 +446,79 @@ for (const history of ["started", "completed"] as const) {
     assert.deepEqual(f.snapshot(), before);
   });
 }
+
+test("an ordinary same-PID re-claim cannot bind the same prepared intent to a different Job", async t => {
+  const port = ownedRelease(), f = sandbox(t);
+  const intent = f.newIntent(1);
+  const original = bind(f, port, { observeOriginalGroup: async () => ({ state: "verified", activeProcesses: 1 }) }, "prepared");
+  workspace.claimWorkspace(f.state, f.legacy.writerPid, () => true);
+  const replacement = f.snapshot();
+  assert.deepEqual(parseLedger(replacement.ledger.toString("utf8"))?.workspace, f.legacy);
+  assert.equal(port.bind(f.state, intent, verifiedZero()), null);
+  assert.deepEqual(f.snapshot(), replacement);
+  startAssignment(f.state, intent, 1001);
+  completeAssignment(f.state, intent, "completed", 1002);
+  const completed = f.snapshot();
+  assert.deepEqual(await port.release(original), held);
+  assert.deepEqual(f.snapshot(), completed);
+});
+
+test("terminal evidence for a newer assignment cannot make an older Job witness sufficient", async t => {
+  const port = ownedRelease(), f = sandbox(t);
+  const older = bind(f, port, verifiedZero());
+  const newer = f.newIntent(2);
+  f.prepare(newer);
+  startAssignment(f.state, newer, 1003);
+  completeAssignment(f.state, newer, "completed", 1004);
+  const before = f.snapshot();
+  assert.deepEqual(await port.release(older), held);
+  assert.deepEqual(f.snapshot(), before);
+});
+
+test("a durable claim clear is reported accurately when the release marker cannot be opened", async t => {
+  const port = ownedRelease(), f = sandbox(t);
+  const authority = bind(f, port, verifiedZero());
+  const before = f.snapshot();
+  const { renameSync: originalRename, openSync: originalOpen } = fs;
+  let replaced = false, refusedReleaseMarker = 0;
+  fs.renameSync = (source, destination) => {
+    originalRename(source, destination);
+    if (destination === f.ledger) replaced = true;
+  };
+  fs.openSync = (path, flags, mode) => {
+    if (replaced && typeof path === "string" && path.startsWith(f.leaseRoot) && path.endsWith("released.prepared")) {
+      refusedReleaseMarker++;
+      throw Object.assign(new Error("fabricated release marker unavailable"), { code: "ENOSPC" });
+    }
+    return originalOpen(path, flags, mode);
+  };
+  syncBuiltinESMExports();
+  try {
+    assert.deepEqual(await port.release(authority), released);
+  } finally {
+    fs.renameSync = originalRename;
+    fs.openSync = originalOpen;
+    syncBuiltinESMExports();
+  }
+  assert.equal(refusedReleaseMarker, 1);
+  assert.deepEqual(parseLedger(readFileSync(f.ledger, "utf8"))?.workspace, { ...f.legacy, writerPid: null });
+  assert.deepEqual(f.snapshot().journal, before.journal);
+  assert.deepEqual(f.snapshot().work, before.work);
+  assert.throws(() => workspace.claimWorkspace(f.state, f.legacy.writerPid, () => true));
+});
+
+for (const action of ["bind", "release"] as const) {
+  test(`owned ${action} preserves a missing ledger`, async t => {
+    const port = ownedRelease(), f = sandbox(t);
+    const intent = f.newIntent(1);
+    const authority = action === "release" ? bind(f, port, verifiedZero()) : null;
+    if (action === "bind") f.prepare(intent);
+    const before = f.snapshot();
+    unlinkSync(f.ledger);
+    if (authority) assert.deepEqual(await port.release(authority), held);
+    else assert.equal(port.bind(f.state, intent, verifiedZero()), null);
+    assert.equal(existsSync(f.ledger), false);
+    assert.deepEqual(readFileSync(f.journal), before.journal);
+    assert.equal(readFileSync(join(f.checkout.path, "work.txt"), "utf8"), work);
+  });
+}
