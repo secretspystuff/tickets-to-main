@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
+import { setTimeout as pause } from "node:timers/promises";
 import { test, type TestContext } from "node:test";
 import { fileURLToPath } from "node:url";
 import { CODEX_APP_SERVER_SCHEMA_VERSION, startCodexAppServerAssignment } from "../src/adapters/codex-app-server.ts";
@@ -15,7 +16,7 @@ import { processNativeTransport, windowsOwnedNativeTransport, windowsProcessLaun
 import { claimWorkspace, prepareWorkspace } from "../src/workspace.ts";
 import { removeDir } from "./helpers.ts";
 
-type PeerMode = "complete" | "wrong workspace" | "invalid initialize" | "wrong turn" | "wrong thread";
+type PeerMode = "complete" | "wrong workspace" | "invalid initialize" | "wrong turn" | "wrong thread" | "interrupt";
 type Scenario = PeerMode | "refused preparation" | "refused activation" | "observer closed before release";
 const executable = realpathSync(process.execPath);
 const peer = fileURLToPath(new URL("./owned-app-server-peer.fixture.mjs", import.meta.url));
@@ -31,8 +32,11 @@ function dialogue(workspace: string, scenario: PeerMode): unknown[] {
   if (scenario !== "invalid initialize") {
     expected.push({ method: "initialized" }, { id: 2, method: "thread/start", params: { cwd: workspace, model: "fixture-model" } });
   }
-  if (scenario === "complete" || scenario === "wrong turn" || scenario === "wrong thread") {
+  if (scenario === "complete" || scenario === "wrong turn" || scenario === "wrong thread" || scenario === "interrupt") {
     expected.push({ id: 3, method: "turn/start", params: { threadId: "fixture-thread", input: [{ type: "text", text: prompt }], effort: "low" } });
+  }
+  if (scenario === "interrupt") {
+    expected.push({ id: 4, method: "turn/interrupt", params: { threadId: "fixture-thread", turnId: "fixture-turn" } });
   }
   return expected;
 }
@@ -57,14 +61,25 @@ async function bounded<T>(operation: Promise<T>) {
   finally { clearTimeout(timer); }
 }
 
+async function until(ready: () => boolean | Promise<boolean>, message: string) {
+  const deadline = Date.now() + 8_000;
+  while (!await ready()) {
+    assert.ok(Date.now() < deadline, message);
+    await pause(20);
+  }
+}
+
 function fixture(t: TestContext, scenario: Scenario) {
   assert.equal(process.version, "v24.18.0");
   const parent = realpathSync(tmpdir());
   const root = realpathSync(mkdtempSync(join(parent, "ttm-owned-app-server-")));
   assert.equal(dirname(root), parent);
   const stateDir = join(root, "state"), workspace = join(root, "workspace"), temp = join(root, "tmp");
+  const allowWrite = join(root, "allow-write"), abortWriter = join(root, "abort-writer");
+  const lateMarker = join(workspace, "late-marker.txt");
   const disposals: Array<() => Promise<void>> = [];
   t.after(async () => {
+    if (scenario === "interrupt" && !existsSync(allowWrite)) writeFileSync(abortWriter, "abort", { flag: "wx" });
     for (const dispose of disposals) await dispose();
     assert.equal(dirname(realpathSync(root)), parent);
     removeDir(root);
@@ -97,6 +112,7 @@ function fixture(t: TestContext, scenario: Scenario) {
   let settled: NativeObservation | undefined, connected: NativeObservation | undefined, finished: NativeObservation | undefined;
   let prepared: ReturnType<typeof snapshot> | undefined, activated: ReturnType<typeof snapshot> | undefined;
   let release: ReturnType<typeof snapshot> | undefined, drained: OriginalGroup | undefined, live: OriginalGroup | undefined;
+  let afterInterruptedClose: OriginalGroup | undefined;
   let releaseBytes: ReturnType<typeof bytes> | undefined, releaseGroup: OriginalGroup | undefined;
   let exit: NativeExit | undefined;
   let activationAttempt: ReturnType<typeof bytes> | undefined;
@@ -147,8 +163,17 @@ function fixture(t: TestContext, scenario: Scenario) {
       const close = () => closing ??= (async () => {
         child.endInput();
         permit.resolve(false);
-        await bounded(closed.promise);
-        child.closeObservation();
+        try {
+          await bounded(closed.promise);
+          if (scenario === "interrupt" && activated) {
+            await until(async () => {
+              drained = await child.observeOriginalGroup();
+              return drained.state === "verified" && drained.activeProcesses === 0;
+            }, "The original Job did not drain after interruption.");
+          }
+        } finally {
+          child.closeObservation();
+        }
         assert.deepEqual(await child.observeOriginalGroup(), { state: "unavailable" });
         closes++;
       })();
@@ -190,10 +215,19 @@ function fixture(t: TestContext, scenario: Scenario) {
           connected = handle.snapshot();
           if (connected.outcome !== "starting" || beforeActivation.length !== 0) throw new Error("The adapter wrote before owned activation.");
           permit.resolve(true);
+          if (scenario === "interrupt") {
+            await until(() => handle.snapshot().outcome === "running", "The app-server did not start the fabricated turn.");
+            assert.equal(handle.interrupt(), true);
+            assert.equal(handle.interrupt(), false);
+          }
           settled = await bounded(handle.settled);
           live = await child.observeOriginalGroup();
           handle.closeInput();
           finished = await bounded(handle.closed);
+          if (scenario === "interrupt") {
+            afterInterruptedClose = await child.observeOriginalGroup();
+            throw new Error("The app-server turn has no successful terminal result.");
+          }
           drained = await child.observeOriginalGroup();
           if (finished.outcome !== "completed" || settled.outcome !== "completed" || settled.resultText !== answer || settled.threadId !== "fixture-thread"
             || settled.turnId !== "fixture-turn" || drained.state !== "verified" || drained.activeProcesses !== 0) {
@@ -207,12 +241,13 @@ function fixture(t: TestContext, scenario: Scenario) {
     } },
   });
   return { run, workspace, answerFile, env, snapshot, bytes, received, before, ledger, writes, beforeActivation, groupIdentity,
+    lateMarker, allowLateWrite: () => writeFileSync(allowWrite, "write", { flag: "wx" }),
     get launches() { return launches; }, get legacy() { return legacy; }, get verified() { return verified; }, get attach() { return attach; },
     get closes() { return closes; }, get prepared() { return prepared; }, get activated() { return activated; },
     get activationAttempt() { return activationAttempt; },
     get connected() { return connected; }, get settled() { return settled; }, get finished() { return finished; }, get exit() { return exit; }, get release() { return release; },
     get releaseBytes() { return releaseBytes; }, get releaseGroup() { return releaseGroup; },
-    get live() { return live; }, get drained() { return drained; } };
+    get live() { return live; }, get drained() { return drained; }, get afterInterruptedClose() { return afterInterruptedClose; } };
 }
 
 test("the same fabricated peer completes the app-server handshake on the existing process transport", onWindows, async t => {
@@ -316,6 +351,59 @@ for (const scenario of ["complete", "wrong workspace", "invalid initialize", "wr
     }
   });
 }
+
+test("an acknowledged app-server interruption leaves the exact workspace claim held through a late writer", onWindows, async t => {
+  const f = fixture(t, "interrupt");
+  const run = f.run();
+  await until(() => f.afterInterruptedClose !== undefined, "The interrupted app-server did not close with its original Job still observable.");
+
+  const expected = dialogue(f.workspace, "interrupt");
+  assert.deepEqual(f.received(), expected);
+  assert.deepEqual(f.writes.map(write => write.value), expected);
+  assert.ok(f.verified && f.activated);
+  assert.equal(f.launches, 1);
+  assert.equal(f.attach, 1);
+  assert.deepEqual(f.beforeActivation, []);
+  for (const write of f.writes) assert.deepEqual(write.snapshot, f.activated);
+  for (const observation of [f.settled, f.finished]) {
+    assert.ok(observation);
+    assert.equal(observation.outcome, "interrupted");
+    assert.equal(observation.interruptRequest, "acknowledged");
+    assert.equal(observation.threadId, "fixture-thread");
+    assert.equal(observation.turnId, "fixture-turn");
+    assert.equal(observation.writerState, "unknown");
+    assert.equal(observation.resultText, null);
+    assert.equal(terminalLineage(observation), null);
+  }
+  assert.deepEqual(f.live, { state: "verified", activeProcesses: 2 });
+  assert.deepEqual(f.exit, { code: 0, signal: null, error: null });
+  assert.deepEqual(f.afterInterruptedClose, { state: "verified", activeProcesses: 1 });
+  assert.equal(existsSync(f.lateMarker), false);
+  assert.equal(f.release, undefined);
+  assert.equal(f.activated.rows.length, 2);
+  assert.equal(f.activated.ledger.workspace?.writerPid, process.pid);
+  assert.ok(f.activated.ledger.workspace?.claimGeneration);
+  assert.deepEqual(f.activated.ledger.boundWorkspaceIntents, [f.activated.rows[0].id]);
+  assert.deepEqual(f.snapshot(), f.activated);
+  const held = f.bytes();
+
+  f.allowLateWrite();
+  assert.deepEqual(await bounded(run), { state: "held", ...noPublication });
+  assert.equal(readFileSync(f.lateMarker, "utf8"), "fabricated late write");
+  assert.deepEqual(f.drained, zero);
+  assert.ok(f.groupIdentity.length >= 3 && f.groupIdentity.every(Boolean));
+  assert.equal(f.release, undefined);
+  assert.deepEqual(f.bytes(), held);
+
+  assert.deepEqual(await f.run(), { state: "held", ...noPublication });
+  assert.deepEqual(f.bytes(), held);
+  assert.deepEqual(f.received(), expected);
+  assert.deepEqual(f.writes.map(write => write.value), expected);
+  assert.equal(f.launches, 1);
+  assert.equal(f.attach, 1);
+  assert.equal(f.closes, 1);
+  assert.equal(f.legacy, 0);
+});
 
 test("a refused native activation closes the suspended app-server without any handshake or turn", onWindows, async t => {
   const f = fixture(t, "refused activation");
