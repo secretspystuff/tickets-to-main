@@ -109,31 +109,59 @@ for (const outcome of ["completed", "failed"] as const) {
     } }, outcome);
     assert.equal(samples, 0, "binding cannot use a pre-launch sample for later release");
     const before = f.snapshot();
-    const commits: string[][] = [];
-    const originalRename = fs.renameSync;
-    fs.renameSync = (source, destination) => {
-      if (destination === f.ledger) {
-        commits.push(readdirSync(f.leaseRoot).filter(name => /^epoch-[0-9]+$/.test(name)
-          && existsSync(join(f.leaseRoot, name, "owner.json")) && !existsSync(join(f.leaseRoot, name, "released"))));
+    const epochs = () => readdirSync(f.leaseRoot).filter(name => /^epoch-[0-9]+$/.test(name)
+      && existsSync(join(f.leaseRoot, name, "owner.json")) && !existsSync(join(f.leaseRoot, name, "released")));
+    const trace: { action: "read journal" | "replace ledger"; epochs: string[]; samples: number }[] = [];
+    const journalDescriptors = new Set<number>();
+    const { openSync: originalOpen, readFileSync: originalRead, closeSync: originalClose, renameSync: originalRename } = fs;
+    let tracing = true;
+    fs.openSync = (path, flags, mode) => {
+      const fd = originalOpen(path, flags, mode);
+      if (path === f.journal) journalDescriptors.add(fd);
+      return fd;
+    };
+    fs.readFileSync = ((path: fs.PathOrFileDescriptor, options: unknown) => {
+      const bytes = Reflect.apply(originalRead, fs, [path, options]);
+      if (tracing && (path === f.journal || (typeof path === "number" && journalDescriptors.has(path)))) {
+        trace.push({ action: "read journal", epochs: epochs(), samples });
       }
+      return bytes;
+    }) as typeof fs.readFileSync;
+    fs.closeSync = fd => {
+      originalClose(fd);
+      journalDescriptors.delete(fd);
+    };
+    fs.renameSync = (source, destination) => {
+      if (destination === f.ledger) trace.push({ action: "replace ledger", epochs: epochs(), samples });
       originalRename(source, destination);
     };
     syncBuiltinESMExports();
     try {
       assert.deepEqual(await port.release(authority), released);
+      tracing = false;
       assert.equal(samples, 1);
       assert.deepEqual(parseLedger(readFileSync(f.ledger, "utf8"))?.workspace, { ...f.legacy, writerPid: null });
       assert.deepEqual(f.snapshot().journal, before.journal);
       assert.deepEqual(f.snapshot().work, before.work);
+      const commits = trace.filter(event => event.action === "replace ledger");
       assert.equal(commits.length, 1);
-      assert.equal(commits[0]!.length, 1);
-      const ownerEpoch = join(f.leaseRoot, commits[0]![0]!);
+      const commit = commits[0]!;
+      assert.equal(commit.epochs.length, 1);
+      assert.equal(commit.samples, 1);
+      const epoch = commit.epochs[0]!;
+      const matching = trace.slice(0, trace.indexOf(commit)).filter(event => event.action === "read journal" && event.samples === 1);
+      assert.ok(matching.some(event => event.epochs.length === 1 && event.epochs[0] === epoch),
+        "the decisive post-sample journal read and ledger replacement must share one lease");
+      const ownerEpoch = join(f.leaseRoot, epoch);
       assert.deepEqual(readFileSync(join(ownerEpoch, "released")), readFileSync(join(ownerEpoch, "owner.json")));
       const after = f.snapshot();
       assert.deepEqual(await port.release(authority), held);
       assert.deepEqual(f.snapshot(), after);
-      assert.equal(commits.length, 1);
+      assert.equal(trace.filter(event => event.action === "replace ledger").length, 1);
     } finally {
+      fs.openSync = originalOpen;
+      fs.readFileSync = originalRead;
+      fs.closeSync = originalClose;
       fs.renameSync = originalRename;
       syncBuiltinESMExports();
     }
@@ -188,16 +216,52 @@ test("a terminal result for a different workspace cannot release the bound claim
   assert.deepEqual(f.snapshot(), before);
 });
 
-test("a caller cannot substitute a zero observation or a copied claim binding", async t => {
+test("a previously completed intent in the same checkout cannot release a newer started intent", async t => {
+  const port = ownedRelease(), f = sandbox(t);
+  const first = bind(f, port, verifiedZero());
+  assert.deepEqual(await port.release(first), released);
+  workspace.claimWorkspace(f.state, f.legacy.writerPid, () => true);
+  const second = bind(f, port, verifiedZero(), "started", 2);
+  const before = f.snapshot();
+  assert.deepEqual(await port.release(second), held);
+  assert.deepEqual(f.snapshot(), before);
+});
+
+test("a caller cannot substitute a zero observation or copy a zero-capable claim binding", async t => {
+  const port = ownedRelease(), f = sandbox(t);
+  const authority = bind(f, port, verifiedZero());
+  const before = f.snapshot();
+  assert.deepEqual(await port.release({ ...authority }), held);
+  assert.deepEqual(f.snapshot(), before);
+  assert.deepEqual(await port.release(zero), held);
+  assert.deepEqual(f.snapshot(), before);
+  assert.deepEqual(await port.release(authority), released);
+  assert.deepEqual(f.snapshot().journal, before.journal);
+});
+
+test("changing the observer object after binding cannot replace the original observation", async t => {
   const port = ownedRelease(), f = sandbox(t);
   const original: OriginalObserver = { observeOriginalGroup: async () => ({ state: "unavailable" }) };
   const authority = bind(f, port, original);
   original.observeOriginalGroup = async () => zero;
   const before = f.snapshot();
-  assert.deepEqual(await port.release({ ...authority }), held);
-  assert.deepEqual(await port.release(zero), held);
   assert.deepEqual(await port.release(authority), held);
   assert.deepEqual(f.snapshot(), before);
+});
+
+test("an in-flight original observation cannot clear a same-PID legacy replacement", { timeout: 15_000 }, async t => {
+  const port = ownedRelease(), f = sandbox(t);
+  const probe = delayedObservation(t);
+  const authority = bind(f, port, probe.observe);
+  const pending = port.release(authority);
+  assert.equal(await Promise.race([probe.started, pending]), undefined, "the Job observation must be in flight");
+  workspace.releaseWorkspace(f.state);
+  workspace.claimWorkspace(f.state, f.legacy.writerPid, () => true);
+  const replacement = f.snapshot();
+  assert.deepEqual(parseLedger(replacement.ledger.toString("utf8"))?.workspace, f.legacy);
+  probe.answer(zero);
+  assert.deepEqual(await pending, held);
+  assert.deepEqual(f.snapshot(), replacement);
 });
 
 test("observation of an old Job cannot clear a newly bound claim at the same path and PID", { timeout: 15_000 }, async t => {
@@ -265,6 +329,28 @@ test("an unprepared or foreign intent cannot bind the currently held workspace",
   const foreign = f.snapshot();
   assert.equal(port.bind(f.state, intent, verifiedZero()), null);
   assert.deepEqual(f.snapshot(), foreign);
+});
+
+test("matching identity does not permit binding an altered prepared assignment", t => {
+  const port = ownedRelease(), f = sandbox(t);
+  const prepared = f.newIntent(1);
+  f.prepare(prepared);
+  const before = f.snapshot();
+  const mismatched = { ...prepared, bindingDigest: journalDigest("fabricated different binding") };
+  assert.equal(port.bind(f.state, mismatched, verifiedZero()), null);
+  assert.deepEqual(f.snapshot(), before);
+  assert.ok(port.bind(f.state, prepared, verifiedZero()));
+});
+
+test("an exact prepared assignment cannot bind an unheld workspace", t => {
+  const port = ownedRelease(), f = sandbox(t);
+  workspace.releaseWorkspace(f.state);
+  const prepared = f.newIntent(1);
+  f.prepare(prepared);
+  const before = f.snapshot();
+  assert.equal(parseLedger(before.ledger.toString("utf8"))?.workspace?.writerPid, null);
+  assert.equal(port.bind(f.state, prepared, verifiedZero()), null);
+  assert.deepEqual(f.snapshot(), before);
 });
 
 test("a prepared intent cannot be rebound to a different original observer", async t => {
