@@ -156,7 +156,8 @@ export function startCodexAppServerAssignment(
     if (value.type === "contextCompaction") {
       const { threadId, turnId, outcome } = state;
       if ((outcome !== "starting" && outcome !== "running") || threadId === null || turnId === null
-        || !Number.isSafeInteger(params[completed ? "completedAtMs" : "startedAtMs"]) || !safeEvidenceText(value.id)) return;
+        || !Number.isSafeInteger(params[completed ? "completedAtMs" : "startedAtMs"])
+        || ![threadId, turnId, value.id].every(safeEvidenceText)) return;
       if (!completed && compactionEvidence === null) {
         compactionEvidence = { threadId, turnId, itemId: value.id, state: "started" };
       } else if (completed && compactionEvidence?.state === "started" && compactionEvidence.itemId === value.id) {

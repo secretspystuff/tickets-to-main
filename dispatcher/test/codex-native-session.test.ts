@@ -13,11 +13,11 @@ const THREAD = "thread-1";
 const TURN = "turn-1";
 const COMPACTION = { threadId: THREAD, turnId: TURN, itemId: "compaction-1" };
 function emit(events: NativeEvents, value: unknown): void { events.stdout(`${JSON.stringify(value)}\n`); }
-function terminal(events: NativeEvents, status = "completed", turnId = TURN): void {
-  emit(events, { method: "turn/completed", params: { threadId: THREAD, turn: { id: turnId, status, items: [] } } });
+function terminal(events: NativeEvents, status = "completed", turnId = TURN, threadId = THREAD): void {
+  emit(events, { method: "turn/completed", params: { threadId, turn: { id: turnId, status, items: [] } } });
 }
-function message(events: NativeEvents, text = "Result.", turnId = TURN): void {
-  emit(events, { method: "item/completed", params: { threadId: THREAD, turnId, item: { id: "msg-1", type: "agentMessage", text } } });
+function message(events: NativeEvents, text = "Result.", turnId = TURN, threadId = THREAD): void {
+  emit(events, { method: "item/completed", params: { threadId, turnId, item: { id: "msg-1", type: "agentMessage", text } } });
 }
 function permission(events: NativeEvents, method = "item/commandExecution/requestApproval"): void {
   const context = { threadId: THREAD, turnId: TURN, itemId: "cmd-1", startedAtMs: 1 };
@@ -34,7 +34,7 @@ function compaction(events: NativeEvents, phase: "started" | "completed", itemId
 }
 function server(
   turn: (events: NativeEvents) => void,
-  options: { observedModel?: string; reasoningEffort?: unknown; workspace?: string; threadId?: string;
+  options: { observedModel?: string; reasoningEffort?: unknown; workspace?: string; threadId?: string; turnId?: string;
     startedBeforeReply?: boolean; beforeTurnReply?: (events: NativeEvents) => void;
     interrupt?: (events: NativeEvents, id: number) => void } = {},
 ) {
@@ -47,9 +47,10 @@ function server(
       approvalPolicy: "on-request", approvalsReviewer: "user", sandbox: { type: "workspaceWrite" },
     } });
     if (msg.method === "turn/start") {
-      if (options.startedBeforeReply) emit(events, { method: "turn/started", params: { threadId: THREAD, turn: { id: TURN, items: [], status: "inProgress" } } });
+      const turnResult = { id: options.turnId ?? TURN, items: [], status: "inProgress" };
+      if (options.startedBeforeReply) emit(events, { method: "turn/started", params: { threadId: options.threadId ?? THREAD, turn: turnResult } });
       options.beforeTurnReply?.(events);
-      emit(events, { id: msg.id, result: { turn: { id: TURN, items: [], status: "inProgress" } } });
+      emit(events, { id: msg.id, result: { turn: turnResult } });
       turn(events);
     }
     if (msg.method === "turn/interrupt") {
@@ -174,6 +175,20 @@ test("app-server compaction evidence requires a correlated turn and safe item ID
     assert.equal(result.appServerCompactionEvidence, null);
     assert.equal(JSON.stringify(result).includes(REQUEST.prompt), false);
   });
+  for (const field of ["threadId", "turnId"] as const) {
+    await t.test(`assignment text echoed as ${field}`, async () => {
+      const context = { threadId: THREAD, turnId: TURN, [field]: REQUEST.prompt };
+      const result = await finish(server(events => {
+        compaction(events, "started", COMPACTION.itemId, context);
+        compaction(events, "completed", COMPACTION.itemId, context);
+        message(events, "Result.", context.turnId, context.threadId);
+        terminal(events, "completed", context.turnId, context.threadId);
+      }, context));
+      assert.equal(result.outcome, "completed");
+      assert.equal(result.resultText, "Result.");
+      assert.equal(result.appServerCompactionEvidence, null);
+    });
+  }
 });
 
 test("app-server compaction evidence stops advancing on terminal or held assignments", async t => {
