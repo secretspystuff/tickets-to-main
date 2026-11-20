@@ -27,14 +27,14 @@ function permission(events: NativeEvents, method = "item/commandExecution/reques
 }
 function server(
   turn: (events: NativeEvents) => void,
-  options: { observedModel?: string; reasoningEffort?: unknown; workspace?: string;
+  options: { observedModel?: string; reasoningEffort?: unknown; workspace?: string; threadId?: string;
     startedBeforeReply?: boolean; interrupt?: (events: NativeEvents, id: number) => void } = {},
 ) {
   return scriptedTransport((input, events) => {
     const msg = JSON.parse(input) as { id?: number; method: string };
     if (msg.method === "initialize") emit(events, { id: msg.id, result: { userAgent: "codex/0.163.0", platformFamily: "windows", platformOs: "windows", codexHome: "C:\\own-codex" } });
     if (msg.method === "thread/start") emit(events, { id: msg.id, result: {
-      thread: { id: THREAD }, model: options.observedModel ?? "native-model", modelProvider: "openai",
+      thread: { id: options.threadId ?? THREAD }, model: options.observedModel ?? "native-model", modelProvider: "openai",
       reasoningEffort: options.reasoningEffort, cwd: options.workspace ?? REQUEST.workspace,
       approvalPolicy: "on-request", approvalsReviewer: "user", sandbox: { type: "workspaceWrite" },
     } });
@@ -144,6 +144,7 @@ test("app-server model evidence keeps only an exact turn's well-formed reroute",
 
 test("app-server model evidence preserves native effort and exact startup refusals", async t => {
   const heldEffort = "fabricated-held-effort";
+  const longEffort = "a".repeat(200) + "b";
   for (const [name, reasoningEffort, expectedEffort] of [
     ["omitted", undefined, null],
     ["null", null, null],
@@ -151,6 +152,7 @@ test("app-server model evidence preserves native effort and exact startup refusa
     ["empty", "", null],
     ["held value", heldEffort, null],
     ["provider-defined", "fixture-effort", "fixture-effort"],
+    ["provider-defined effort of 201 characters", longEffort, longEffort],
   ] as const) {
     await t.test(name, async () => {
       const transport = server((events) => { message(events); terminal(events); }, { reasoningEffort });
@@ -190,6 +192,57 @@ test("app-server model evidence preserves native effort and exact startup refusa
       beforeTurn: { model: "native-model", reasoningEffort: "high" }, reroute: null,
     });
   });
+  await t.test("overlong thread identity", async () => {
+    const transport = server(() => assert.fail("an invalid thread identity must receive no assignment"), {
+      threadId: "r".repeat(201), reasoningEffort: longEffort,
+    });
+    const result = await finish(transport);
+    assert.equal(result.outcome, "protocol-error");
+    assert.equal(result.threadId, null);
+    assert.equal(result.writerState, "unknown");
+    assert.deepEqual(transport.calls[0]!.input.map((line) => JSON.parse(line).method), ["initialize", "initialized", "thread/start"]);
+    assert.deepEqual(Reflect.get(result, "appServerModelEvidence"), { beforeTurn: null, reroute: null });
+  });
+});
+
+test("app-server late reroutes leave terminal model evidence intact", async t => {
+  const earlyReroute = { fromModel: "early-source", toModel: "early-target", reason: "highRiskCyberActivity" };
+  const lateReroute = { fromModel: "late-source", toModel: "late-target", reason: "highRiskCyberActivity" };
+  for (const prior of ["completed", "held"] as const) {
+    await t.test(prior, async () => {
+      let native!: NativeEvents;
+      const transport = server((events) => {
+        native = events;
+        if (prior === "held") {
+          emit(events, { method: "model/rerouted", params: { threadId: THREAD, turnId: TURN, ...earlyReroute } });
+        } else {
+          message(events);
+        }
+        terminal(events);
+      }, { reasoningEffort: "high" });
+      const handle = startCodexAppServerAssignment(REQUEST, transport, {}, [], LAUNCH);
+      const settled = await handle.settled;
+      assert.equal(settled.outcome, prior);
+      emit(native, { method: "model/rerouted", params: { threadId: THREAD, turnId: TURN, ...lateReroute } });
+      const after = handle.snapshot();
+      handle.closeInput();
+      const closed = await handle.closed;
+      assert.deepEqual(transport.calls[0]!.input.map((line) => JSON.parse(line).method),
+        ["initialize", "initialized", "thread/start", "turn/start"]);
+      for (const observation of [settled, after, closed]) {
+        assert.equal(observation.threadId, THREAD);
+        assert.equal(observation.turnId, TURN);
+        assert.equal(observation.writerState, "unknown");
+      }
+      for (const observation of [after, closed]) {
+        assert.equal(observation.outcome, "held");
+        assert.equal(observation.observedModel, "late-target");
+      }
+      const evidence = { beforeTurn: { model: "native-model", reasoningEffort: "high" }, reroute: prior === "held" ? earlyReroute : null };
+      assert.deepEqual([settled.appServerModelEvidence, after.appServerModelEvidence, closed.appServerModelEvidence],
+        [evidence, evidence, evidence]);
+    });
+  }
 });
 
 for (const method of ["item/commandExecution/requestApproval", "item/fileChange/requestApproval", "item/permissions/requestApproval"]) {
