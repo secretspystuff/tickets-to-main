@@ -121,15 +121,21 @@ export async function runCodexCliAssignment(
   return new Promise((resolve) => {
     let child: NativeProcess | undefined;
     let inputStarted = false;
+    let inputEnded = false;
     let connectionClosed = false;
     function sendInput(): void {
       if (!child || !state.spawned || inputStarted || connectionClosed || state.outcome !== "starting") return;
       inputStarted = true;
-      if (!child.write(prompt)) {
+      const accepted = child.write(prompt);
+      if (!accepted) {
         state.outcome = "disconnected";
         state.reason = "Native input is unavailable. Writer completion is unknown.";
       }
-      if (!connectionClosed) child.endInput();
+      if (!connectionClosed) {
+        // EOF can synchronously close the stream after the prompt was accepted.
+        inputEnded = accepted;
+        child.endInput();
+      }
     }
     child = transport.start(state.argv, { cwd: request.workspace, env: toolEnv(parentEnv, secrets) }, {
       spawned() { state.spawned = true; sendInput(); },
@@ -143,7 +149,7 @@ export async function runCodexCliAssignment(
         if (connectionClosed) return;
         connectionClosed = true;
         parser.finish();
-        if (inputStarted && state.outcome === "completed" && exit.code === 0 && exit.signal === null && exit.error === null) {
+        if (inputEnded && state.outcome === "completed" && exit.code === 0 && exit.signal === null && exit.error === null) {
           state.observed.assignment = "supported";
           state.observed.streamResult = "supported";
         } else if (state.outcome !== "protocol-error" && state.outcome !== "failed") {
