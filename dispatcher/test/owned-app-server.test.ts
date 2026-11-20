@@ -15,8 +15,8 @@ import { processNativeTransport, windowsOwnedNativeTransport, windowsProcessLaun
 import { claimWorkspace, prepareWorkspace } from "../src/workspace.ts";
 import { removeDir } from "./helpers.ts";
 
-type PeerMode = "complete" | "wrong workspace" | "invalid initialize" | "wrong turn";
-type Scenario = PeerMode | "refused preparation" | "refused activation";
+type PeerMode = "complete" | "wrong workspace" | "invalid initialize" | "wrong turn" | "wrong thread";
+type Scenario = PeerMode | "refused preparation" | "refused activation" | "observer closed before release";
 const executable = realpathSync(process.execPath);
 const peer = fileURLToPath(new URL("./owned-app-server-peer.fixture.mjs", import.meta.url));
 const onWindows = { skip: process.platform !== "win32", timeout: 24_000 };
@@ -31,10 +31,15 @@ function dialogue(workspace: string, scenario: PeerMode): unknown[] {
   if (scenario !== "invalid initialize") {
     expected.push({ method: "initialized" }, { id: 2, method: "thread/start", params: { cwd: workspace, model: "fixture-model" } });
   }
-  if (scenario === "complete" || scenario === "wrong turn") {
+  if (scenario === "complete" || scenario === "wrong turn" || scenario === "wrong thread") {
     expected.push({ id: 3, method: "turn/start", params: { threadId: "fixture-thread", input: [{ type: "text", text: prompt }], effort: "low" } });
   }
   return expected;
+}
+
+function terminalLineage(observation: NativeObservation | undefined): unknown {
+  assert.ok(observation);
+  return Reflect.get(observation, "appServerTerminalLineage") ?? null;
 }
 
 function deferred<T>() {
@@ -92,6 +97,7 @@ function fixture(t: TestContext, scenario: Scenario) {
   let settled: NativeObservation | undefined, connected: NativeObservation | undefined, finished: NativeObservation | undefined;
   let prepared: ReturnType<typeof snapshot> | undefined, activated: ReturnType<typeof snapshot> | undefined;
   let release: ReturnType<typeof snapshot> | undefined, drained: OriginalGroup | undefined, live: OriginalGroup | undefined;
+  let releaseBytes: ReturnType<typeof bytes> | undefined, releaseGroup: OriginalGroup | undefined;
   let exit: NativeExit | undefined;
   let activationAttempt: ReturnType<typeof bytes> | undefined;
   const run = () => runAssignment({
@@ -107,6 +113,7 @@ function fixture(t: TestContext, scenario: Scenario) {
       if (scenario === "refused preparation") return null;
       assert.equal(input.workspace, workspace);
       const launcher = windowsProcessLauncher();
+      const peerMode = scenario === "refused activation" || scenario === "observer closed before release" ? "complete" : scenario;
       const suspended = deferred<void>(), permit = deferred<boolean>(), closed = deferred<NativeExit>();
       let listener: NativeEvents | undefined;
       const child = windowsOwnedNativeTransport({
@@ -130,7 +137,7 @@ function fixture(t: TestContext, scenario: Scenario) {
             return observed;
           } };
         },
-      }).start([executable, peer, scenario === "refused activation" ? "complete" : scenario, workspace], { cwd: workspace, env }, {
+      }).start([executable, peer, peerMode, workspace], { cwd: workspace, env }, {
         spawned() { activated = snapshot(); listener?.spawned(); },
         stdout(chunk) { listener?.stdout(chunk); }, stderr(chunk) { listener?.stderr(chunk); },
         inputError() { listener?.inputError(); },
@@ -170,7 +177,12 @@ function fixture(t: TestContext, scenario: Scenario) {
         }, endInput: () => child.endInput() };
       } };
       return {
-        original: { observeOriginalGroup() { release = snapshot(); return child.observeOriginalGroup(); } },
+        original: { async observeOriginalGroup() {
+          release = snapshot();
+          releaseBytes = bytes();
+          releaseGroup = await child.observeOriginalGroup();
+          return releaseGroup;
+        } },
         async execute(assignment) {
           const handle = startCodexAppServerAssignment({ assignmentId: assignment.id, prompt: assignment.input,
             workspace: assignment.workspace, model: "fixture-model", effort: "low" }, bridge, env, [],
@@ -187,6 +199,7 @@ function fixture(t: TestContext, scenario: Scenario) {
             || settled.turnId !== "fixture-turn" || drained.state !== "verified" || drained.activeProcesses !== 0) {
             throw new Error("The original Job or app-server did not provide exact terminal evidence.");
           }
+          if (scenario === "observer closed before release") child.closeObservation();
           return { id: assignment.id, sequence: assignment.sequence, result: "completed", writersContained: true };
         },
         close,
@@ -198,6 +211,7 @@ function fixture(t: TestContext, scenario: Scenario) {
     get closes() { return closes; }, get prepared() { return prepared; }, get activated() { return activated; },
     get activationAttempt() { return activationAttempt; },
     get connected() { return connected; }, get settled() { return settled; }, get finished() { return finished; }, get exit() { return exit; }, get release() { return release; },
+    get releaseBytes() { return releaseBytes; }, get releaseGroup() { return releaseGroup; },
     get live() { return live; }, get drained() { return drained; } };
 }
 
@@ -219,7 +233,7 @@ test("the same fabricated peer completes the app-server handshake on the existin
   assert.equal((await handle.closed).outcome, "completed");
 });
 
-for (const scenario of ["complete", "wrong workspace", "invalid initialize", "wrong turn"] as const) {
+for (const scenario of ["complete", "wrong workspace", "invalid initialize", "wrong turn", "wrong thread", "observer closed before release"] as const) {
   test(`owned app-server ${scenario} uses the first post-activation handshake`, onWindows, async t => {
     const f = fixture(t, scenario);
     const result = await f.run();
@@ -229,6 +243,7 @@ for (const scenario of ["complete", "wrong workspace", "invalid initialize", "wr
     assert.equal(f.closes, 1);
     assert.deepEqual(f.beforeActivation, [], "initialize must never be attempted while the verified Job is suspended");
     assert.equal(f.connected?.outcome, "starting");
+    assert.equal(terminalLineage(f.connected), null);
     assert.ok(f.prepared && f.activated);
     const [intent] = f.prepared.rows;
     assert.deepEqual(f.prepared.ledger.workspace, { path: f.workspace, writerPid: process.pid, qualified: false });
@@ -238,7 +253,7 @@ for (const scenario of ["complete", "wrong workspace", "invalid initialize", "wr
     assert.ok(workspace?.claimGeneration);
     assert.deepEqual(workspace, { ...f.prepared.ledger.workspace, claimGeneration: workspace.claimGeneration });
     assert.deepEqual(f.activated.ledger.boundWorkspaceIntents, [intent.id]);
-    const expected = dialogue(f.workspace, scenario);
+    const expected = dialogue(f.workspace, scenario === "observer closed before release" ? "complete" : scenario);
     assert.deepEqual(f.received(), expected);
     assert.deepEqual(f.writes.map(write => write.value), expected);
     for (const write of f.writes) assert.deepEqual(write.snapshot, f.activated);
@@ -248,10 +263,12 @@ for (const scenario of ["complete", "wrong workspace", "invalid initialize", "wr
     assert.equal(f.finished?.outcome, f.settled?.outcome);
     assert.equal(f.legacy, 0);
     assert.equal(readFileSync(f.answerFile, "utf8"), answer);
-    if (scenario === "complete") {
+    if (scenario === "complete" || scenario === "observer closed before release") {
       assert.deepEqual(result, { state: "completed", ...noPublication });
       assert.equal(f.settled?.outcome, "completed");
       assert.equal(f.settled?.resultText, answer);
+      assert.equal(f.settled?.vendor, "codex");
+      assert.equal(f.settled?.interfaceId, "app-server");
       assert.equal(f.settled?.threadId, "fixture-thread");
       assert.equal(f.settled?.turnId, "fixture-turn");
       assert.equal(f.settled?.writerState, "unknown");
@@ -259,15 +276,43 @@ for (const scenario of ["complete", "wrong workspace", "invalid initialize", "wr
       assert.deepEqual(f.release, { rows: [intent, started, terminal], ledger: f.activated.ledger });
       const after = f.snapshot();
       assert.deepEqual(after.rows, f.release?.rows);
-      assert.deepEqual(after.ledger.workspace, { path: f.workspace, writerPid: null, qualified: false });
-      assert.equal(after.ledger.boundWorkspaceIntents, undefined);
-      assert.deepEqual(f.groupIdentity, [true, true, true]);
+      if (scenario === "complete") {
+        assert.deepEqual(f.releaseGroup, zero);
+        assert.deepEqual(after.ledger.workspace, { path: f.workspace, writerPid: null, qualified: false });
+        assert.equal(after.ledger.boundWorkspaceIntents, undefined);
+        assert.deepEqual(f.groupIdentity, [true, true, true]);
+        const lineage = { vendor: "codex", interfaceId: "app-server", threadId: "fixture-thread", turnId: "fixture-turn" };
+        assert.deepEqual([terminalLineage(f.settled), terminalLineage(f.finished)], [lineage, lineage],
+          "only the correlated successful native terminal can report exact app-server lineage");
+      } else {
+        assert.deepEqual(f.releaseGroup, { state: "unavailable" });
+        assert.deepEqual(f.groupIdentity, [true, true]);
+        assert.deepEqual(after.ledger, f.activated.ledger);
+        const atRelease = f.releaseBytes;
+        assert.ok(atRelease);
+        assert.deepEqual(f.bytes(), atRelease);
+
+        assert.deepEqual(await f.run(), { state: "completed", ...noPublication });
+        assert.deepEqual(f.bytes(), atRelease);
+        assert.deepEqual(f.received(), expected);
+        assert.deepEqual(f.writes.map(write => write.value), expected);
+        assert.equal(f.launches, 1);
+        assert.equal(f.attach, 1);
+        assert.equal(f.closes, 1);
+        assert.equal(f.legacy, 0);
+      }
     } else {
       assert.deepEqual(result, { state: "held", ...noPublication });
       assert.equal(f.settled?.outcome, scenario === "wrong workspace" ? "refused" : "protocol-error");
       assert.equal(f.release, undefined);
       assert.deepEqual(f.snapshot(), f.activated);
       assert.deepEqual(f.groupIdentity, [true, true]);
+      if (scenario === "wrong thread" || scenario === "wrong turn") {
+        assert.equal(f.settled?.interfaceId, "app-server");
+        assert.equal(f.settled?.threadId, "fixture-thread");
+        assert.equal(f.settled?.turnId, "fixture-turn");
+      }
+      assert.deepEqual([terminalLineage(f.settled), terminalLineage(f.finished)], [null, null]);
     }
   });
 }
