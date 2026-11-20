@@ -149,6 +149,55 @@ test("a transport closed before spawn receives neither assignment nor EOF even i
   assert.deepEqual(handle.snapshot(), result);
 });
 
+for (const writeAccepted of [true, false]) {
+  test(`clean close inside an ${writeAccepted ? "accepted" : "unaccepted"} write cannot establish completion`, async () => {
+    let writes = 0;
+    const handle = startClaudeCliAssignment(REQUEST, { start(_argv, _options, events) {
+      events.spawned();
+      return {
+        write(line) {
+          writes++;
+          const input: Input = JSON.parse(line);
+          emit(events, init(input));
+          emit(events, terminal(input));
+          events.closed({ code: 0, signal: null, error: null });
+          return writeAccepted;
+        },
+        endInput() { assert.fail("A closed transport must not receive EOF."); },
+      };
+    } }, {}, [], LAUNCH);
+    const result = await handle.closed;
+    assert.equal(writes, 1);
+    assert.equal(result.outcome, "disconnected");
+    assert.equal(result.observed.assignment, undefined);
+    assert.deepEqual(await handle.settled, result);
+    assert.deepEqual(handle.snapshot(), result);
+  });
+}
+
+test("clean close inside EOF can complete an accepted and correlated assignment", async () => {
+  const calls: string[] = [];
+  const result = await finish({ start(_argv, _options, events) {
+    events.spawned();
+    return {
+      write(line) {
+        calls.push("write");
+        const input: Input = JSON.parse(line);
+        emit(events, init(input));
+        emit(events, terminal(input));
+        return true;
+      },
+      endInput() {
+        calls.push("eof");
+        events.closed({ code: 0, signal: null, error: null });
+      },
+    };
+  } });
+  assert.deepEqual(calls, ["write", "eof"]);
+  assert.equal(result.outcome, "completed");
+  assert.equal(result.observed.assignment, "supported");
+});
+
 test("native model and exact supported CLI effort remain requested versus observed, with no Dispatcher fallback", async () => {
   for (const effort of ["low", "medium", "high", "xhigh", "max"]) {
     const request = { ...REQUEST, model: "requested-model", effort };

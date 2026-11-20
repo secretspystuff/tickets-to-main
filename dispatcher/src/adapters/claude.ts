@@ -262,11 +262,16 @@ export function startClaudeCliAssignment(
   })}\n`;
   let child: NativeProcess | undefined;
   let inputAttempted = false;
+  let inputFinished = false;
   function sendInput(): void {
     if (!child || !state.spawned || inputAttempted || connectionClosed) return;
     inputAttempted = true;
-    if (!child.write(line)) outcome("disconnected", "Claude Code input is unavailable. Writer completion is unknown.");
-    if (!connectionClosed) child.endInput();
+    const written = child.write(line);
+    if (connectionClosed) return;
+    if (!written) outcome("disconnected", "Claude Code input is unavailable. Writer completion is unknown.");
+    // EOF can report closure inline, so record the accepted write before calling it.
+    inputFinished = written;
+    child.endInput();
   }
   child = transport.start(state.argv, { cwd: request.workspace, env: toolEnv(parentEnv, secrets) }, {
     spawned() {
@@ -281,7 +286,7 @@ export function startClaudeCliAssignment(
       if (connectionClosed) return;
       parser.finish();
       connectionClosed = true;
-      if (successfulTerminal && state.spawned && state.outcome === "running" && exit.code === 0 && exit.signal === null && exit.error === null) {
+      if (successfulTerminal && inputFinished && state.outcome === "running" && exit.code === 0 && exit.signal === null && exit.error === null) {
         state.observed.assignment = "supported";
         state.observed.streamResult = "supported";
         state.observed.freshContext = "supported";
