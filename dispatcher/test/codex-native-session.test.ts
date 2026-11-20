@@ -27,13 +27,15 @@ function permission(events: NativeEvents, method = "item/commandExecution/reques
 }
 function server(
   turn: (events: NativeEvents) => void,
-  options: { observedModel?: string; startedBeforeReply?: boolean; interrupt?: (events: NativeEvents, id: number) => void } = {},
+  options: { observedModel?: string; reasoningEffort?: unknown; workspace?: string;
+    startedBeforeReply?: boolean; interrupt?: (events: NativeEvents, id: number) => void } = {},
 ) {
   return scriptedTransport((input, events) => {
     const msg = JSON.parse(input) as { id?: number; method: string };
     if (msg.method === "initialize") emit(events, { id: msg.id, result: { userAgent: "codex/0.163.0", platformFamily: "windows", platformOs: "windows", codexHome: "C:\\own-codex" } });
     if (msg.method === "thread/start") emit(events, { id: msg.id, result: {
-      thread: { id: THREAD }, model: options.observedModel ?? "native-model", modelProvider: "openai", cwd: REQUEST.workspace,
+      thread: { id: THREAD }, model: options.observedModel ?? "native-model", modelProvider: "openai",
+      reasoningEffort: options.reasoningEffort, cwd: options.workspace ?? REQUEST.workspace,
       approvalPolicy: "on-request", approvalsReviewer: "user", sandbox: { type: "workspaceWrite" },
     } });
     if (msg.method === "turn/start") {
@@ -47,8 +49,8 @@ function server(
     }
   });
 }
-async function finish(transport: NativeTransport, request = REQUEST): Promise<NativeObservation> {
-  const handle = startCodexAppServerAssignment(request, transport, {}, [], LAUNCH);
+async function finish(transport: NativeTransport, request = REQUEST, secrets: readonly string[] = []): Promise<NativeObservation> {
+  const handle = startCodexAppServerAssignment(request, transport, {}, secrets, LAUNCH);
   await handle.settled;
   handle.closeInput();
   return handle.closed;
@@ -83,6 +85,102 @@ test("model and effort preserve exact native values without permission or auth o
   const mismatch = server(() => assert.fail("mismatched model must not get an assignment"));
   assert.equal((await finish(mismatch, { ...REQUEST, model: "requested-model" })).outcome, "refused");
   assert.equal(mismatch.calls[0]!.input.some((value) => value.includes('"turn/start"')), false);
+});
+
+test("app-server model evidence separates pre-turn thread configuration from the request", async () => {
+  const request = { ...REQUEST, model: "requested-model", effort: "low" };
+  const transport = server((events) => { message(events); terminal(events); }, { observedModel: request.model, reasoningEffort: "high" });
+  const handle = startCodexAppServerAssignment(request, transport, {}, [], LAUNCH);
+  const settled = await handle.settled;
+  handle.closeInput();
+  const closed = await handle.closed;
+  assert.deepEqual(transport.calls[0]!.input.map((line) => JSON.parse(line).method),
+    ["initialize", "initialized", "thread/start", "turn/start"]);
+  for (const result of [settled, closed]) {
+    assert.equal(result.outcome, "completed");
+    assert.equal(result.requestedModel, request.model);
+    assert.equal(result.requestedEffort, request.effort);
+    assert.equal(result.writerState, "unknown");
+    assert.equal(result.approvalAnswered, false);
+    assert.equal(result.observed.modelSelection, undefined);
+  }
+  const beforeTurn = { model: request.model, reasoningEffort: "high" };
+  assert.deepEqual([Reflect.get(settled, "appServerModelEvidence"), Reflect.get(closed, "appServerModelEvidence")],
+    [{ beforeTurn, reroute: null }, { beforeTurn, reroute: null }]);
+});
+
+test("app-server model evidence keeps only an exact turn's well-formed reroute", async t => {
+  const reroute = { fromModel: "native-model", toModel: "changed-model", reason: "highRiskCyberActivity" };
+  const heldValue = "fabricated-held-model";
+  for (const [name, change, outcome, evidence] of [
+    ["matching", {}, "held", reroute],
+    ["foreign thread", { threadId: "helper-thread" }, "completed", null],
+    ["foreign turn", { turnId: "stale-turn" }, "completed", null],
+    ["malformed source", { fromModel: 12 }, "held", null],
+    ["malformed destination", { toModel: null }, "held", null],
+    ["held destination value", { toModel: heldValue }, "held", null],
+    ["unrecognized reason", { reason: "fabricated-unknown" }, "held", null],
+  ] as const) {
+    await t.test(name, async () => {
+      const transport = server((events) => {
+        emit(events, { method: "model/rerouted", params: { threadId: THREAD, turnId: TURN, ...reroute, ...change } });
+        if (outcome === "completed") { message(events); terminal(events); }
+      }, { reasoningEffort: "high" });
+      const result = await finish(transport, REQUEST, [heldValue]);
+      assert.equal(result.outcome, outcome);
+      assert.equal(result.writerState, "unknown");
+      assert.equal(result.approvalAnswered, false);
+      assert.equal(result.observed.modelSelection, undefined);
+      assert.equal(result.resultText, outcome === "completed" ? "Result." : null);
+      assert.equal(result.requestedModel, null);
+      assert.equal(result.requestedEffort, null);
+      assert.equal(JSON.stringify(result).includes(heldValue), false);
+      assert.deepEqual(Reflect.get(result, "appServerModelEvidence"), {
+        beforeTurn: { model: "native-model", reasoningEffort: "high" }, reroute: evidence,
+      });
+    });
+  }
+});
+
+test("app-server model evidence preserves unknown effort and exact startup refusals", async t => {
+  for (const [name, reasoningEffort] of [["omitted", undefined], ["null", null], ["malformed", 7], ["unrecognized", "fixture-effort"]] as const) {
+    await t.test(name, async () => {
+      const transport = server((events) => { message(events); terminal(events); }, { reasoningEffort });
+      const result = await finish(transport, { ...REQUEST, effort: "low" });
+      assert.equal(result.outcome, "completed");
+      assert.equal(result.requestedEffort, "low");
+      assert.equal(result.writerState, "unknown");
+      assert.deepEqual(Reflect.get(result, "appServerModelEvidence"), {
+        beforeTurn: { model: "native-model", reasoningEffort: null }, reroute: null,
+      });
+    });
+  }
+  await t.test("wrong workspace", async () => {
+    const transport = server(() => assert.fail("a foreign workspace must receive no assignment"), {
+      workspace: "C:\\different-workspace", reasoningEffort: "high",
+    });
+    const result = await finish(transport, { ...REQUEST, model: "native-model", effort: "low" });
+    assert.equal(result.outcome, "refused");
+    assert.equal(result.threadId, null);
+    assert.equal(result.writerState, "unknown");
+    assert.equal(result.requestedModel, "native-model");
+    assert.equal(result.requestedEffort, "low");
+    assert.deepEqual(transport.calls[0]!.input.map((line) => JSON.parse(line).method), ["initialize", "initialized", "thread/start"]);
+    assert.deepEqual(Reflect.get(result, "appServerModelEvidence"), { beforeTurn: null, reroute: null });
+  });
+  await t.test("different configured model", async () => {
+    const transport = server(() => assert.fail("a model mismatch must receive no assignment"), { reasoningEffort: "high" });
+    const result = await finish(transport, { ...REQUEST, model: "requested-model", effort: "low" });
+    assert.equal(result.outcome, "refused");
+    assert.equal(result.turnId, null);
+    assert.equal(result.requestedModel, "requested-model");
+    assert.equal(result.requestedEffort, "low");
+    assert.equal(result.writerState, "unknown");
+    assert.deepEqual(transport.calls[0]!.input.map((line) => JSON.parse(line).method), ["initialize", "initialized", "thread/start"]);
+    assert.deepEqual(Reflect.get(result, "appServerModelEvidence"), {
+      beforeTurn: { model: "native-model", reasoningEffort: "high" }, reroute: null,
+    });
+  });
 });
 
 for (const method of ["item/commandExecution/requestApproval", "item/fileChange/requestApproval", "item/permissions/requestApproval"]) {
