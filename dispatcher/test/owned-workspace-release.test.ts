@@ -475,10 +475,7 @@ test("terminal evidence for a newer assignment cannot make an older Job witness 
   assert.deepEqual(f.snapshot(), before);
 });
 
-test("a durable claim clear is reported accurately when the release marker cannot be opened", async t => {
-  const port = ownedRelease(), f = sandbox(t);
-  const authority = bind(f, port, verifiedZero());
-  const before = f.snapshot();
+function refuseReleaseMarkerAfterCommit(f: Sandbox) {
   const { renameSync: originalRename, openSync: originalOpen } = fs;
   let replaced = false, refusedReleaseMarker = 0;
   fs.renameSync = (source, destination) => {
@@ -493,18 +490,78 @@ test("a durable claim clear is reported accurately when the release marker canno
     return originalOpen(path, flags, mode);
   };
   syncBuiltinESMExports();
+  return {
+    get failures() { return refusedReleaseMarker; },
+    restore() {
+      fs.renameSync = originalRename;
+      fs.openSync = originalOpen;
+      syncBuiltinESMExports();
+    },
+  };
+}
+
+test("a durable claim clear is reported accurately when the release marker cannot be opened", async t => {
+  const port = ownedRelease(), f = sandbox(t);
+  const authority = bind(f, port, verifiedZero());
+  const before = f.snapshot();
+  const fault = refuseReleaseMarkerAfterCommit(f);
   try {
     assert.deepEqual(await port.release(authority), released);
-  } finally {
-    fs.renameSync = originalRename;
-    fs.openSync = originalOpen;
-    syncBuiltinESMExports();
-  }
-  assert.equal(refusedReleaseMarker, 1);
+  } finally { fault.restore(); }
+  assert.equal(fault.failures, 1);
   assert.deepEqual(parseLedger(readFileSync(f.ledger, "utf8"))?.workspace, { ...f.legacy, writerPid: null });
   assert.deepEqual(f.snapshot().journal, before.journal);
   assert.deepEqual(f.snapshot().work, before.work);
   assert.throws(() => workspace.claimWorkspace(f.state, f.legacy.writerPid, () => true));
+});
+
+test("a committed binding retains its original authority when the release marker cannot be opened", async t => {
+  const port = ownedRelease(), f = sandbox(t);
+  const prepared = f.newIntent(1);
+  f.prepare(prepared);
+  const before = f.snapshot();
+  const fault = refuseReleaseMarkerAfterCommit(f);
+  let samples = 0;
+  let authority: object | null;
+  try {
+    authority = port.bind(f.state, prepared, { observeOriginalGroup: async () => { samples++; return zero; } });
+    assert.ok(authority);
+  } finally { fault.restore(); }
+  assert.equal(fault.failures, 1);
+  const bound = f.snapshot();
+  assert.notDeepEqual(bound.ledger, before.ledger);
+  assert.deepEqual(bound.journal, before.journal);
+  assert.deepEqual(bound.work, before.work);
+  assert.throws(() => startAssignment(f.state, prepared, 1001));
+  assert.deepEqual(await port.release(authority), held);
+  assert.equal(samples, 1);
+  assert.deepEqual(f.snapshot(), bound);
+});
+
+test("a distinct checkout can bind while the previous prepared assignment remains fenced", async t => {
+  const port = ownedRelease(), f = sandbox(t);
+  const first = f.newIntent(1);
+  bind(f, port, verifiedZero(), "prepared");
+  const otherPath = join(f.root, "other-checkout");
+  workspace.releaseWorkspace(f.state);
+  workspace.prepareWorkspace(f.state, otherPath, () => true);
+  workspace.claimWorkspace(f.state, f.legacy.writerPid, () => true);
+  const other = assignmentDirectory(otherPath);
+  writeFileSync(join(other.path, "other-work.txt"), work, { flag: "wx" });
+  const second = f.newIntent(2, other);
+  f.prepare(second, other);
+  const authority = port.bind(f.state, second, verifiedZero());
+  assert.ok(authority, "a different checkout may use its own prepared intent and Job");
+  startAssignment(f.state, second, 1001);
+  completeAssignment(f.state, second, "completed", 1002);
+  assert.deepEqual(await port.release(authority), released);
+
+  workspace.prepareWorkspace(f.state, f.checkout.path, () => true);
+  workspace.claimWorkspace(f.state, f.legacy.writerPid, () => true);
+  const before = f.snapshot();
+  assert.equal(port.bind(f.state, first, verifiedZero()), null);
+  assert.deepEqual(f.snapshot(), before);
+  assert.equal(readFileSync(join(other.path, "other-work.txt"), "utf8"), work);
 });
 
 for (const action of ["bind", "release"] as const) {
