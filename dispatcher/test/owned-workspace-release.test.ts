@@ -564,6 +564,7 @@ test("a distinct checkout can bind while the previous prepared assignment remain
   assert.ok(authority, "a different checkout may use its own prepared intent and Job");
   startAssignment(f.state, second, 1001);
   completeAssignment(f.state, second, "completed", 1002);
+  assert.deepEqual({ samplesA, samplesB }, { samplesA: 0, samplesB: 0 });
   assert.deepEqual(await port.release(authority), released);
   assert.deepEqual({ samplesA, samplesB }, { samplesA: 0, samplesB: 1 });
 
