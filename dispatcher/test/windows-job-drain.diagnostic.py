@@ -155,7 +155,7 @@ def verify_member(process, pid, job, stage):
 def workspace_probe(node, fixture, action):
     try:
         result = subprocess.run(
-            [str(node), "--disable-warning=ExperimentalWarning",
+            [str(node), "--experimental-strip-types", "--disable-warning=ExperimentalWarning",
              str(SCRIPT.with_name("windows-job-claim.fixture.ts")), action, str(fixture), str(os.getpid())],
             cwd=fixture, env={"SystemRoot": os.environ["SystemRoot"],
                               "TEMP": str(fixture / "tmp"), "TMP": str(fixture / "tmp")},
