@@ -1,8 +1,24 @@
+import { randomUUID } from "node:crypto";
 import { lstatSync, realpathSync, rmdirSync } from "node:fs";
 import { isAbsolute, resolve, sep } from "node:path";
+import { hasOwnedTerminalUnderLease, journalDigest, preparedOwnedBindingsUnderLease, type Intent } from "./assignment-journal.ts";
+import { assignmentDirectory, directoryBirthTime, type DirectoryIdentity } from "./directory-identity.ts";
 import { StateError, assertPrivateAccess, ensurePrivateDirectory } from "./fs-safety.ts";
 import { loadLedger, updateLedger, type Ledger } from "./ledger.ts";
-import { observeRecordedPid } from "./process-identity.ts";
+import type { WindowsOwnedNativeProcess } from "./native-transport.ts";
+import { currentProcessOwner, observeRecordedPid } from "./process-identity.ts";
+
+type OriginalObserver = Pick<WindowsOwnedNativeProcess, "observeOriginalGroup">;
+type OwnedClaim = {
+  state: DirectoryIdentity;
+  stateBirth: bigint;
+  checkout: DirectoryIdentity;
+  checkoutBirth: bigint;
+  generation: string;
+  intent: Intent;
+  observe: OriginalObserver["observeOriginalGroup"];
+};
+const ownedClaims = new WeakMap<object, OwnedClaim>();
 
 function nested(parent: string, child: string): boolean {
   const root = parent.endsWith(sep) ? parent : parent + sep;
@@ -108,4 +124,68 @@ export function releaseWorkspace(stateDir: string): string[] {
     ledger.workspace = { path: ledger.workspace.path, writerPid: null, qualified: false };
   });
   return ["Writer released."];
+}
+
+export function bindOwnedWorkspaceClaim(stateDir: string, prepared: Intent, original: OriginalObserver): object | null {
+  let committed: OwnedClaim | undefined;
+  try {
+    const intent = structuredClone(prepared);
+    const owner = currentProcessOwner();
+    if (intent.version !== 4 || intent.pid !== owner.pid || !owner.birth || intent.birth !== owner.birth) return null;
+    const state = assignmentDirectory(stateDir);
+    const stateBirth = directoryBirthTime(state);
+    const generation = randomUUID();
+    const observe = original.observeOriginalGroup.bind(original);
+    let claim: OwnedClaim | undefined;
+    updateLedger(state.path, [], ledger => {
+      if (!ledger.install) throw new StateError("The recorded workspace is unavailable.");
+      const current = ledger.workspace;
+      if (!current || current.writerPid !== intent.pid || current.claimGeneration !== undefined
+        || directoryBirthTime(state) !== stateBirth) return;
+      assertCurrentWorkspace(state.path, current.path);
+      const checkout = assignmentDirectory(current.path);
+      if (checkout.path !== current.path || journalDigest(checkout.path) !== intent.workspaceDigest
+        || journalDigest(checkout.identity) !== intent.aliasDigest) return;
+      const bindings = preparedOwnedBindingsUnderLease(state.path, intent, ledger.boundWorkspaceIntents ?? []);
+      if (!bindings) return;
+      const checkoutBirth = directoryBirthTime(checkout);
+      ledger.workspace = { ...current, claimGeneration: generation };
+      ledger.boundWorkspaceIntents = bindings;
+      claim = { state, stateBirth, checkout, checkoutBirth, generation, intent, observe };
+    }, () => { committed = claim; });
+  } catch { /* A failed lease release does not discard a persisted original binding. */ }
+  if (!committed) return null;
+  const authority = Object.freeze({});
+  ownedClaims.set(authority, committed);
+  return authority;
+}
+
+export async function releaseOwnedWorkspaceClaim(authority: object): Promise<{ state: "released" | "held" }> {
+  const claim = ownedClaims.get(authority);
+  if (!claim) return { state: "held" };
+  let committed = false;
+  try {
+    const sample = await claim.observe();
+    if (sample?.state !== "verified" || !Object.is(sample.activeProcesses, 0)) return { state: "held" };
+    updateLedger(claim.state.path, [], ledger => {
+      if (!ledger.install) throw new StateError("The recorded workspace is unavailable.");
+      const current = ledger.workspace;
+      const bindings = ledger.boundWorkspaceIntents;
+      if (!current || current.path !== claim.checkout.path || current.writerPid !== claim.intent.pid
+        || !bindings?.includes(claim.intent.id)
+        || current.claimGeneration !== claim.generation || directoryBirthTime(claim.state) !== claim.stateBirth) return;
+      assertCurrentWorkspace(claim.state.path, current.path);
+      const checkout = assignmentDirectory(current.path);
+      if (checkout.path !== claim.checkout.path || checkout.identity !== claim.checkout.identity
+        || directoryBirthTime(checkout) !== claim.checkoutBirth
+        || !hasOwnedTerminalUnderLease(claim.state.path, claim.intent)) return;
+      ledger.workspace = { path: current.path, writerPid: null, qualified: false };
+      const retained = bindings.filter(id => id !== claim.intent.id);
+      if (retained.length > 0) ledger.boundWorkspaceIntents = retained;
+      else delete ledger.boundWorkspaceIntents;
+    }, () => { committed = true; });
+  } catch { /* A failed lease release does not undo a persisted claim clear. */ }
+  if (!committed) return { state: "held" };
+  ownedClaims.delete(authority);
+  return { state: "released" };
 }

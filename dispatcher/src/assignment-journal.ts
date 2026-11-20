@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { withPrivateJournal } from "./private-journal.ts";
+import { readExistingPrivateJournalUnderLease, withPrivateJournal } from "./private-journal.ts";
 import { currentProcessOwner, validProcessBirth, type ProcessOwner } from "./process-identity.ts";
 
 export type Intent = {
@@ -75,6 +75,39 @@ function matching(left: Intent, right: Intent): boolean {
 function overlap(a: Intent, b: Intent): boolean {
   if (a.version === 4 && b.version === 4) return a.workspaceDigest === b.workspaceDigest || a.aliasDigest === b.aliasDigest;
   return a.version === b.version && a.workspaceDigest === b.workspaceDigest;
+}
+
+function ownedAssignmentUnderLease(stateDir: string, intent: Intent): { entries: Map<string, Entry>; entry: Entry } | null {
+  const entries = readExistingPrivateJournalUnderLease(stateDir, "assignment-intents.jsonl", records);
+  const entry = entries.get(intent.id);
+  if (!entry || entry.intent.version !== 4 || intent.version !== 4 || !matching(entry.intent, intent)
+    || entry.intent.pid !== intent.pid || entry.intent.birth !== intent.birth || entry.intent.at !== intent.at) return null;
+  return { entries, entry };
+}
+
+export function preparedOwnedBindingsUnderLease(stateDir: string, intent: Intent, previous: readonly string[]): string[] | null {
+  const history = ownedAssignmentUnderLease(stateDir, intent);
+  if (!history || history.entry.started || history.entry.result || previous.includes(intent.id)) return null;
+  const retained: string[] = [];
+  for (const id of previous) {
+    const bound = history.entries.get(id);
+    if (!bound) return null;
+    if (!bound.started && !bound.result) retained.push(id);
+  }
+  return [...retained, intent.id];
+}
+
+export function hasOwnedTerminalUnderLease(stateDir: string, intent: Intent): boolean {
+  const history = ownedAssignmentUnderLease(stateDir, intent);
+  if (!history) return false;
+  const { entry, entries } = history;
+  if (!entry.started || (entry.result?.outcome !== "completed" && entry.result?.outcome !== "failed")) return false;
+  let later = false;
+  for (const other of entries.values()) {
+    if (other === entry) later = true;
+    else if ((!other.result || (later && other.started)) && (other.intent.version !== 4 || overlap(other.intent, intent))) return false;
+  }
+  return true;
 }
 
 export function reserveAssignment(stateDir: string, intent: Intent, legacyWorkspaceDigest: string, ownerAlive: (owner: ProcessOwner) => boolean): { state: "new" | "pending" | Result["outcome"]; intent: Intent } {
