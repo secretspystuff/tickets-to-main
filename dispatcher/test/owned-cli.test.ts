@@ -199,6 +199,8 @@ test("the same fabricated CLI runs on the existing plain process transport", onW
   assert.equal(result.outcome, "completed");
   assert.equal(result.resultText, answer);
   assert.equal(result.threadId, "fixture-cli-thread");
+  assert.equal(result.helpers, "terminal-observed");
+  assert.equal(result.observed.helperCompletion, undefined);
   assert.equal(result.writerState, "unknown");
   assert.equal(readFileSync(f.inputFile, "utf8"), prompt);
   assert.equal(existsSync(f.eofFile), true);
@@ -243,6 +245,8 @@ for (const scenario of ["complete", "wrong result", "unsafe metadata", "refused 
     assert.equal(readFileSync(f.inputFile, "utf8"), prompt);
     assert.equal(existsSync(f.eofFile), true);
     assert.equal(readFileSync(f.answerFile, "utf8"), answer);
+    assert.equal(f.observed?.helpers, scenario === "unsafe metadata" ? "unknown" : "terminal-observed");
+    assert.equal(f.observed?.observed.helperCompletion, undefined);
     assert.equal(f.observed?.writerState, "unknown");
     assert.deepEqual(f.exit, { code: 0, signal: null, error: null });
     assert.deepEqual(f.live, { state: "verified", activeProcesses: 1 });
