@@ -9,7 +9,7 @@ import { runAssignment, type AssignmentAdapter, type AssignmentInput, type Assig
 import type { Intent } from "../src/assignment-journal.ts";
 import { ensurePrivateDirectory } from "../src/fs-safety.ts";
 import { install } from "../src/install.ts";
-import { parseLedger } from "../src/ledger.ts";
+import { parseLedger, updateLedger } from "../src/ledger.ts";
 import {
   windowsOwnedNativeTransport, windowsProcessLauncher, type NativeExit, type WindowsOwnedNativeProcess,
 } from "../src/native-transport.ts";
@@ -24,11 +24,13 @@ type PreparedExecution = {
 type OwnedInput = AssignmentInput & {
   owned: { prepare(input: { intent: Intent; workspace: string }): Promise<PreparedExecution> };
 };
-type Scenario = "complete" | "wrong writer" | "revoked" | "claim replaced" | "start flush" | "interrupted" | "result flush" | "witness lost";
+type Scenario = "complete" | "wrong writer" | "revoked" | "claim replaced" | "successor claim" | "prepare rejected"
+  | "start flush" | "interrupted" | "wrong terminal" | "revoked after execution" | "result flush" | "witness lost";
 type JournalRow = { kind: string; id: string; sequence: number; requestDigest: string; outcome?: string };
 const onWindows = { skip: process.platform !== "win32", timeout: 24_000 };
 const unqualified = { qualification: "unqualified-harness", publishable: false } as const;
 const nativeExit = { code: 0, signal: null, error: null };
+const successor = "11111111-1111-4111-8111-111111111111";
 const id = (value: number) => value.toString(16).padStart(32, "0");
 
 function deferred<T>() {
@@ -158,22 +160,35 @@ async function stage(f: Space, beforeResume: () => void) {
   };
 }
 
-function ownedCase(t: TestContext, mode: Scenario) {
+function ownedCase(t: TestContext, mode: Scenario, gateClose = false) {
   const f = space(t, mode === "wrong writer");
   const { flushes, faults, started } = observeFlushes(t, f, mode);
   const events: Trace[] = [];
   const record = (event: string) => events.push({ event, kinds: f.rows().map(r => r.kind),
     writer: f.claim()?.writerPid, generation: f.claim()?.claimGeneration, flushes: [...flushes] });
-  let fallback = 0, reconciliations = 0, replaced = false;
+  const closing = deferred<void>(), permitClose = deferred<void>();
+  t.after(() => permitClose.resolve());
+  let fallback = 0, reconciliations = 0, replaced = false, disposed = 0;
+  let replacement: Buffer | undefined;
   let staged: Awaited<ReturnType<typeof stage>> | undefined;
   const input: OwnedInput = {
     ...f.base, adapter: {
       kind: "fabricated-harness",
       async readCurrent() {
         const bound = f.claim()?.claimGeneration !== undefined;
-        const revoked = mode === "revoked" && bound;
+        const revoked = (mode === "revoked" && bound)
+          || (mode === "revoked after execution" && events.some(event => event.event === "root closed"));
         if (mode === "claim replaced" && bound && !replaced) {
           claimWorkspace(f.base.stateDir, f.owner, () => true);
+          replaced = true;
+        }
+        if (mode === "successor claim" && bound && !replaced) {
+          updateLedger(f.base.stateDir, [], ledger => {
+            assert.ok(ledger.workspace?.claimGeneration);
+            assert.notEqual(ledger.workspace.claimGeneration, successor);
+            ledger.workspace.claimGeneration = successor;
+          });
+          replacement = readFileSync(f.ledger);
           replaced = true;
         }
         return { binding: f.request.binding, nextSequence: 1, authorized: !revoked, seat: "member",
@@ -188,6 +203,7 @@ function ownedCase(t: TestContext, mode: Scenario) {
       assert.deepEqual(f.rows(), [prepared.intent], "the exact prepared intent must come from the runner");
       assert.ok(flushes.includes("intent"));
       assert.equal(f.claim()?.claimGeneration, undefined);
+      if (mode === "prepare rejected") throw new Error("fabricated preparation refusal");
       const child = staged = await stage(f, () => {
         record("resume");
         assert.deepEqual(f.rows().map(row => row.kind), ["intent", "started"]);
@@ -206,17 +222,22 @@ function ownedCase(t: TestContext, mode: Scenario) {
           assert.deepEqual(readFileSync(f.marker), Buffer.from(f.request.input));
           if (mode === "interrupted") throw new Error("fabricated interruption after local start");
           if (mode === "witness lost") child.owned.closeObservation();
-          return f.receipt(value);
+          const result = f.receipt(value);
+          return mode === "wrong terminal" ? { ...result, id: id(20) } : result;
         },
         async close() {
           record("close");
+          closing.resolve();
+          if (gateClose) await permitClose.promise;
           await child.dispose();
           assert.deepEqual(await child.owned.observeOriginalGroup(), { state: "unavailable" });
+          disposed++;
         },
       };
     } },
   };
-  return { ...f, events, faults, started, run: () => runAssignment(input),
+  return { ...f, events, faults, started, closing: closing.promise, permitClose: () => permitClose.resolve(),
+    run: () => runAssignment(input), get disposed() { return disposed; }, get replacement() { return replacement; },
     get fallback() { return fallback; }, get reconciliations() { return reconciliations; },
     get replaced() { return replaced; },
     get activations() { return staged?.activations ?? 0; },
@@ -264,6 +285,7 @@ test("owned runner binds before durable start and clears only after durable term
   assert.equal(sample.writer, f.owner);
   assert.equal(close.writer, null);
   assert.equal(close.generation, undefined);
+  assert.equal(f.disposed, 1);
   assert.equal(f.activations, 1);
   assert.equal(f.fallback, 0);
   const journal = f.journalText(), events = f.events.length;
@@ -273,36 +295,79 @@ test("owned runner binds before durable start and clears only after durable term
   assert.equal(f.reconciliations, 0);
 });
 
-for (const mode of ["wrong writer", "revoked", "claim replaced", "start flush"] as const) {
+for (const mode of ["wrong writer", "revoked", "claim replaced", "successor claim", "start flush"] as const) {
   test(`owned runner closes a staged Job without activation when ${mode} prevents start`, onWindows, async t => {
-    const f = ownedCase(t, mode);
-    const result = await f.run();
+    const f = ownedCase(t, mode, mode === "wrong writer");
+    const run = f.run();
+    let returned = false;
+    void run.then(() => { returned = true; }, () => { returned = true; });
+    if (mode === "wrong writer") {
+      try {
+        assert.equal(await bounded(Promise.race([f.closing.then(() => "closing"), run.then(() => "returned")])), "closing");
+        await new Promise<void>(resolve => { setImmediate(resolve); });
+        assert.equal(returned, false, "runner must await native disposal before returning");
+        assert.equal(f.disposed, 0);
+      } finally { f.permitClose(); }
+    }
+    const result = await run;
     assert.ok(result.state === "held" || result.state === "not-started");
     assert.deepEqual(f.events.map(event => event.event), ["prepared", "suspended", "close"]);
     assert.equal(f.events.at(-1)?.writer, f.owner);
-    assert.equal(f.events.at(-1)?.generation !== undefined, mode === "revoked" || mode === "start flush");
-    assert.equal(f.replaced, mode === "claim replaced");
+    assert.equal(f.events.at(-1)?.generation !== undefined, mode === "revoked" || mode === "start flush" || mode === "successor claim");
+    assert.equal(f.replaced, mode === "claim replaced" || mode === "successor claim");
+    if (mode === "successor claim") {
+      assert.equal(f.claim()?.claimGeneration, successor);
+      assert.deepEqual(readFileSync(f.ledger), f.replacement);
+    }
     assert.equal(f.started.length, Number(mode === "start flush"));
+    if (mode !== "start flush") assert.equal(f.rows().some(row => row.kind === "started"), false);
     assert.deepEqual(f.faults, mode === "start flush" ? ["started"] : []);
     assert.equal(f.activations, 0);
+    assert.equal(f.disposed, 1);
     assert.equal(f.fallback, 0);
     assert.equal(existsSync(f.marker), false);
     assert.equal(f.rows().some(row => row.outcome === "completed"), false);
   });
 }
 
-for (const mode of ["interrupted", "result flush", "witness lost"] as const) {
+test("owned prepare rejection cannot fall back to legacy execution", onWindows, async t => {
+  const f = ownedCase(t, "prepare rejected");
+  const before = readFileSync(f.ledger);
+  assert.ok(["held", "not-started"].includes((await f.run()).state));
+  assert.deepEqual(f.events.map(event => event.event), ["prepared"]);
+  assert.equal(f.started.length, 0);
+  assert.equal(f.rows().some(row => row.kind === "started"), false);
+  assert.equal(f.fallback, 0);
+  assert.equal(f.activations, 0);
+  assert.equal(existsSync(f.marker), false);
+  assert.deepEqual(readFileSync(f.ledger), before);
+});
+
+for (const mode of ["interrupted", "wrong terminal", "revoked after execution", "result flush", "witness lost"] as const) {
   test(`owned runner retains the claim when ${mode} prevents a safe durable release`, onWindows, async t => {
     const f = ownedCase(t, mode);
     assert.deepEqual(await f.run(), { state: mode === "witness lost" ? "completed" : "held", ...unqualified });
     const entries = ["prepared", "suspended", "execute", "resume", "root closed"];
     assert.deepEqual(f.events.map(event => event.event), [...entries, ...(mode === "witness lost" ? ["sample"] : []), "close"]);
     assert.equal(f.activations, 1);
+    assert.equal(f.disposed, 1);
     assert.equal(f.fallback, 0);
     assert.equal(f.claim()?.writerPid, f.owner);
     assert.equal(f.claim()?.claimGeneration, f.events[2]?.generation);
     assert.deepEqual(f.faults, mode === "result flush" ? ["result"] : []);
-    if (mode === "witness lost") assert.ok(f.events[5]?.flushes.includes("result"));
-    else assert.equal(f.events.at(-1)?.flushes.includes("result"), false);
+    if (mode === "witness lost") {
+      assert.ok(f.events[5]?.flushes.includes("result"));
+      const snapshot = { ledger: readFileSync(f.ledger), journal: f.journalText() };
+      const counts = () => ({ prepared: f.events.filter(event => event.event === "prepared").length,
+        samples: f.events.filter(event => event.event === "sample").length, fallback: f.fallback,
+        reconciliations: f.reconciliations, activations: f.activations, disposals: f.disposed });
+      const before = counts();
+      assert.deepEqual(await f.run(), { state: "completed", ...unqualified });
+      assert.deepEqual({ ledger: readFileSync(f.ledger), journal: f.journalText() }, snapshot);
+      assert.deepEqual(counts(), before);
+    } else {
+      assert.equal(f.events.at(-1)?.flushes.includes("result"), false);
+      if (mode !== "result flush") assert.deepEqual(f.rows().map(row => row.kind), ["intent", "started"]);
+    }
   });
 }
