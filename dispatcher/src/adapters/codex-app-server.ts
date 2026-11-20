@@ -7,10 +7,16 @@ import { copyObservation, hasHeldSecret, nativeObservation, opaqueId, record, sa
 export const CODEX_APP_SERVER_SCHEMA_VERSION = "0.163.0";
 
 export type CodexAppServerLaunch = { executable: string; version: string };
+export type CodexAppServerObservation = NativeObservation & {
+  appServerModelEvidence: {
+    beforeTurn: { model: string | null; reasoningEffort: string | null } | null;
+    reroute: { fromModel: string; toModel: string; reason: "highRiskCyberActivity" } | null;
+  };
+};
 export type CodexAssignmentHandle = {
-  snapshot(): NativeObservation;
-  settled: Promise<NativeObservation>;
-  closed: Promise<NativeObservation>;
+  snapshot(): CodexAppServerObservation;
+  settled: Promise<CodexAppServerObservation>;
+  closed: Promise<CodexAppServerObservation>;
   interrupt(): boolean;
   closeInput(): void;
 };
@@ -33,10 +39,11 @@ export function startCodexAppServerAssignment(
   launch: CodexAppServerLaunch,
 ): CodexAssignmentHandle {
   const state = nativeObservation("app-server");
-  let settle!: (value: NativeObservation) => void;
-  let close!: (value: NativeObservation) => void;
-  const settled = new Promise<NativeObservation>((resolve) => { settle = resolve; });
-  const closed = new Promise<NativeObservation>((resolve) => { close = resolve; });
+  const modelEvidence: CodexAppServerObservation["appServerModelEvidence"] = { beforeTurn: null, reroute: null };
+  let settle!: (value: CodexAppServerObservation) => void;
+  let close!: (value: CodexAppServerObservation) => void;
+  const settled = new Promise<CodexAppServerObservation>((resolve) => { settle = resolve; });
+  const closed = new Promise<CodexAppServerObservation>((resolve) => { close = resolve; });
   let process: NativeProcess | null = null;
   let settledOnce = false;
   let connectionClosed = false;
@@ -47,10 +54,20 @@ export function startCodexAppServerAssignment(
   const pending = new Set<number>();
   const helpers = new Map<string, string>();
 
+  function snapshot(): CodexAppServerObservation {
+    const { beforeTurn, reroute } = modelEvidence;
+    return {
+      ...copyObservation(state),
+      appServerModelEvidence: {
+        beforeTurn: beforeTurn && { ...beforeTurn },
+        reroute: reroute && { ...reroute },
+      },
+    };
+  }
   function boundary(): void {
     if (!settledOnce && state.outcome !== "starting" && state.outcome !== "running") {
       settledOnce = true;
-      settle(copyObservation(state));
+      settle(snapshot());
     }
   }
   function outcome(value: NativeOutcome, reason: string | null): void {
@@ -81,6 +98,10 @@ export function startCodexAppServerAssignment(
   function safeId(value: unknown): value is string {
     return opaqueId(value) && !hasHeldSecret(value, secrets) && safeNativeText(value, secrets) === value;
   }
+  function safeModelValue(value: unknown): value is string {
+    return opaqueId(value) && !/[\u007f-\u009f]/.test(value)
+      && !hasHeldSecret(value, secrets) && safeNativeText(value, secrets, request.prompt) === value;
+  }
   function threadResult(result: Record<string, unknown>): void {
     const thread = record(result.thread);
     if (!thread || !safeId(thread.id) || typeof result.model !== "string" || typeof result.cwd !== "string"
@@ -92,6 +113,10 @@ export function startCodexAppServerAssignment(
     }
     state.threadId = thread.id;
     state.observedModel = safeNativeText(result.model, secrets);
+    modelEvidence.beforeTurn = {
+      model: safeModelValue(result.model) ? result.model : null,
+      reasoningEffort: safeModelValue(result.reasoningEffort) ? result.reasoningEffort : null,
+    };
     if (request.model !== null && result.model !== request.model) {
       outcome("refused", "The native tool reported a different model. No assignment was sent.");
       return;
@@ -163,6 +188,10 @@ export function startCodexAppServerAssignment(
       } else if (state.outcome !== "held") { invalid(); }
     } else if (method === "model/rerouted" && params && sameContext(params)) {
       if (typeof params.toModel === "string") state.observedModel = safeNativeText(params.toModel, secrets);
+      const { fromModel, toModel, reason } = params;
+      if (safeModelValue(fromModel) && safeModelValue(toModel) && reason === "highRiskCyberActivity" && safeModelValue(reason)) {
+        modelEvidence.reroute = { fromModel, toModel, reason };
+      }
       outcome("held", "The native tool reported a model change. Writer completion is unknown.");
     } else if (method === "error" && params && sameContext(params) && params.willRetry !== true) {
       outcome("held", "The native tool reported an error without a terminal result. Writer completion is unknown.");
@@ -209,7 +238,7 @@ export function startCodexAppServerAssignment(
 
   const parser = new JsonLines(message, invalid);
   const handle: CodexAssignmentHandle = {
-    snapshot: () => copyObservation(state), settled, closed,
+    snapshot, settled, closed,
     interrupt() {
       if (connectionClosed || interruptSent || !["starting", "running", "held"].includes(state.outcome) || state.threadId === null || state.turnId === null) return false;
       interruptSent = true;
@@ -224,13 +253,13 @@ export function startCodexAppServerAssignment(
   if (launch.version !== CODEX_APP_SERVER_SCHEMA_VERSION || !absoluteWindowsPath(launch.executable)
     || launch.executable.includes("\0") || request.workspace.includes("\0") || !absoluteWindowsPath(request.workspace)) {
     outcome("refused", "This app-server adapter requires the inspected Windows executable version and an absolute Windows workspace.");
-    close(copyObservation(state));
+    close(snapshot());
     return handle;
   }
   if ([request.prompt, request.workspace, request.assignmentId, request.model ?? "", request.effort ?? "", launch.executable]
     .some((part) => hasHeldSecret(part, secrets) || safeNativeText(part, secrets) !== part)) {
     outcome("refused", "The assignment includes a credential. It was not sent.");
-    close(copyObservation(state));
+    close(snapshot());
     return handle;
   }
   state.argv = [launch.executable, "app-server"];
@@ -249,7 +278,7 @@ export function startCodexAppServerAssignment(
       else if (state.outcome === "completed" && (exit.error !== null || exit.code !== 0 || exit.signal !== null)) {
         outcome("disconnected", "The native connection closed abnormally. Writer completion is unknown.");
       }
-      close(copyObservation(state));
+      close(snapshot());
     },
   });
   initialize();
