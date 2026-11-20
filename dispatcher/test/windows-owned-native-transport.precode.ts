@@ -1,5 +1,7 @@
 import assert from "node:assert/strict";
+import childProcess from "node:child_process";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync } from "node:fs";
+import { syncBuiltinESMExports } from "node:module";
 import { tmpdir } from "node:os";
 import { basename, dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -21,7 +23,7 @@ type Launch = {
   observe(): Promise<GroupSample>;
   disposeBeforeInput(): void;
 };
-type Launcher = { start(...parameters: Parameters<NativeTransport["start"]>): Launch | null };
+type Launcher = { start(...parameters: Parameters<NativeTransport["start"]>): Launch | null | Promise<Launch | null> };
 type OwnedNativeProcess = NativeProcess & { observeOriginalGroup(): Promise<Custody> };
 interface OwnedNativeTransport extends NativeTransport {
   start(...parameters: Parameters<NativeTransport["start"]>): OwnedNativeProcess;
@@ -30,7 +32,29 @@ interface OwnedNativeTransport extends NativeTransport {
 const early = "fabricated early input\n";
 const allowed = "fabricated accepted input\n";
 const unavailable = { state: "unavailable" } as const;
+const cleanExit = { code: 0, signal: null, error: null } as const;
+const heldExit = { code: null, signal: null, error: "spawn" } as const;
 const platform = { skip: process.platform !== "win32", timeout: 20_000 };
+const nextTurn = () => new Promise<void>(resolve => { setImmediate(resolve); });
+type Failure = "throw" | "reject";
+type Stage = "verify" | "activate" | "observe";
+
+function fail(how: Failure): Promise<never> {
+  const error = new Error("fabricated internal failure");
+  if (how === "throw") throw error;
+  return Promise.reject(error);
+}
+
+function recordUnhandled(t: TestContext) {
+  const rejections: unknown[] = [];
+  const record = (error: unknown) => { rejections.push(error); };
+  process.on("unhandledRejection", record);
+  t.after(async () => {
+    await nextTurn();
+    process.off("unhandledRejection", record);
+    assert.deepEqual(rejections, [], "operation failure cannot leak an unhandled rejection");
+  });
+}
 
 function ownedFactory(): (launcher: Launcher) => OwnedNativeTransport {
   const exported: unknown = Reflect.get(transport, "windowsOwnedNativeTransport");
@@ -56,6 +80,7 @@ function fixture(t: TestContext) {
   const options = { cwd, env: { SystemRoot: process.env.SystemRoot, TEMP: parent, TMP: parent } };
   const ready = deferred<void>();
   const pipesClosed = deferred<NativeExit>();
+  const readerExits: NativeExit[] = [];
   let output = "";
   let owned: NativeProcess | undefined;
   t.after(async () => {
@@ -78,26 +103,55 @@ function fixture(t: TestContext) {
         if (output.includes("reader-ready\n")) ready.resolve();
         events.stdout(chunk);
       },
-      closed(exit) { pipesClosed.resolve(exit); events.closed(exit); },
+      closed(exit) { readerExits.push(exit); pipesClosed.resolve(exit); events.closed(exit); },
     });
     return owned;
   }
 
-  return { argv, options, marker, ready, startReader, pipesClosed,
+  return { argv, options, marker, ready, startReader, pipesClosed, readerExits,
     checkClaim: () => assert.deepEqual(readFileSync(ledger), claimed),
   };
 }
 
-function setup(t: TestContext, factory: ReturnType<typeof ownedFactory>, activationSucceeds = true) {
+function closing(t: TestContext, f: ReturnType<typeof fixture>) {
+  const first = deferred<void>();
+  const reports: { exit: NativeExit; readerCloses: number }[] = [];
+  let expected: { exit: NativeExit; readerCloses: number } | undefined;
+  t.after(async () => {
+    await nextTurn();
+    if (expected) assert.deepEqual(reports, [expected]);
+  });
+  return {
+    reports,
+    closed(exit: NativeExit) { reports.push({ exit, readerCloses: f.readerExits.length }); first.resolve(); },
+    async expectOnce(exit: NativeExit, readerLaunched: boolean) {
+      expected = { exit, readerCloses: Number(readerLaunched) };
+      await first.promise;
+      if (readerLaunched) await f.pipesClosed.promise;
+      await nextTurn();
+      assert.deepEqual(f.readerExits, readerLaunched ? [cleanExit] : []);
+      assert.deepEqual(reports, [expected]);
+    },
+  };
+}
+
+function setup(t: TestContext, factory: ReturnType<typeof ownedFactory>, options: {
+  activationSucceeds?: boolean; failure?: { stage: Stage; how: Failure };
+} = {}) {
   const f = fixture(t);
+  recordUnhandled(t);
+  const end = closing(t, f);
   const verified = deferred<Membership>();
   const activating = deferred<void>();
   const active = deferred<boolean>();
   const released = deferred<void>();
-  const closed = deferred<NativeExit>();
   const job = {}, child = {};
-  const trace = { ready: 0, activations: 0, disposed: 0, writes: [] as string[], launches: 0 };
+  const trace = { ready: 0, activations: 0, disposed: 0, pipeEnds: 0, writes: [] as string[], launches: 0, stages: [] as Stage[] };
   let sample: GroupSample = { job, activeProcesses: 1, complete: true };
+  function atStage<T>(stage: Stage, control: () => Promise<T>): Promise<T> {
+    trace.stages.push(stage);
+    return options.failure?.stage === stage ? fail(options.failure.how) : control();
+  }
   const owned = factory({
     start(argv, options, events) {
       trace.launches++;
@@ -108,21 +162,25 @@ function setup(t: TestContext, factory: ReturnType<typeof ownedFactory>, activat
         originalJob: job, exactChild: child,
         pipe: {
           write(text) { trace.writes.push(text); return reader.write(text); },
-          endInput() { reader.endInput(); },
+          endInput() { trace.pipeEnds++; reader.endInput(); },
         },
-        verify: () => verified.promise,
-        activate() { trace.activations++; activating.resolve(); return active.promise; },
-        observe: async () => sample,
+        verify: () => atStage("verify", () => verified.promise),
+        activate() {
+          trace.activations++;
+          activating.resolve();
+          return atStage("activate", () => active.promise);
+        },
+        observe: () => atStage("observe", async () => sample),
         disposeBeforeInput() { trace.disposed++; reader.endInput(); },
       };
     },
   }).start(f.argv, f.options, {
     spawned() { trace.ready++; released.resolve(); },
     stdout() {}, stderr() {}, inputError() { assert.fail("unexpected fixture input error"); },
-    closed: closed.resolve,
+    closed: end.closed,
   });
-  if (!activationSucceeds) active.resolve(false);
-  return { ...f, owned, activating, active, verified, released, closed, job, child, trace,
+  if (options.activationSucceeds === false) active.resolve(false);
+  return { ...f, owned, activating, active, verified, released, end, job, child, trace,
     observe(sampled: GroupSample) { sample = sampled; },
   };
 }
@@ -134,7 +192,7 @@ test("the pinned benign reader records exact stdin only in its fabricated worksp
   assert.equal(existsSync(f.marker), false);
   assert.equal(child.write(allowed), true);
   child.endInput();
-  assert.deepEqual(await f.pipesClosed.promise, { code: 0, signal: null, error: null });
+  assert.deepEqual(await f.pipesClosed.promise, cleanExit);
   assert.deepEqual(readFileSync(f.marker), Buffer.from(allowed));
   f.checkClaim();
 });
@@ -143,7 +201,11 @@ test("owned transport gates input until exact membership and activation, with se
   const f = setup(t, ownedFactory());
   assert.equal(f.owned.write(early), false);
   await f.ready.promise;
-  assert.deepEqual(f.trace, { ready: 0, activations: 0, disposed: 0, writes: [], launches: 1 });
+  assert.equal(f.trace.ready, 0);
+  assert.equal(f.trace.activations, 0);
+  assert.equal(f.trace.disposed, 0);
+  assert.equal(f.trace.launches, 1);
+  assert.deepEqual(f.trace.writes, []);
   assert.equal(f.owned.write(early), false);
   assert.deepEqual(await f.owned.observeOriginalGroup(), unavailable);
   f.verified.resolve({ child: f.child, job: f.job });
@@ -155,10 +217,14 @@ test("owned transport gates input until exact membership and activation, with se
   await f.released.promise;
   assert.equal(f.trace.ready, 1);
   assert.equal(f.trace.activations, 1);
-  assert.deepEqual(await f.owned.observeOriginalGroup(), { state: "verified", activeProcesses: 1 });
+  f.observe({ job: f.job, activeProcesses: 4, complete: true });
+  assert.deepEqual(await f.owned.observeOriginalGroup(), { state: "verified", activeProcesses: 4 });
+  assert.deepEqual(f.end.reports, []);
   assert.equal(f.owned.write(allowed), true);
   f.owned.endInput();
-  assert.deepEqual(await f.closed.promise, { code: 0, signal: null, error: null });
+  await f.end.expectOnce(cleanExit, true);
+  f.observe({ job: f.job, activeProcesses: 2, complete: true });
+  assert.deepEqual(await f.owned.observeOriginalGroup(), { state: "verified", activeProcesses: 2 });
   assert.deepEqual(f.trace.writes, [allowed]);
   assert.deepEqual(readFileSync(f.marker), Buffer.from(allowed));
   for (const sample of [null, { job: {}, activeProcesses: 0, complete: true }, { job: f.job, activeProcesses: 0, complete: false },
@@ -172,36 +238,101 @@ test("owned transport gates input until exact membership and activation, with se
   f.checkClaim();
 });
 
+test("a complete zero sample can arrive while the transport still has an open pipe", platform, async t => {
+  const f = setup(t, ownedFactory());
+  await f.ready.promise;
+  f.verified.resolve({ child: f.child, job: f.job });
+  f.active.resolve(true);
+  await f.released.promise;
+  f.observe({ job: f.job, activeProcesses: 0, complete: true });
+  assert.deepEqual(await f.owned.observeOriginalGroup(), { state: "verified", activeProcesses: 0 });
+  assert.deepEqual(f.readerExits, []);
+  assert.deepEqual(f.end.reports, []);
+  assert.equal(f.trace.pipeEnds, 0);
+  assert.equal(f.trace.disposed, 0);
+  assert.deepEqual(f.trace.writes, []);
+  assert.equal(existsSync(f.marker), false);
+  f.checkClaim();
+  f.owned.endInput();
+  await f.end.expectOnce(cleanExit, true);
+  f.checkClaim();
+});
+
 for (const fault of ["unavailable", "foreign job", "foreign child", "activation refused"] as const) {
   test(`owned transport exposes zero input for ${fault}`, platform, async t => {
-    const f = setup(t, ownedFactory(), false);
+    const f = setup(t, ownedFactory(), { activationSucceeds: false });
     await f.ready.promise;
     assert.equal(f.owned.write(early), false);
     f.verified.resolve(fault === "unavailable" ? null : {
       job: fault === "foreign job" ? {} : f.job, child: fault === "foreign child" ? {} : f.child,
     });
-    assert.deepEqual(await f.closed.promise, { code: null, signal: null, error: "spawn" });
+    await f.end.expectOnce(heldExit, true);
     assert.equal(f.owned.write(allowed), false);
-    assert.deepEqual(f.trace, { ready: 0, activations: fault === "activation refused" ? 1 : 0, disposed: 1, writes: [], launches: 1 });
+    assert.equal(f.trace.ready, 0);
+    assert.equal(f.trace.activations, fault === "activation refused" ? 1 : 0);
+    assert.equal(f.trace.disposed, 1);
+    assert.equal(f.trace.launches, 1);
+    assert.deepEqual(f.trace.writes, []);
     assert.deepEqual(await f.owned.observeOriginalGroup(), unavailable);
     assert.equal(existsSync(f.marker), false);
     f.checkClaim();
   });
 }
 
-test("an unavailable Windows launcher never falls back to a generic native process", platform, async t => {
-  const factory = ownedFactory();
-  const f = fixture(t);
-  const closed = deferred<NativeExit>();
-  let attempts = 0, ready = 0;
-  const child = factory({ start() { attempts++; return null; } }).start(f.argv, f.options, {
-    spawned() { ready++; }, stdout() { assert.fail(); }, stderr() {}, inputError() { assert.fail(); }, closed: closed.resolve,
+for (const how of ["missing", "throw", "reject"] as const) {
+  test(`Windows launcher start ${how} never falls back to a generic native process`, platform, async t => {
+    const factory = ownedFactory();
+    const f = fixture(t);
+    recordUnhandled(t);
+    const end = closing(t, f);
+    let attempts = 0, ready = 0, ordinaryLaunches = 0;
+    const ordinary = t.mock.method(childProcess, "spawn", () => {
+      ordinaryLaunches++;
+      throw new Error("ordinary spawn must not be called");
+    });
+    syncBuiltinESMExports();
+    try {
+      const child = factory({ start() { attempts++; return how === "missing" ? null : fail(how); } }).start(f.argv, f.options, {
+        spawned() { ready++; }, stdout() { assert.fail(); }, stderr() {}, inputError() { assert.fail(); }, closed: end.closed,
+      });
+      assert.equal(child.write(early), false);
+      await end.expectOnce(heldExit, false);
+      assert.equal(child.write(allowed), false);
+      assert.equal(attempts, 1);
+      assert.equal(ordinaryLaunches, 0);
+      assert.equal(ready, 0);
+      assert.deepEqual(await child.observeOriginalGroup(), unavailable);
+      assert.equal(existsSync(f.marker), false);
+      f.checkClaim();
+    } finally {
+      ordinary.mock.restore();
+      syncBuiltinESMExports();
+    }
   });
-  assert.equal(child.write(early), false);
-  assert.deepEqual(await closed.promise, { code: null, signal: null, error: "spawn" });
-  assert.equal(attempts, 1);
-  assert.equal(ready, 0);
-  assert.deepEqual(await child.observeOriginalGroup(), unavailable);
-  assert.equal(existsSync(f.marker), false);
-  f.checkClaim();
-});
+}
+
+const stages = ["verify", "activate", "observe"] as const;
+for (const stage of stages) {
+  for (const how of ["throw", "reject"] as const) {
+    test(`owned transport ${stage} ${how} closes once without sending input`, platform, async t => {
+      const f = setup(t, ownedFactory(), { failure: { stage, how } });
+      assert.equal(f.owned.write(early), false);
+      if (stage !== "verify") {
+        await f.ready.promise;
+        f.verified.resolve({ child: f.child, job: f.job });
+      }
+      if (stage === "observe") {
+        f.active.resolve(true);
+        await f.released.promise;
+        assert.deepEqual(await f.owned.observeOriginalGroup(), unavailable);
+      }
+      await f.end.expectOnce(heldExit, true);
+      assert.equal(f.owned.write(allowed), false);
+      assert.equal(f.trace.ready, stage === "observe" ? 1 : 0);
+      assert.deepEqual(f.trace.stages, stages.slice(0, stages.indexOf(stage) + 1));
+      assert.deepEqual(f.trace.writes, []);
+      assert.equal(existsSync(f.marker), false);
+      f.checkClaim();
+    });
+  }
+}
