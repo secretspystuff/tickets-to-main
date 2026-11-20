@@ -236,8 +236,11 @@ test("app-server late reroutes leave terminal model evidence intact", async t =>
       }
       for (const observation of [after, closed]) {
         assert.equal(observation.outcome, "held");
+        assert.equal(observation.appServerTerminalLineage, null);
         assert.equal(observation.observedModel, "late-target");
       }
+      const lineage = prior === "completed" ? { vendor: "codex", interfaceId: "app-server", threadId: THREAD, turnId: TURN } : null;
+      assert.deepEqual(settled.appServerTerminalLineage, lineage);
       const evidence = { beforeTurn: { model: "native-model", reasoningEffort: "high" }, reroute: prior === "held" ? earlyReroute : null };
       assert.deepEqual([settled.appServerModelEvidence, after.appServerModelEvidence, closed.appServerModelEvidence],
         [evidence, evidence, evidence]);
