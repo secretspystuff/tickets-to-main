@@ -40,9 +40,11 @@ export function startCodexAppServerAssignment(
   let process: NativeProcess | null = null;
   let settledOnce = false;
   let connectionClosed = false;
+  let inputClosed = false;
+  let initializationSent = false;
   let stage: "initialize" | "thread" | "turn" | "active" = "initialize";
   let interruptSent = false;
-  const pending = new Set<number>([1]);
+  const pending = new Set<number>();
   const helpers = new Map<string, string>();
 
   function boundary(): void {
@@ -61,11 +63,17 @@ export function startCodexAppServerAssignment(
     outcome("protocol-error", "The native stream could not establish an assignment result. Writer completion is unknown.");
   }
   function send(value: unknown): boolean {
-    if (connectionClosed || process === null || !process.write(`${JSON.stringify(value)}\n`)) {
+    if (connectionClosed || inputClosed || process === null || !process.write(`${JSON.stringify(value)}\n`)) {
       outcome("disconnected", "Native input is unavailable. Writer completion is unknown.");
       return false;
     }
     return true;
+  }
+  function initialize(): void {
+    if (!state.spawned || process === null || initializationSent || connectionClosed || inputClosed || state.outcome !== "starting") return;
+    initializationSent = true;
+    pending.add(1);
+    send({ id: 1, method: "initialize", params: { clientInfo: { name: "tickets_to_main", version: "0.1.0" } } });
   }
   function sameContext(params: Record<string, unknown>): boolean {
     return params.threadId === state.threadId && params.turnId === state.turnId && state.turnId !== null;
@@ -211,7 +219,7 @@ export function startCodexAppServerAssignment(
       if (!sent) state.interruptRequest = "unavailable";
       return sent;
     },
-    closeInput() { process?.endInput(); },
+    closeInput() { inputClosed = true; process?.endInput(); },
   };
   if (launch.version !== CODEX_APP_SERVER_SCHEMA_VERSION || !absoluteWindowsPath(launch.executable)
     || launch.executable.includes("\0") || request.workspace.includes("\0") || !absoluteWindowsPath(request.workspace)) {
@@ -229,7 +237,7 @@ export function startCodexAppServerAssignment(
   state.requestedModel = request.model;
   state.requestedEffort = request.effort;
   process = transport.start(state.argv, { cwd: request.workspace, env: toolEnv(parentEnv, secrets) }, {
-    spawned() { state.spawned = true; },
+    spawned() { state.spawned = true; initialize(); },
     stdout(chunk) { parser.push(chunk); },
     stderr() {},
     inputError() { outcome("disconnected", "Native input disconnected. Writer completion is unknown."); },
@@ -244,6 +252,6 @@ export function startCodexAppServerAssignment(
       close(copyObservation(state));
     },
   });
-  send({ id: 1, method: "initialize", params: { clientInfo: { name: "tickets_to_main", version: "0.1.0" } } });
+  initialize();
   return handle;
 }
