@@ -3,6 +3,8 @@ import { assignmentDirectory, directoriesOverlap, type DirectoryIdentity } from 
 import { currentProcessOwner, processOwnerAlive, type ProcessOwner } from "./process-identity.ts";
 import { safeNativeText } from "./adapters/native-result.ts";
 import { completeAssignment, journalDigest, reserveAssignment, startAssignment, type Intent } from "./assignment-journal.ts";
+import type { WindowsOwnedNativeProcess } from "./native-transport.ts";
+import { bindOwnedWorkspaceClaim, releaseOwnedWorkspaceClaim, startOwnedWorkspaceClaim } from "./workspace.ts";
 
 export type AssignmentBinding = {
   board: string; repo: string; activation: string; connection: string; job: string;
@@ -22,7 +24,15 @@ export type AssignmentAdapter = {
   execute(input: { id: string; sequence: number; input: string; workspace: string }): Promise<AssignmentTerminal>;
   reconcile(input: { id: string; sequence: number; requestDigest: string }): Promise<AssignmentTerminal | null>;
 };
-export type AssignmentInput = { stateDir: string; raw: string; secrets: readonly string[]; now(): number; adapter: AssignmentAdapter };
+type PreparedOwnedAssignment = {
+  original: Pick<WindowsOwnedNativeProcess, "observeOriginalGroup">;
+  execute: AssignmentAdapter["execute"];
+  close(): Promise<void>;
+};
+export type AssignmentInput = {
+  stateDir: string; raw: string; secrets: readonly string[]; now(): number; adapter: AssignmentAdapter;
+  owned?: { prepare(input: { intent: Intent; workspace: string }): Promise<PreparedOwnedAssignment | null> };
+};
 export type AssignmentResult = { state: "completed" | "failed" | "not-started" | "held" | "refused"; qualification: "unqualified-harness"; publishable: false };
 
 const BINDING = ["board", "repo", "activation", "connection", "job", "claim", "requirements", "candidate", "policy", "fence"];
@@ -107,6 +117,7 @@ export async function runAssignment(input: AssignmentInput, directory = assignme
   if (!request || input.adapter.kind !== "fabricated-harness") return outcome("refused");
   const locks: string[] = [];
   let unstarted: { stateDir: string; intent: Intent } | null = null;
+  let prepared: PreparedOwnedAssignment | null = null;
   try {
     const state = directory(input.stateDir);
     const stateDir = state.path;
@@ -128,14 +139,29 @@ export async function runAssignment(input: AssignmentInput, directory = assignme
     if ((await current(input, request, state, directory))?.identity !== workspace.identity) throw new Error("Assignment authority changed.");
     if (reserved.state === "completed" || reserved.state === "failed" || reserved.state === "not-started") return outcome(reserved.state);
     if (reserved.state === "pending" && ownerAlive(reserved.intent)) return outcome("held");
-    if (reserved.state === "new") startAssignment(stateDir, intent, input.now());
+    let ownedClaim: object | null = null;
+    if (reserved.state === "new") {
+      if ("owned" in input) {
+        prepared = await input.owned?.prepare({ intent: structuredClone(intent), workspace: workspace.path }) ?? null;
+        if (!prepared) throw new Error("Owned assignment preparation is unavailable.");
+        ownedClaim = bindOwnedWorkspaceClaim(stateDir, intent, prepared.original);
+        if (!ownedClaim || (await current(input, request, state, directory))?.identity !== workspace.identity) {
+          throw new Error("Assignment authority changed.");
+        }
+        startOwnedWorkspaceClaim(ownedClaim, input.now());
+      } else {
+        startAssignment(stateDir, intent, input.now());
+      }
+    }
     unstarted = null;
     // An intent surviving its controller is uncertain at every age; only read-only evidence can resolve it.
+    const execution = { id: request.id, sequence: request.sequence, input: request.input, workspace: workspace.path };
     const observed: unknown = structuredClone(reserved.state === "pending"
       ? await input.adapter.reconcile({ id: request.id, sequence: request.sequence, requestDigest: reserved.intent.requestDigest })
-      : await input.adapter.execute({ id: request.id, sequence: request.sequence, input: request.input, workspace: workspace.path }));
+      : await (prepared ?? input.adapter).execute(execution));
     if (!terminal(observed, request) || (await current(input, request, state, directory))?.identity !== workspace.identity) return outcome("held");
     completeAssignment(stateDir, reserved.intent, observed.result, input.now());
+    if (ownedClaim) await releaseOwnedWorkspaceClaim(ownedClaim);
     return outcome(observed.result);
   } catch {
     if (unstarted) {
@@ -146,5 +172,9 @@ export async function runAssignment(input: AssignmentInput, directory = assignme
     }
     return outcome("held");
   }
-  finally { for (const key of locks) active.delete(key); }
+  finally {
+    try { if (prepared) await prepared.close(); }
+    catch { /* The observer cannot justify any further claim action after disposal fails. */ }
+    for (const key of locks) active.delete(key);
+  }
 }

@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import fs, { existsSync, mkdtempSync, readFileSync, realpathSync } from "node:fs";
+import fs, { existsSync, mkdtempSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
 import { syncBuiltinESMExports } from "node:module";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
@@ -65,6 +65,7 @@ function space(t: TestContext, wrongWriter = false) {
   const workspace = realpathSync(requested);
   const owner = process.pid + Number(wrongWriter);
   claimWorkspace(stateDir, owner, () => true);
+  writeFileSync(join(workspace, "work.txt"), "fabricated checkout\n", { flag: "wx" });
   const request: AssignmentRequest = {
     version: 1, id: id(1), sequence: 1, operation: "native.assign", input: "fabricated owned runner input\n",
     binding: { board: id(2), repo: id(3), activation: id(4), connection: id(5), job: id(6), claim: id(7),

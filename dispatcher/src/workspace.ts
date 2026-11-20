@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { lstatSync, realpathSync, rmdirSync } from "node:fs";
 import { isAbsolute, resolve, sep } from "node:path";
-import { hasOwnedTerminalUnderLease, journalDigest, preparedOwnedBindingsUnderLease, type Intent } from "./assignment-journal.ts";
+import { hasOwnedTerminalUnderLease, journalDigest, preparedOwnedBindingsUnderLease, startAssignment, type Intent } from "./assignment-journal.ts";
 import { assignmentDirectory, directoryBirthTime, type DirectoryIdentity } from "./directory-identity.ts";
 import { StateError, assertPrivateAccess, ensurePrivateDirectory } from "./fs-safety.ts";
 import { loadLedger, updateLedger, type Ledger } from "./ledger.ts";
@@ -160,6 +160,27 @@ export function bindOwnedWorkspaceClaim(stateDir: string, prepared: Intent, orig
   return authority;
 }
 
+function currentOwnedWorkspace(ledger: Ledger, claim: OwnedClaim): Ledger["workspace"] {
+  if (!ledger.install) throw new StateError("The recorded workspace is unavailable.");
+  const current = ledger.workspace;
+  if (!current || current.path !== claim.checkout.path || current.writerPid !== claim.intent.pid
+    || !ledger.boundWorkspaceIntents?.includes(claim.intent.id)
+    || current.claimGeneration !== claim.generation || directoryBirthTime(claim.state) !== claim.stateBirth) return null;
+  assertCurrentWorkspace(claim.state.path, current.path);
+  const checkout = assignmentDirectory(current.path);
+  return checkout.path === claim.checkout.path && checkout.identity === claim.checkout.identity
+    && directoryBirthTime(checkout) === claim.checkoutBirth ? current : null;
+}
+
+export function startOwnedWorkspaceClaim(authority: object, at: number): void {
+  const claim = ownedClaims.get(authority);
+  if (!claim) throw new StateError("The recorded workspace is unavailable.");
+  startAssignment(claim.state.path, claim.intent, at, () => {
+    const loaded = loadLedger(claim.state.path);
+    return loaded.ok && currentOwnedWorkspace(loaded.ledger, claim) !== null;
+  });
+}
+
 export async function releaseOwnedWorkspaceClaim(authority: object): Promise<{ state: "released" | "held" }> {
   const claim = ownedClaims.get(authority);
   if (!claim) return { state: "held" };
@@ -168,19 +189,10 @@ export async function releaseOwnedWorkspaceClaim(authority: object): Promise<{ s
     const sample = await claim.observe();
     if (sample?.state !== "verified" || !Object.is(sample.activeProcesses, 0)) return { state: "held" };
     updateLedger(claim.state.path, [], ledger => {
-      if (!ledger.install) throw new StateError("The recorded workspace is unavailable.");
-      const current = ledger.workspace;
-      const bindings = ledger.boundWorkspaceIntents;
-      if (!current || current.path !== claim.checkout.path || current.writerPid !== claim.intent.pid
-        || !bindings?.includes(claim.intent.id)
-        || current.claimGeneration !== claim.generation || directoryBirthTime(claim.state) !== claim.stateBirth) return;
-      assertCurrentWorkspace(claim.state.path, current.path);
-      const checkout = assignmentDirectory(current.path);
-      if (checkout.path !== claim.checkout.path || checkout.identity !== claim.checkout.identity
-        || directoryBirthTime(checkout) !== claim.checkoutBirth
-        || !hasOwnedTerminalUnderLease(claim.state.path, claim.intent)) return;
+      const current = currentOwnedWorkspace(ledger, claim);
+      if (!current || !hasOwnedTerminalUnderLease(claim.state.path, claim.intent)) return;
       ledger.workspace = { path: current.path, writerPid: null, qualified: false };
-      const retained = bindings.filter(id => id !== claim.intent.id);
+      const retained = (ledger.boundWorkspaceIntents ?? []).filter(id => id !== claim.intent.id);
       if (retained.length > 0) ledger.boundWorkspaceIntents = retained;
       else delete ledger.boundWorkspaceIntents;
     }, () => { committed = true; });

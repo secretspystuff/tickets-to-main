@@ -62,8 +62,9 @@ function records(text: string): Map<string, Entry> {
   return entries;
 }
 
-function transact<T>(stateDir: string, operation: (entries: Map<string, Entry>, append: (value: Intent | Started | Result) => void) => T): T {
-  return withPrivateJournal(stateDir, "assignment-intents.jsonl", records, operation);
+function transact<T>(stateDir: string, operation: (entries: Map<string, Entry>, append: (value: Intent | Started | Result) => void) => T,
+  mode?: "append-existing"): T {
+  return withPrivateJournal(stateDir, "assignment-intents.jsonl", records, operation, mode);
 }
 
 function matching(left: Intent, right: Intent): boolean {
@@ -140,13 +141,15 @@ export function reserveAssignment(stateDir: string, intent: Intent, legacyWorksp
   });
 }
 
-export function startAssignment(stateDir: string, intent: Intent, at: number): void {
+export function startAssignment(stateDir: string, intent: Intent, at: number, claimIsCurrent?: () => boolean): void {
   transact(stateDir, (entries, append) => {
     const entry = entries.get(intent.id);
     if (!entry || !matching(entry.intent, intent) || entry.intent.version === undefined || !owned(entry.intent)
       || entry.started || entry.result || !integer(at, 0) || at < entry.intent.at) throw unavailable();
+    if (claimIsCurrent && (entry.intent.version !== 4 || entry.intent.pid !== intent.pid
+      || entry.intent.birth !== intent.birth || entry.intent.at !== intent.at || !claimIsCurrent())) throw unavailable();
     append({ kind: "started", id: intent.id, sequence: intent.sequence, requestDigest: intent.requestDigest, at });
-  });
+  }, claimIsCurrent ? "append-existing" : undefined);
 }
 
 export function completeAssignment(stateDir: string, intent: Intent, outcome: Result["outcome"], at: number): void {
