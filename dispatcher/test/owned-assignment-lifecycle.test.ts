@@ -27,7 +27,9 @@ type OwnedInput = AssignmentInput & {
 type Scenario = "complete" | "wrong writer" | "revoked" | "claim replaced" | "successor claim" | "prepare rejected"
   | "start flush" | "interrupted" | "wrong terminal" | "revoked after execution" | "result flush" | "witness lost"
   | "state changed during staging" | "state changed during bind" | "state changed during start" | "state changed during terminal"
-  | "opt-in withdrawn" | "close rejected" | "missing journal";
+  | "opt-in withdrawn" | "close rejected" | "close rejected with changed state" | "missing journal"
+  | "prepared execute changed" | "prepared close changed"
+  | "reservation pid changed" | "reservation birth changed" | "reservation time changed";
 type JournalRow = { kind: string; id: string; sequence: number; requestDigest: string; outcome?: string };
 const onWindows = { skip: process.platform !== "win32", timeout: 24_000 };
 const unqualified = { qualification: "unqualified-harness", publishable: false } as const;
@@ -164,7 +166,8 @@ async function stage(f: Space, beforeResume: () => void) {
 }
 
 function ownedCase(t: TestContext, mode: Scenario, gateClose = false) {
-  const f = space(t, mode === "wrong writer" || mode === "close rejected");
+  const closeRejected = mode === "close rejected" || mode === "close rejected with changed state";
+  const f = space(t, mode === "wrong writer" || closeRejected);
   const { flushes, faults, started } = observeFlushes(t, f, mode);
   const snapshot = () => ({ ledger: readFileSync(f.ledger), journal: f.journalText() });
   const savedJournal = `${f.journal}.saved`;
@@ -173,7 +176,7 @@ function ownedCase(t: TestContext, mode: Scenario, gateClose = false) {
   let changedInEpoch: string | undefined;
   let mismatchObservations = 0;
   let atJournalLoss: ReturnType<typeof snapshot> | undefined;
-  if (mode.startsWith("state changed")) {
+  if (mode.startsWith("state changed") || mode === "close rejected with changed state") {
     const { lstatSync: lstat, renameSync: rename } = fs;
     const leaseRoot = join(f.base.stateDir, ".state-leases", "ledger");
     fs.renameSync = (source, destination) => {
@@ -195,6 +198,30 @@ function ownedCase(t: TestContext, mode: Scenario, gateClose = false) {
     syncBuiltinESMExports();
     t.after(() => { fs.renameSync = rename; Reflect.set(fs, "lstatSync", lstat); syncBuiltinESMExports(); });
   }
+  let atReservationChange: ReturnType<typeof snapshot> | undefined;
+  let reservationObservations = 0;
+  if (mode.startsWith("reservation ")) {
+    const read = fs.readFileSync;
+    fs.readFileSync = ((...args: Parameters<typeof read>) => {
+      const data = read(...args);
+      const [fd, encoding] = args;
+      if (!atReservationChange || typeof fd !== "number" || encoding !== "utf8" || typeof data !== "string") return data;
+      const opened = fs.fstatSync(fd), journal = fs.lstatSync(f.journal);
+      if (opened.dev !== journal.dev || opened.ino !== journal.ino) return data;
+      const newline = data.indexOf("\n");
+      const intent = JSON.parse(data.slice(0, newline)) as Intent;
+      if (mode === "reservation pid changed") intent.pid++;
+      if (mode === "reservation time changed") intent.at--;
+      if (mode === "reservation birth changed") {
+        assert.match(intent.birth ?? "", /^win32:[1-9]\d+$/);
+        intent.birth = intent.birth!.slice(0, -1) + (intent.birth!.at(-1) === "0" ? "1" : "0");
+      }
+      reservationObservations++;
+      return JSON.stringify(intent) + data.slice(newline);
+    }) as typeof fs.readFileSync;
+    syncBuiltinESMExports();
+    t.after(() => { fs.readFileSync = read; syncBuiltinESMExports(); });
+  }
   const events: Trace[] = [];
   const record = (event: string) => events.push({ event, kinds: f.rows().map(r => r.kind),
     writer: f.claim()?.writerPid, generation: f.claim()?.claimGeneration, flushes: [...flushes] });
@@ -202,6 +229,8 @@ function ownedCase(t: TestContext, mode: Scenario, gateClose = false) {
   t.after(() => permitClose.resolve());
   let fallback = 0, reconciliations = 0, replaced = false, disposed = 0, withdrawn = false, substitutePreparations = 0;
   let replacement: Buffer | undefined;
+  let returnedPreparation: PreparedExecution | undefined;
+  let methodsReplaced = false, substituteMethods = 0;
   let staged: Awaited<ReturnType<typeof stage>> | undefined;
   const input: OwnedInput = {
     ...f.base, adapter: {
@@ -213,6 +242,12 @@ function ownedCase(t: TestContext, mode: Scenario, gateClose = false) {
           withdrawn = true;
         }
         const bound = f.claim()?.claimGeneration !== undefined;
+        if (mode.startsWith("prepared ") && bound && returnedPreparation && !methodsReplaced) {
+          const substitute = async () => { substituteMethods++; throw new Error("fabricated replacement prepared method"); };
+          if (mode === "prepared execute changed") returnedPreparation.execute = substitute;
+          if (mode === "prepared close changed") returnedPreparation.close = substitute;
+          methodsReplaced = true;
+        }
         if (mode === "state changed during start" && bound) stateChangeArmed = true;
         const revoked = (mode === "revoked" && bound)
           || (mode === "revoked after execution" && events.some(event => event.event === "root closed"));
@@ -256,7 +291,7 @@ function ownedCase(t: TestContext, mode: Scenario, gateClose = false) {
       record("suspended");
       if (mode === "state changed during staging") atStateChange = snapshot();
       if (mode === "state changed during bind") stateChangeArmed = true;
-      return {
+      return returnedPreparation = {
         original: { observeOriginalGroup() { record("sample"); return child.owned.observeOriginalGroup(); } },
         async execute(value) {
           record("execute");
@@ -267,6 +302,7 @@ function ownedCase(t: TestContext, mode: Scenario, gateClose = false) {
           record("root closed");
           assert.deepEqual(readFileSync(f.marker), Buffer.from(f.request.input));
           if (mode === "state changed during terminal") stateChangeArmed = true;
+          if (mode.startsWith("reservation ")) atReservationChange = snapshot();
           if (mode === "interrupted") throw new Error("fabricated interruption after local start");
           if (mode === "witness lost") child.owned.closeObservation();
           const result = f.receipt(value);
@@ -276,7 +312,7 @@ function ownedCase(t: TestContext, mode: Scenario, gateClose = false) {
           record("close");
           closing.resolve();
           if (gateClose) await permitClose.promise;
-          if (mode === "close rejected") throw new Error("fabricated disposal acknowledgement unavailable");
+          if (closeRejected) throw new Error("fabricated disposal acknowledgement unavailable");
           await child.dispose();
           assert.deepEqual(await child.owned.observeOriginalGroup(), { state: "unavailable" });
           disposed++;
@@ -285,7 +321,10 @@ function ownedCase(t: TestContext, mode: Scenario, gateClose = false) {
     } },
   };
   return { ...f, events, faults, started, snapshot, savedJournal, get stateChange() { return atStateChange; },
+    changeStateObservation() { atStateChange = snapshot(); },
     get changedInEpoch() { return changedInEpoch; }, get mismatchObservations() { return mismatchObservations; },
+    get atReservationChange() { return atReservationChange; }, get reservationObservations() { return reservationObservations; },
+    get methodsReplaced() { return methodsReplaced; }, get substituteMethods() { return substituteMethods; },
     get journalLoss() { return atJournalLoss; }, get withdrawn() { return withdrawn; }, get substitutePreparations() { return substitutePreparations; },
     closing: closing.promise, permitClose: () => permitClose.resolve(),
     run: () => runAssignment(input), get disposed() { return disposed; }, get replacement() { return replacement; },
@@ -465,46 +504,50 @@ test("an owned opt-in stays selected when its input property is withdrawn during
   assert.equal(f.disposed, 1);
 });
 
-test("an owned disposal rejection holds the workspace and prevents handoff or replay", onWindows, async t => {
-  const f = ownedCase(t, "close rejected");
-  const result = await f.run();
-  assert.deepEqual(f.events.map(event => event.event), ["prepared", "suspended", "close"]);
-  assert.equal(f.childExits, 0, "the staged fixture is still awaiting cleanup");
-  assert.equal(f.claim()?.writerPid, f.owner);
-  assert.equal(f.disposed, 0);
-  assert.equal(f.activations, 0);
-  assert.equal(existsSync(f.marker), false);
-  const before = f.snapshot();
-  const replay = await f.run();
-  const later = { ...f.request, id: id(21), sequence: 2 };
-  let nextReads = 0, nextWork = 0;
-  const other: OwnedInput = {
-    ...f.base, raw: JSON.stringify(later),
-    adapter: {
-      kind: "fabricated-harness",
-      async readCurrent() {
-        nextReads++;
-        return { binding: later.binding, nextSequence: later.sequence, authorized: true, seat: "member",
-          confirmedWorkspace: f.workspace, writersContained: true };
+for (const mode of ["close rejected", "close rejected with changed state"] as const) {
+  test(`an owned disposal rejection fences the workspace when ${mode}`, onWindows, async t => {
+    const f = ownedCase(t, mode);
+    const result = await f.run();
+    assert.deepEqual(f.events.map(event => event.event), ["prepared", "suspended", "close"]);
+    assert.equal(f.childExits, 0, "the staged fixture is still awaiting cleanup");
+    assert.equal(f.claim()?.writerPid, f.owner);
+    assert.equal(f.disposed, 0);
+    assert.equal(f.activations, 0);
+    assert.equal(existsSync(f.marker), false);
+    const before = f.snapshot();
+    const replay = await f.run();
+    if (mode === "close rejected with changed state") f.changeStateObservation();
+    const later = { ...f.request, id: id(21), sequence: 2 };
+    let nextReads = 0, nextWork = 0;
+    const other: OwnedInput = {
+      ...f.base, raw: JSON.stringify(later),
+      adapter: {
+        kind: "fabricated-harness",
+        async readCurrent() {
+          nextReads++;
+          return { binding: later.binding, nextSequence: later.sequence, authorized: true, seat: "member",
+            confirmedWorkspace: f.workspace, writersContained: true };
+        },
+        async execute() { nextWork++; throw new Error("unexpected successor execution"); },
+        async reconcile() { nextWork++; return null; },
       },
-      async execute() { nextWork++; throw new Error("unexpected successor execution"); },
-      async reconcile() { nextWork++; return null; },
-    },
-    owned: { async prepare() { nextWork++; throw new Error("unexpected successor preparation"); } },
-  };
-  const successorResult = await runAssignment(other);
-  assert.deepEqual({ result, replay, successorResult, nextReads, nextWork }, {
-    result: { state: "held", ...unqualified }, replay: { state: "held", ...unqualified },
-    successorResult: { state: "held", ...unqualified }, nextReads: 1, nextWork: 0,
+      owned: { async prepare() { nextWork++; throw new Error("unexpected successor preparation"); } },
+    };
+    const successorResult = await runAssignment(other);
+    if (mode === "close rejected with changed state") assert.ok(f.mismatchObservations > 0);
+    assert.deepEqual({ result, replay, successorResult, nextReads, nextWork }, {
+      result: { state: "held", ...unqualified }, replay: { state: "held", ...unqualified },
+      successorResult: { state: "held", ...unqualified }, nextReads: 1, nextWork: 0,
+    });
+    assert.deepEqual(f.snapshot(), before);
+    assert.deepEqual(f.events.map(event => event.event), ["prepared", "suspended", "close"]);
+    assert.equal(f.fallback, 0);
+    assert.equal(f.reconciliations, 0);
+    assert.equal(f.disposals.length, 1);
+    await f.disposals[0]!();
+    assert.equal(f.childExits, 1, "test cleanup must close the exact staged fixture once");
   });
-  assert.deepEqual(f.snapshot(), before);
-  assert.deepEqual(f.events.map(event => event.event), ["prepared", "suspended", "close"]);
-  assert.equal(f.fallback, 0);
-  assert.equal(f.reconciliations, 0);
-  assert.equal(f.disposals.length, 1);
-  await f.disposals[0]!();
-  assert.equal(f.childExits, 1, "test cleanup must close the exact staged fixture once");
-});
+}
 
 test("an owned start refusal preserves a missing prepared journal and its saved bytes", onWindows, async t => {
   const f = ownedCase(t, "missing journal");
@@ -520,3 +563,36 @@ test("an owned start refusal preserves a missing prepared journal and its saved 
   assert.equal(f.fallback, 0);
   assert.equal(existsSync(f.marker), false);
 });
+
+for (const mode of ["prepared execute changed", "prepared close changed"] as const) {
+  test(`an owned runner retains the original native callbacks when ${mode}`, onWindows, async t => {
+    const f = ownedCase(t, mode);
+    const result = await f.run();
+    assert.equal(f.methodsReplaced, true);
+    assert.equal(f.substituteMethods, 0);
+    assert.deepEqual(result, { state: "completed", ...unqualified });
+    assert.deepEqual(f.events.map(event => event.event), ["prepared", "suspended", "execute", "resume", "root closed", "sample", "close"]);
+    assert.deepEqual(readFileSync(f.marker), Buffer.from(f.request.input));
+    assert.equal(f.activations, 1);
+    assert.equal(f.disposed, 1);
+    assert.equal(f.fallback, 0);
+  });
+}
+
+for (const mode of ["reservation pid changed", "reservation birth changed", "reservation time changed"] as const) {
+  test(`an owned terminal result preserves the original durable reservation when ${mode}`, onWindows, async t => {
+    const f = ownedCase(t, mode);
+    const result = await f.run();
+    assert.ok(f.reservationObservations > 0, "the durable terminal transaction must observe the isolated differing reservation");
+    assert.deepEqual(result, { state: "held", ...unqualified });
+    assert.deepEqual(f.events.map(event => event.event), ["prepared", "suspended", "execute", "resume", "root closed", "close"]);
+    assert.ok(f.atReservationChange);
+    assert.deepEqual(f.snapshot(), f.atReservationChange);
+    assert.deepEqual(f.rows().map(row => row.kind), ["intent", "started"]);
+    assert.equal(f.claim()?.claimGeneration, f.events[2]?.generation);
+    assert.equal(f.claim()?.writerPid, f.owner);
+    assert.equal(f.activations, 1);
+    assert.equal(f.disposed, 1);
+    assert.equal(f.fallback, 0);
+  });
+}
