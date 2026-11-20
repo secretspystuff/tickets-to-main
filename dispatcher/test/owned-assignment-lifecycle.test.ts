@@ -586,6 +586,61 @@ test("pending disposal fences the workspace across state identity changes until 
   assert.deepEqual(f.rows().filter(row => row.id === next.id).map(row => row.kind), ["intent", "result"]);
 });
 
+for (const laterOwned of [true, false]) {
+  test(`an active legacy writer preserves ${laterOwned ? "owned isolation" : "separate legacy behavior"} across local state directories`, onWindows, async t => {
+    const f = space(t);
+    const snapshot = () => ({ ledger: readFileSync(f.ledger), journal: f.journalText() });
+    const otherState = join(dirname(f.base.stateDir), "other-state");
+    install({ stateDir: otherState, platform: process.platform, arch: process.arch, nowIso: new Date(0).toISOString() });
+    prepareWorkspace(otherState, f.workspace, () => false);
+    claimWorkspace(otherState, f.owner, () => true);
+    const otherLedger = join(otherState, "ledger.json"), otherJournal = join(otherState, "assignment-intents.jsonl");
+    const otherLedgerBefore = readFileSync(otherLedger);
+    const writing = deferred<void>(), finish = deferred<void>();
+    const authorized = (request: AssignmentRequest) => ({ binding: request.binding, nextSequence: request.sequence,
+      authorized: true, seat: "member" as const, confirmedWorkspace: f.workspace, writersContained: true });
+    const first = runAssignment({ ...f.base, adapter: {
+      kind: "fabricated-harness",
+      async readCurrent() { return authorized(f.request); },
+      async execute(value) { writing.resolve(); await finish.promise; return f.receipt(value); },
+      async reconcile() { return assert.fail("legacy execution has no prior request"); },
+    } });
+    const later = { ...f.request, id: id(22), sequence: 2 };
+    let reads = 0, executes = 0, prepares = 0;
+    const laterInput: AssignmentInput = {
+      ...f.base, stateDir: otherState, raw: JSON.stringify(later), adapter: {
+        kind: "fabricated-harness",
+        async readCurrent() { reads++; return authorized(later); },
+        async execute(value) { executes++; return f.receipt(value); },
+        async reconcile() { return assert.fail("the other ledger has no prior request"); },
+      },
+    };
+    if (laterOwned) laterInput.owned = { async prepare() { prepares++; throw new Error("stop the fabricated preparer without launch"); } };
+    try {
+      assert.equal(await bounded(Promise.race([writing.promise.then(() => "started"), first.then(() => "returned")])), "started");
+      assert.deepEqual(f.rows().map(row => row.kind), ["intent", "started"]);
+      const before = snapshot();
+      const laterResult = await bounded(runAssignment(laterInput));
+      assert.deepEqual({ laterResult, reads, prepares, executes }, {
+        laterResult: { state: laterOwned ? "held" : "completed", ...unqualified },
+        reads: laterOwned ? 1 : 3, prepares: 0, executes: laterOwned ? 0 : 1,
+      });
+      assert.deepEqual(snapshot(), before);
+      assert.deepEqual(readFileSync(otherLedger), otherLedgerBefore);
+      assert.equal(existsSync(otherJournal), !laterOwned);
+    } finally {
+      finish.resolve();
+      await first;
+    }
+    assert.deepEqual(await first, { state: "completed", ...unqualified });
+    if (laterOwned) {
+      assert.deepEqual(await runAssignment(laterInput), { state: "not-started", ...unqualified });
+      assert.equal(prepares, 1);
+      assert.equal(executes, 0);
+    }
+  });
+}
+
 test("an owned start refusal preserves a missing prepared journal and its saved bytes", onWindows, async t => {
   const f = ownedCase(t, "missing journal");
   assert.deepEqual(await f.run(), { state: "held", ...unqualified });
