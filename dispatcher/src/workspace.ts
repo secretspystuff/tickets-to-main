@@ -1,14 +1,16 @@
 import { randomUUID } from "node:crypto";
 import { lstatSync, realpathSync, rmdirSync } from "node:fs";
 import { isAbsolute, resolve, sep } from "node:path";
-import { hasOwnedTerminalUnderLease, journalDigest, preparedOwnedBindingsUnderLease, startAssignment, type Intent } from "./assignment-journal.ts";
+import { journalDigest, ownedTerminalUnderLease, preparedOwnedBindingsUnderLease, startAssignment, type Intent } from "./assignment-journal.ts";
+import { isAppServerProcess, observeOwnedAppServerTerminal, type AppServerTerminalLineage, type CodexAssignmentHandle } from "./adapters/codex-app-server.ts";
 import { assignmentDirectory, directoryBirthTime, type DirectoryIdentity } from "./directory-identity.ts";
 import { StateError, assertPrivateAccess, ensurePrivateDirectory } from "./fs-safety.ts";
-import { loadLedger, updateLedger, type Ledger } from "./ledger.ts";
-import type { WindowsOwnedNativeProcess } from "./native-transport.ts";
+import { assertPublicRecord, loadLedger, updateLedger, type Ledger, type NativePredecessorRecord } from "./ledger.ts";
+import { originalOwnedGroupObserver, type WindowsOwnedNativeProcess } from "./native-transport.ts";
 import { currentProcessOwner, observeRecordedPid } from "./process-identity.ts";
 
 type OriginalObserver = Pick<WindowsOwnedNativeProcess, "observeOriginalGroup">;
+type AppServerPredecessorSource = { prompt: string; secrets: readonly string[]; readHandle(): CodexAssignmentHandle | null };
 type OwnedClaim = {
   state: DirectoryIdentity;
   stateBirth: bigint;
@@ -16,7 +18,9 @@ type OwnedClaim = {
   checkoutBirth: bigint;
   generation: string;
   intent: Intent;
+  original: OriginalObserver;
   observe: OriginalObserver["observeOriginalGroup"];
+  predecessor: { terminal(): AppServerTerminalLineage | null; secrets: readonly string[] } | null;
 };
 const ownedClaims = new WeakMap<object, OwnedClaim>();
 
@@ -127,7 +131,7 @@ export function releaseWorkspace(stateDir: string): string[] {
 }
 
 export function bindOwnedWorkspaceClaim(stateDir: string, prepared: Intent, original: OriginalObserver,
-  stateIsCurrent?: () => boolean): object | null {
+  stateIsCurrent?: () => boolean, appServer?: AppServerPredecessorSource): object | null {
   let committed: OwnedClaim | undefined;
   try {
     const intent = structuredClone(prepared);
@@ -136,7 +140,9 @@ export function bindOwnedWorkspaceClaim(stateDir: string, prepared: Intent, orig
     const state = assignmentDirectory(stateDir);
     const stateBirth = directoryBirthTime(state);
     const generation = randomUUID();
-    const observe = original.observeOriginalGroup.bind(original);
+    const observe = appServer ? originalOwnedGroupObserver(original) : original.observeOriginalGroup.bind(original);
+    if (!observe) return null;
+    const source = appServer && { prompt: appServer.prompt, secrets: [...appServer.secrets], readHandle: appServer.readHandle.bind(appServer) };
     let claim: OwnedClaim | undefined;
     updateLedger(state.path, [], ledger => {
       if (!ledger.install) throw new StateError("The recorded workspace is unavailable.");
@@ -152,7 +158,9 @@ export function bindOwnedWorkspaceClaim(stateDir: string, prepared: Intent, orig
       const checkoutBirth = directoryBirthTime(checkout);
       ledger.workspace = { ...current, claimGeneration: generation };
       ledger.boundWorkspaceIntents = bindings;
-      claim = { state, stateBirth, checkout, checkoutBirth, generation, intent, observe };
+      const predecessor = source ? { secrets: source.secrets, terminal: () => observeOwnedAppServerTerminal(original,
+        source.readHandle(), { assignmentId: intent.id, workspace: checkout.path, prompt: source.prompt }, source.secrets) } : null;
+      claim = { state, stateBirth, checkout, checkoutBirth, generation, intent, original, observe, predecessor };
     }, () => { committed = claim; });
   } catch { /* A failed lease release does not discard a persisted original binding. */ }
   if (!committed) return null;
@@ -191,7 +199,22 @@ export async function releaseOwnedWorkspaceClaim(authority: object): Promise<{ s
     if (sample?.state !== "verified" || !Object.is(sample.activeProcesses, 0)) return { state: "held" };
     updateLedger(claim.state.path, [], ledger => {
       const current = currentOwnedWorkspace(ledger, claim);
-      if (!current || !hasOwnedTerminalUnderLease(claim.state.path, claim.intent)) return;
+      if (!current) return;
+      const terminal = ownedTerminalUnderLease(claim.state.path, claim.intent);
+      if (!terminal) return;
+      if (!claim.predecessor && isAppServerProcess(claim.original)) return;
+      if (claim.predecessor) {
+        const { id, sequence, requestDigest, bindingDigest, workspaceDigest, aliasDigest } = claim.intent;
+        const lineage = claim.predecessor.terminal();
+        if (!lineage || terminal.outcome !== "completed" || !aliasDigest) return;
+        const receipt: NativePredecessorRecord = {
+          assignmentId: id, sequence, requestDigest, bindingDigest, workspaceDigest, workspaceIdentityDigest: aliasDigest,
+          workspaceBirthDigest: journalDigest(claim.checkoutBirth.toString()), claimGeneration: claim.generation,
+          completedAt: terminal.at, nativeTerminal: lineage, originalJob: { state: "verified", activeProcesses: 0 },
+        };
+        assertPublicRecord(receipt, claim.predecessor.secrets);
+        ledger.nativePredecessor = receipt;
+      }
       ledger.workspace = { path: current.path, writerPid: null, qualified: false };
       const retained = (ledger.boundWorkspaceIntents ?? []).filter(id => id !== claim.intent.id);
       if (retained.length > 0) ledger.boundWorkspaceIntents = retained;

@@ -7,6 +7,9 @@ import { KEY_MARK, unfold } from "./secret-text.ts";
 import { PACKAGE_VERSION } from "./version.ts";
 import { StateError, assertPrivateDirectory, writePrivateFile } from "./fs-safety.ts";
 import { validCheckAttemptRecord, type CheckAttemptRecord } from "./check-attempt-record.ts";
+import type { AppServerTerminalLineage } from "./adapters/codex-app-server.ts";
+import { nativePredecessorId, record } from "./adapters/native-result.ts";
+import { matchesNativePredecessorJournal } from "./assignment-journal.ts";
 
 export type OsLabel = "early-linux-probe" | "unqualified-windows" | "unqualified-macos" | "unqualified-other";
 
@@ -66,6 +69,20 @@ export type WorkspaceRecord = {
   claimGeneration?: string;
 };
 
+export type NativePredecessorRecord = {
+  assignmentId: string;
+  sequence: number;
+  requestDigest: string;
+  bindingDigest: string;
+  workspaceDigest: string;
+  workspaceIdentityDigest: string;
+  workspaceBirthDigest: string;
+  claimGeneration: string;
+  completedAt: number;
+  nativeTerminal: AppServerTerminalLineage;
+  originalJob: { state: "verified"; activeProcesses: 0 };
+};
+
 export type BoardFeedCursorRecord = {
   board: string;
   binding: string;
@@ -79,6 +96,7 @@ export type Ledger = {
   tools: ToolRecord[];
   workspace: WorkspaceRecord | null;
   boundWorkspaceIntents?: string[];
+  nativePredecessor?: NativePredecessorRecord;
   checkAttempts?: CheckAttemptRecord[];
   boardFeedCursors?: BoardFeedCursorRecord[];
 };
@@ -160,6 +178,23 @@ function isWorkspace(value: unknown): value is WorkspaceRecord {
     && row.qualified === false;
 }
 
+function isNativePredecessor(value: unknown): value is NativePredecessorRecord {
+  const row = record(value);
+  if (!row) return false;
+  const digests = ["requestDigest", "bindingDigest", "workspaceDigest", "workspaceIdentityDigest", "workspaceBirthDigest"];
+  const keys = [...digests, "assignmentId", "sequence", "claimGeneration", "completedAt", "nativeTerminal", "originalJob"];
+  const terminal = record(row.nativeTerminal), job = record(row.originalJob);
+  return Object.keys(row).length === keys.length && keys.every(key => Object.hasOwn(row, key))
+    && digests.every(key => typeof row[key] === "string" && /^[a-f0-9]{64}$/.test(row[key]))
+    && typeof row.assignmentId === "string" && /^[a-f0-9]{32}$/.test(row.assignmentId)
+    && typeof row.sequence === "number" && Number.isSafeInteger(row.sequence) && row.sequence >= 1
+    && typeof row.claimGeneration === "string" && /^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/.test(row.claimGeneration)
+    && typeof row.completedAt === "number" && Number.isSafeInteger(row.completedAt) && row.completedAt >= 0
+    && terminal !== null && Object.keys(terminal).length === 4 && terminal.vendor === "codex" && terminal.interfaceId === "app-server"
+    && nativePredecessorId(terminal.threadId) && nativePredecessorId(terminal.turnId)
+    && job !== null && Object.keys(job).length === 2 && job.state === "verified" && Object.is(job.activeProcesses, 0);
+}
+
 function isBoardFeedCursor(value: unknown): value is BoardFeedCursorRecord {
   if (value === null || typeof value !== "object" || Array.isArray(value)) return false;
   const row = value as Record<string, unknown>;
@@ -211,7 +246,7 @@ export function parseLedger(text: string): Ledger | null {
   }
   if (parsed === null || typeof parsed !== "object") return null;
   const row = parsed as Record<string, unknown>;
-  const fields = ["version", "install", "connection", "tools", "workspace", "boundWorkspaceIntents", "checkAttempts", "boardFeedCursors"];
+  const fields = ["version", "install", "connection", "tools", "workspace", "boundWorkspaceIntents", "nativePredecessor", "checkAttempts", "boardFeedCursors"];
   if (row.version !== 1 || Object.keys(row).some(key => !fields.includes(key))) return null;
   const install = row.install;
   let installRecord: InstallRecord | null = null;
@@ -256,6 +291,9 @@ export function parseLedger(text: string): Ledger | null {
     || !boundWorkspaceIntents.every(id => typeof id === "string" && /^[a-f0-9]{32}$/.test(id))
     || new Set(boundWorkspaceIntents).size !== boundWorkspaceIntents.length)) return null;
   if (workspace?.claimGeneration !== undefined && boundWorkspaceIntents === undefined) return null;
+  const predecessor = row.nativePredecessor;
+  if (predecessor !== undefined && (!isNativePredecessor(predecessor) || workspace?.claimGeneration === predecessor.claimGeneration
+    || boundWorkspaceIntents?.includes(predecessor.assignmentId))) return null;
   try {
     assertPublicRecord(parsed, []);
   } catch {
@@ -268,6 +306,7 @@ export function parseLedger(text: string): Ledger | null {
     tools: row.tools,
     workspace,
     ...(boundWorkspaceIntents === undefined ? {} : { boundWorkspaceIntents }),
+    ...(predecessor === undefined ? {} : { nativePredecessor: predecessor }),
     ...(row.checkAttempts === undefined ? {} : { checkAttempts: row.checkAttempts }),
     ...(cursors === undefined ? {} : { boardFeedCursors: cursors }),
   };
@@ -305,6 +344,11 @@ export function loadLedger(stateDir: string): LoadResult {
   }
   const ledger = parseLedger(text);
   if (!ledger) return { ok: false, reason: "unreadable" };
+  try {
+    if (ledger.nativePredecessor && !matchesNativePredecessorJournal(stateDir, ledger.nativePredecessor)) return { ok: false, reason: "unreadable" };
+  } catch {
+    return { ok: false, reason: "unreadable" };
+  }
   origins.set(ledger, { path: resolve(stateDir), digest: fingerprint(text) });
   return { ok: true, ledger };
 }

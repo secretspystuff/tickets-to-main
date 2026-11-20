@@ -23,6 +23,10 @@ export function opaqueId(value: unknown): value is string {
   return typeof value === "string" && value.length > 0 && value.length <= 200 && !/[\u0000-\u001f]/.test(value);
 }
 
+export function nativePredecessorId(value: unknown): value is string {
+  return typeof value === "string" && /^[A-Za-z0-9_-]{1,200}$/.test(value) && safeNativeText(value, []) === value;
+}
+
 export function hasHeldSecret(value: string, secrets: readonly string[]): boolean {
   return secrets.some((secret) => secret.length > 0 && value.includes(secret));
 }

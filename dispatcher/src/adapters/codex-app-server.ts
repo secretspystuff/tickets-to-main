@@ -1,14 +1,17 @@
+import { AsyncLocalStorage } from "node:async_hooks";
 import { win32 } from "node:path";
 import { toolEnv } from "../command.ts";
-import { JsonLines, type NativeProcess, type NativeTransport } from "../native-transport.ts";
+import { attachOwnedNativeProcess, isOwnedNativeProcess, JsonLines, type NativeEvents, type NativeProcess, type NativeTransport,
+  type WindowsOwnedNativeProcess } from "../native-transport.ts";
 import type { AssignmentRequest } from "./contract.ts";
-import { copyObservation, hasHeldSecret, nativeObservation, opaqueId, record, safeNativeText, type NativeObservation, type NativeOutcome } from "./native-result.ts";
+import { copyObservation, hasHeldSecret, nativeObservation, nativePredecessorId, opaqueId, record, safeNativeText, type NativeObservation, type NativeOutcome } from "./native-result.ts";
 
 export const CODEX_APP_SERVER_SCHEMA_VERSION = "0.163.0";
 
 export type CodexAppServerLaunch = { executable: string; version: string };
+export type AppServerTerminalLineage = { vendor: "codex"; interfaceId: "app-server"; threadId: string; turnId: string };
 export type CodexAppServerObservation = NativeObservation & {
-  appServerTerminalLineage: { vendor: "codex"; interfaceId: "app-server"; threadId: string; turnId: string } | null;
+  appServerTerminalLineage: AppServerTerminalLineage | null;
   appServerCompactionEvidence: { threadId: string; turnId: string; itemId: string; state: "started" | "completed" } | null;
   appServerModelEvidence: {
     beforeTurn: { model: string | null; reasoningEffort: string | null } | null;
@@ -23,6 +26,28 @@ export type CodexAssignmentHandle = {
   closeInput(): void;
 };
 
+type RunIdentity = Pick<AssignmentRequest, "assignmentId" | "workspace" | "prompt">;
+const appServerUse = new AsyncLocalStorage<{ started: boolean }>();
+const appServerProcesses = new WeakSet<object>();
+const appServerRuns = new WeakMap<object, {
+  handle: CodexAssignmentHandle;
+  terminal(expected: RunIdentity, secrets: readonly string[]): AppServerTerminalLineage | null;
+}>();
+
+export function observeAppServerUse<T>(observation: { started: boolean }, operation: () => T): T {
+  return appServerUse.run(observation, operation);
+}
+
+export function isAppServerProcess(process: object): boolean {
+  return appServerProcesses.has(process);
+}
+
+export function observeOwnedAppServerTerminal(original: object, handle: CodexAssignmentHandle | null,
+  expected: RunIdentity, secrets: readonly string[]): AppServerTerminalLineage | null {
+  const run = appServerRuns.get(original);
+  return run?.handle === handle ? run.terminal(expected, secrets) : null;
+}
+
 const APPROVALS = new Set([
   "item/commandExecution/requestApproval", "item/fileChange/requestApproval", "item/permissions/requestApproval",
 ]);
@@ -35,11 +60,14 @@ function absoluteWindowsPath(value: string): boolean {
 
 export function startCodexAppServerAssignment(
   request: AssignmentRequest,
-  transport: NativeTransport,
+  transport: NativeTransport | WindowsOwnedNativeProcess,
   parentEnv: NodeJS.ProcessEnv,
   secrets: readonly string[],
   launch: CodexAppServerLaunch,
 ): CodexAssignmentHandle {
+  const use = appServerUse.getStore();
+  if (use) use.started = true;
+  request = { ...request };
   const state = nativeObservation("app-server");
   const modelEvidence: CodexAppServerObservation["appServerModelEvidence"] = { beforeTurn: null, reroute: null };
   let settle!: (value: CodexAppServerObservation) => void;
@@ -141,11 +169,16 @@ export function startCodexAppServerAssignment(
     if (request.effort !== null) params.effort = request.effort;
     send({ id: 3, method: "turn/start", params });
   }
-  function turnResult(result: Record<string, unknown>): void {
+  function matchingTurnId(result: Record<string, unknown>): string | null {
     const turn = record(result.turn);
     if (!turn || !safeId(turn.id) || !Array.isArray(turn.items) || turn.status !== "inProgress"
-      || (state.turnId !== null && turn.id !== state.turnId)) { invalid(); return; }
-    state.turnId = turn.id;
+      || (state.turnId !== null && turn.id !== state.turnId)) return null;
+    return turn.id;
+  }
+  function turnResult(result: Record<string, unknown>): void {
+    const turnId = matchingTurnId(result);
+    if (turnId === null) { invalid(); return; }
+    state.turnId = turnId;
     stage = "active";
     if (state.outcome === "starting") state.outcome = "running";
   }
@@ -235,6 +268,11 @@ export function startCodexAppServerAssignment(
         : msg.error === undefined && record(msg.result) ? "acknowledged" : "unconfirmed";
       return;
     }
+    if (msg.id === 3 && stage === "turn" && state.outcome === "completed") {
+      const result = record(msg.result);
+      if (msg.error === undefined && result && matchingTurnId(result) !== null) stage = "active";
+      return;
+    }
     if (state.outcome !== "starting" && state.outcome !== "running") return;
     if (msg.error !== undefined) {
       outcome("failed", "The native tool refused a request. Its specific cause is unknown.");
@@ -294,7 +332,7 @@ export function startCodexAppServerAssignment(
   state.argv = [launch.executable, "app-server"];
   state.requestedModel = request.model;
   state.requestedEffort = request.effort;
-  process = transport.start(state.argv, { cwd: request.workspace, env: toolEnv(parentEnv, secrets) }, {
+  const events: NativeEvents = {
     spawned() { state.spawned = true; initialize(); },
     stdout(chunk) { parser.push(chunk); },
     stderr() {},
@@ -309,7 +347,20 @@ export function startCodexAppServerAssignment(
       }
       close(snapshot());
     },
-  });
+  };
+  const owned = isOwnedNativeProcess(transport);
+  const options = { cwd: request.workspace, env: toolEnv(parentEnv, secrets) };
+  process = owned ? attachOwnedNativeProcess(transport, launch.executable, options, events) : transport.start(state.argv, options, events);
+  appServerProcesses.add(owned ? transport : process);
+  if (owned) {
+    appServerRuns.set(transport, { handle, terminal(expected, held) {
+      if (!connectionClosed || stage !== "active" || state.outcome !== "completed" || !terminalLineage || request.assignmentId !== expected.assignmentId
+        || request.workspace !== expected.workspace || request.prompt !== expected.prompt) return null;
+      return [terminalLineage.threadId, terminalLineage.turnId].every(value => nativePredecessorId(value)
+        && !expected.prompt.includes(value) && safeEvidenceText(value) && safeNativeText(value, held, expected.prompt) === value)
+        ? { ...terminalLineage } : null;
+    } });
+  }
   initialize();
   return handle;
 }
