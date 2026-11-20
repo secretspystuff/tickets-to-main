@@ -188,7 +188,8 @@ export async function runAssignment(input: AssignmentInput, directory = assignme
     const execution = { id: request.id, sequence: request.sequence, input: request.input, workspace: workspace.path };
     const observed: unknown = structuredClone(reserved.state === "pending"
       ? await input.adapter.reconcile({ id: request.id, sequence: request.sequence, requestDigest: reserved.intent.requestDigest })
-      : optedIn ? await observeAppServerUse(appServerUse, () => executePrepared?.(execution)) : await input.adapter.execute(execution));
+      : optedIn ? await observeAppServerUse(appServerUse, () => executePrepared?.(execution), nativeInterface ? ownedClaim : null)
+        : await input.adapter.execute(execution));
     if (!terminal(observed, request) || (await current(input, request, state, directory))?.identity !== workspace.identity) return outcome("held");
     completeAssignment(stateDir, reserved.intent, observed.result, input.now(), stateIsCurrent);
     if (ownedClaim && (nativeInterface || !appServerUse.started)) await releaseOwnedWorkspaceClaim(ownedClaim);

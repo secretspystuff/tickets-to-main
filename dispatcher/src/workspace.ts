@@ -20,7 +20,7 @@ type OwnedClaim = {
   intent: Intent;
   original: OriginalObserver;
   observe: OriginalObserver["observeOriginalGroup"];
-  predecessor: { terminal(): AppServerTerminalLineage | null; secrets: readonly string[] } | null;
+  predecessor: { terminal(authority: object): AppServerTerminalLineage | null; secrets: readonly string[] } | null;
 };
 const ownedClaims = new WeakMap<object, OwnedClaim>();
 
@@ -158,8 +158,8 @@ export function bindOwnedWorkspaceClaim(stateDir: string, prepared: Intent, orig
       const checkoutBirth = directoryBirthTime(checkout);
       ledger.workspace = { ...current, claimGeneration: generation };
       ledger.boundWorkspaceIntents = bindings;
-      const predecessor = source ? { secrets: source.secrets, terminal: () => observeOwnedAppServerTerminal(original,
-        source.readHandle(), { assignmentId: intent.id, workspace: checkout.path, prompt: source.prompt }, source.secrets) } : null;
+      const predecessor = source ? { secrets: source.secrets, terminal: (authority: object) => observeOwnedAppServerTerminal(original,
+        source.readHandle(), authority, { assignmentId: intent.id, workspace: checkout.path, prompt: source.prompt }, source.secrets) } : null;
       claim = { state, stateBirth, checkout, checkoutBirth, generation, intent, original, observe, predecessor };
     }, () => { committed = claim; });
   } catch { /* A failed lease release does not discard a persisted original binding. */ }
@@ -195,6 +195,8 @@ export async function releaseOwnedWorkspaceClaim(authority: object): Promise<{ s
   if (!claim) return { state: "held" };
   let committed = false;
   try {
+    // Resolve the external reader before taking the fresh Job sample and validating the current claim.
+    const lineage = claim.predecessor?.terminal(authority);
     const sample = await claim.observe();
     if (sample?.state !== "verified" || !Object.is(sample.activeProcesses, 0)) return { state: "held" };
     updateLedger(claim.state.path, [], ledger => {
@@ -205,7 +207,6 @@ export async function releaseOwnedWorkspaceClaim(authority: object): Promise<{ s
       if (!claim.predecessor && isAppServerProcess(claim.original)) return;
       if (claim.predecessor) {
         const { id, sequence, requestDigest, bindingDigest, workspaceDigest, aliasDigest } = claim.intent;
-        const lineage = claim.predecessor.terminal();
         if (!lineage || terminal.outcome !== "completed" || !aliasDigest) return;
         const receipt: NativePredecessorRecord = {
           assignmentId: id, sequence, requestDigest, bindingDigest, workspaceDigest, workspaceIdentityDigest: aliasDigest,

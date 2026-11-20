@@ -9,7 +9,7 @@ import { test, type TestContext } from "node:test";
 import { fileURLToPath } from "node:url";
 import { CODEX_APP_SERVER_SCHEMA_VERSION, startCodexAppServerAssignment, type CodexAssignmentHandle } from "../src/adapters/codex-app-server.ts";
 import type { NativeObservation } from "../src/adapters/native-result.ts";
-import { runAssignment, type AssignmentRequest } from "../src/assignment-boundary.ts";
+import { runAssignment, type AssignmentAdapter, type AssignmentRequest } from "../src/assignment-boundary.ts";
 import { journalDigest } from "../src/assignment-journal.ts";
 import { assignmentDirectory, directoryBirthTime } from "../src/directory-identity.ts";
 import { ensurePrivateDirectory } from "../src/fs-safety.ts";
@@ -252,7 +252,7 @@ function fixture(t: TestContext, scenario: Scenario, predecessor: PredecessorTer
         receiver = events;
         return child;
       } };
-      async function execute(assignment: Pick<AssignmentRequest, "id" | "sequence" | "input"> & { workspace: string }) {
+      const execute: AssignmentAdapter["execute"] = async assignment => {
         attach++;
         assert.equal(attach, 1);
         const handle = startCodexAppServerAssignment({ assignmentId: assignment.id, prompt: assignment.input,
@@ -283,8 +283,8 @@ function fixture(t: TestContext, scenario: Scenario, predecessor: PredecessorTer
           priorSample = afterClose;
           child.closeObservation();
         }
-        return { id: assignment.id, sequence: assignment.sequence, result: "completed" as const, writersContained: true };
-      }
+        return { id: assignment.id, sequence: assignment.sequence, result: "completed", writersContained: true };
+      };
       const earlier = scenario === "prestarted turn" ? await execute({ ...request, workspace }) : null;
       return {
         ...(predecessor !== "absent reader" && declaresAppServer && { nativePredecessor: { readHandle() {

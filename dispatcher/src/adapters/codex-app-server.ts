@@ -27,25 +27,26 @@ export type CodexAssignmentHandle = {
 };
 
 type RunIdentity = Pick<AssignmentRequest, "assignmentId" | "workspace" | "prompt">;
-const appServerUse = new AsyncLocalStorage<{ started: boolean }>();
+const appServerUse = new AsyncLocalStorage<{ observation: { started: boolean }; claim: object | null }>();
 const appServerProcesses = new WeakSet<object>();
 const appServerRuns = new WeakMap<object, {
   handle: CodexAssignmentHandle;
+  claim: object | null;
   terminal(expected: RunIdentity, secrets: readonly string[]): AppServerTerminalLineage | null;
 }>();
 
-export function observeAppServerUse<T>(observation: { started: boolean }, operation: () => T): T {
-  return appServerUse.run(observation, operation);
+export function observeAppServerUse<T>(observation: { started: boolean }, operation: () => T, claim: object | null = null): T {
+  return appServerUse.run({ observation, claim }, operation);
 }
 
 export function isAppServerProcess(process: object): boolean {
   return appServerProcesses.has(process);
 }
 
-export function observeOwnedAppServerTerminal(original: object, handle: CodexAssignmentHandle | null,
+export function observeOwnedAppServerTerminal(original: object, handle: CodexAssignmentHandle | null, claim: object,
   expected: RunIdentity, secrets: readonly string[]): AppServerTerminalLineage | null {
   const run = appServerRuns.get(original);
-  return run?.handle === handle ? run.terminal(expected, secrets) : null;
+  return run?.handle === handle && run.claim === claim ? run.terminal(expected, secrets) : null;
 }
 
 const APPROVALS = new Set([
@@ -66,7 +67,7 @@ export function startCodexAppServerAssignment(
   launch: CodexAppServerLaunch,
 ): CodexAssignmentHandle {
   const use = appServerUse.getStore();
-  if (use) use.started = true;
+  if (use) use.observation.started = true;
   request = { ...request };
   const state = nativeObservation("app-server");
   const modelEvidence: CodexAppServerObservation["appServerModelEvidence"] = { beforeTurn: null, reroute: null };
@@ -353,7 +354,7 @@ export function startCodexAppServerAssignment(
   process = owned ? attachOwnedNativeProcess(transport, launch.executable, options, events) : transport.start(state.argv, options, events);
   appServerProcesses.add(owned ? transport : process);
   if (owned) {
-    appServerRuns.set(transport, { handle, terminal(expected, held) {
+    appServerRuns.set(transport, { handle, claim: use?.claim ?? null, terminal(expected, held) {
       if (!connectionClosed || stage !== "active" || state.outcome !== "completed" || !terminalLineage || request.assignmentId !== expected.assignmentId
         || request.workspace !== expected.workspace || request.prompt !== expected.prompt) return null;
       return [terminalLineage.threadId, terminalLineage.turnId].every(value => nativePredecessorId(value)
