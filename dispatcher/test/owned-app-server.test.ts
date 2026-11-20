@@ -224,13 +224,11 @@ function fixture(t: TestContext, scenario: Scenario) {
           live = await child.observeOriginalGroup();
           handle.closeInput();
           finished = await bounded(handle.closed);
-          if (scenario === "interrupt") {
-            afterInterruptedClose = await child.observeOriginalGroup();
-            throw new Error("The app-server turn has no successful terminal result.");
-          }
-          drained = await child.observeOriginalGroup();
+          const afterClose = await child.observeOriginalGroup();
+          if (scenario === "interrupt") afterInterruptedClose = afterClose;
+          else drained = afterClose;
           if (finished.outcome !== "completed" || settled.outcome !== "completed" || settled.resultText !== answer || settled.threadId !== "fixture-thread"
-            || settled.turnId !== "fixture-turn" || drained.state !== "verified" || drained.activeProcesses !== 0) {
+            || settled.turnId !== "fixture-turn" || afterClose.state !== "verified" || afterClose.activeProcesses !== 0) {
             throw new Error("The original Job or app-server did not provide exact terminal evidence.");
           }
           if (scenario === "observer closed before release") child.closeObservation();
