@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto";
-import { withPrivateJournal } from "./private-journal.ts";
+import { readExistingPrivateJournalUnderLease, withPrivateJournal } from "./private-journal.ts";
 import { currentProcessOwner, validProcessBirth, type ProcessOwner } from "./process-identity.ts";
 
 export type Intent = {
@@ -75,6 +75,17 @@ function matching(left: Intent, right: Intent): boolean {
 function overlap(a: Intent, b: Intent): boolean {
   if (a.version === 4 && b.version === 4) return a.workspaceDigest === b.workspaceDigest || a.aliasDigest === b.aliasDigest;
   return a.version === b.version && a.workspaceDigest === b.workspaceDigest;
+}
+
+export function assignmentAllowsOwnedClaimUnderLease(stateDir: string, intent: Intent, phase: "prepared" | "terminal"): boolean {
+  const entries = readExistingPrivateJournalUnderLease(stateDir, "assignment-intents.jsonl", records);
+  const entry = entries.get(intent.id);
+  if (!entry || entry.intent.version !== 4 || intent.version !== 4 || !matching(entry.intent, intent)
+    || entry.intent.pid !== intent.pid || entry.intent.birth !== intent.birth || entry.intent.at !== intent.at) return false;
+  if (phase === "prepared") return !entry.started && entry.result === null;
+  return entry.started && (entry.result?.outcome === "completed" || entry.result?.outcome === "failed")
+    && ![...entries.values()].some(other => other !== entry && !other.result
+      && (other.intent.version !== 4 || overlap(other.intent, intent)));
 }
 
 export function reserveAssignment(stateDir: string, intent: Intent, legacyWorkspaceDigest: string, ownerAlive: (owner: ProcessOwner) => boolean): { state: "new" | "pending" | Result["outcome"]; intent: Intent } {

@@ -63,6 +63,7 @@ export type WorkspaceRecord = {
   path: string;
   writerPid: number | null;
   qualified: false;
+  claimGeneration?: string;
 };
 
 export type BoardFeedCursorRecord = {
@@ -153,6 +154,8 @@ function isWorkspace(value: unknown): value is WorkspaceRecord {
     && isAbsolute(row.path)
     && row.path.length <= 4096
     && pid
+    && (!Object.hasOwn(row, "claimGeneration") || (row.writerPid !== null && typeof row.claimGeneration === "string"
+      && /^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/.test(row.claimGeneration)))
     && row.qualified === false;
 }
 
