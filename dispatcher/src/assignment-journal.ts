@@ -77,17 +77,30 @@ function overlap(a: Intent, b: Intent): boolean {
   return a.version === b.version && a.workspaceDigest === b.workspaceDigest;
 }
 
-export function assignmentAllowsOwnedClaimUnderLease(stateDir: string, intent: Intent, phase: "prepared" | "terminal",
-  previousBinding?: string): boolean {
+function ownedAssignmentUnderLease(stateDir: string, intent: Intent): { entries: Map<string, Entry>; entry: Entry } | null {
   const entries = readExistingPrivateJournalUnderLease(stateDir, "assignment-intents.jsonl", records);
   const entry = entries.get(intent.id);
   if (!entry || entry.intent.version !== 4 || intent.version !== 4 || !matching(entry.intent, intent)
-    || entry.intent.pid !== intent.pid || entry.intent.birth !== intent.birth || entry.intent.at !== intent.at) return false;
-  if (phase === "prepared") {
-    const previous = previousBinding === undefined ? null : entries.get(previousBinding);
-    return !entry.started && entry.result === null
-      && (previous === null || (previous !== undefined && (previous.started || previous.result !== null)));
+    || entry.intent.pid !== intent.pid || entry.intent.birth !== intent.birth || entry.intent.at !== intent.at) return null;
+  return { entries, entry };
+}
+
+export function preparedOwnedBindingsUnderLease(stateDir: string, intent: Intent, previous: readonly string[]): string[] | null {
+  const history = ownedAssignmentUnderLease(stateDir, intent);
+  if (!history || history.entry.started || history.entry.result || previous.includes(intent.id)) return null;
+  const retained: string[] = [];
+  for (const id of previous) {
+    const bound = history.entries.get(id);
+    if (!bound) return null;
+    if (!bound.started && !bound.result) retained.push(id);
   }
+  return [...retained, intent.id];
+}
+
+export function hasOwnedTerminalUnderLease(stateDir: string, intent: Intent): boolean {
+  const history = ownedAssignmentUnderLease(stateDir, intent);
+  if (!history) return false;
+  const { entry, entries } = history;
   if (!entry.started || (entry.result?.outcome !== "completed" && entry.result?.outcome !== "failed")) return false;
   let later = false;
   for (const other of entries.values()) {

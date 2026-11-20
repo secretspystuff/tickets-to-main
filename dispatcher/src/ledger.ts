@@ -78,7 +78,7 @@ export type Ledger = {
   connection: ConnectionRecord | null;
   tools: ToolRecord[];
   workspace: WorkspaceRecord | null;
-  boundWorkspaceIntent?: string;
+  boundWorkspaceIntents?: string[];
   checkAttempts?: CheckAttemptRecord[];
   boardFeedCursors?: BoardFeedCursorRecord[];
 };
@@ -211,7 +211,7 @@ export function parseLedger(text: string): Ledger | null {
   }
   if (parsed === null || typeof parsed !== "object") return null;
   const row = parsed as Record<string, unknown>;
-  const fields = ["version", "install", "connection", "tools", "workspace", "boundWorkspaceIntent", "checkAttempts", "boardFeedCursors"];
+  const fields = ["version", "install", "connection", "tools", "workspace", "boundWorkspaceIntents", "checkAttempts", "boardFeedCursors"];
   if (row.version !== 1 || Object.keys(row).some(key => !fields.includes(key))) return null;
   const install = row.install;
   let installRecord: InstallRecord | null = null;
@@ -251,10 +251,11 @@ export function parseLedger(text: string): Ledger | null {
     if (!isWorkspace(row.workspace)) return null;
     workspace = row.workspace;
   }
-  const boundWorkspaceIntent = row.boundWorkspaceIntent;
-  if (boundWorkspaceIntent !== undefined && (typeof boundWorkspaceIntent !== "string"
-    || !/^[a-f0-9]{32}$/.test(boundWorkspaceIntent))) return null;
-  if (workspace?.claimGeneration !== undefined && boundWorkspaceIntent === undefined) return null;
+  const boundWorkspaceIntents = row.boundWorkspaceIntents;
+  if (boundWorkspaceIntents !== undefined && (!Array.isArray(boundWorkspaceIntents) || boundWorkspaceIntents.length === 0
+    || !boundWorkspaceIntents.every(id => typeof id === "string" && /^[a-f0-9]{32}$/.test(id))
+    || new Set(boundWorkspaceIntents).size !== boundWorkspaceIntents.length)) return null;
+  if (workspace?.claimGeneration !== undefined && boundWorkspaceIntents === undefined) return null;
   try {
     assertPublicRecord(parsed, []);
   } catch {
@@ -266,7 +267,7 @@ export function parseLedger(text: string): Ledger | null {
     connection: row.connection === null ? null : row.connection,
     tools: row.tools,
     workspace,
-    ...(boundWorkspaceIntent === undefined ? {} : { boundWorkspaceIntent }),
+    ...(boundWorkspaceIntents === undefined ? {} : { boundWorkspaceIntents }),
     ...(row.checkAttempts === undefined ? {} : { checkAttempts: row.checkAttempts }),
     ...(cursors === undefined ? {} : { boardFeedCursors: cursors }),
   };

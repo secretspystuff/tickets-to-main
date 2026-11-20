@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { lstatSync, realpathSync, rmdirSync } from "node:fs";
 import { isAbsolute, resolve, sep } from "node:path";
-import { assignmentAllowsOwnedClaimUnderLease, journalDigest, type Intent } from "./assignment-journal.ts";
+import { hasOwnedTerminalUnderLease, journalDigest, preparedOwnedBindingsUnderLease, type Intent } from "./assignment-journal.ts";
 import { assignmentDirectory, directoryBirthTime, type DirectoryIdentity } from "./directory-identity.ts";
 import { StateError, assertPrivateAccess, ensurePrivateDirectory } from "./fs-safety.ts";
 import { loadLedger, updateLedger, type Ledger } from "./ledger.ts";
@@ -127,6 +127,7 @@ export function releaseWorkspace(stateDir: string): string[] {
 }
 
 export function bindOwnedWorkspaceClaim(stateDir: string, prepared: Intent, original: OriginalObserver): object | null {
+  let committed: OwnedClaim | undefined;
   try {
     const intent = structuredClone(prepared);
     const owner = currentProcessOwner();
@@ -144,18 +145,19 @@ export function bindOwnedWorkspaceClaim(stateDir: string, prepared: Intent, orig
       assertCurrentWorkspace(state.path, current.path);
       const checkout = assignmentDirectory(current.path);
       if (checkout.path !== current.path || journalDigest(checkout.path) !== intent.workspaceDigest
-        || journalDigest(checkout.identity) !== intent.aliasDigest
-        || !assignmentAllowsOwnedClaimUnderLease(state.path, intent, "prepared", ledger.boundWorkspaceIntent)) return;
+        || journalDigest(checkout.identity) !== intent.aliasDigest) return;
+      const bindings = preparedOwnedBindingsUnderLease(state.path, intent, ledger.boundWorkspaceIntents ?? []);
+      if (!bindings) return;
       const checkoutBirth = directoryBirthTime(checkout);
       ledger.workspace = { ...current, claimGeneration: generation };
-      ledger.boundWorkspaceIntent = intent.id;
+      ledger.boundWorkspaceIntents = bindings;
       claim = { state, stateBirth, checkout, checkoutBirth, generation, intent, observe };
-    });
-    if (!claim) return null;
-    const authority = Object.freeze({});
-    ownedClaims.set(authority, claim);
-    return authority;
-  } catch { return null; }
+    }, () => { committed = claim; });
+  } catch { /* A failed lease release does not discard a persisted original binding. */ }
+  if (!committed) return null;
+  const authority = Object.freeze({});
+  ownedClaims.set(authority, committed);
+  return authority;
 }
 
 export async function releaseOwnedWorkspaceClaim(authority: object): Promise<{ state: "released" | "held" }> {
@@ -168,16 +170,19 @@ export async function releaseOwnedWorkspaceClaim(authority: object): Promise<{ s
     updateLedger(claim.state.path, [], ledger => {
       if (!ledger.install) throw new StateError("The recorded workspace is unavailable.");
       const current = ledger.workspace;
+      const bindings = ledger.boundWorkspaceIntents;
       if (!current || current.path !== claim.checkout.path || current.writerPid !== claim.intent.pid
-        || ledger.boundWorkspaceIntent !== claim.intent.id
+        || !bindings?.includes(claim.intent.id)
         || current.claimGeneration !== claim.generation || directoryBirthTime(claim.state) !== claim.stateBirth) return;
       assertCurrentWorkspace(claim.state.path, current.path);
       const checkout = assignmentDirectory(current.path);
       if (checkout.path !== claim.checkout.path || checkout.identity !== claim.checkout.identity
         || directoryBirthTime(checkout) !== claim.checkoutBirth
-        || !assignmentAllowsOwnedClaimUnderLease(claim.state.path, claim.intent, "terminal")) return;
+        || !hasOwnedTerminalUnderLease(claim.state.path, claim.intent)) return;
       ledger.workspace = { path: current.path, writerPid: null, qualified: false };
-      delete ledger.boundWorkspaceIntent;
+      const retained = bindings.filter(id => id !== claim.intent.id);
+      if (retained.length > 0) ledger.boundWorkspaceIntents = retained;
+      else delete ledger.boundWorkspaceIntents;
     }, () => { committed = true; });
   } catch { /* A failed lease release does not undo a persisted claim clear. */ }
   if (!committed) return { state: "held" };
