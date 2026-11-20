@@ -1,12 +1,13 @@
 import assert from "node:assert/strict";
 import { generateKeyPairSync, sign } from "node:crypto";
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { test } from "node:test";
 import { install } from "../src/install.ts";
+import { statusOf } from "../src/status.ts";
 import { io, removeDir, tempDir } from "./helpers.ts";
 import { run } from "../src/cli.ts";
-import { activeDirectory, digest, FILES, fixture, installFixture, rejectedUnchanged, snapshot } from "./release-test-fixtures.ts";
+import { active, activeDirectory, digest, FILES, fixture, installFixture, rejectedUnchanged, snapshot } from "./release-test-fixtures.ts";
 
 test("generated Ed25519 release verifies through the existing installer without platform qualification", () => {
   const dir = tempDir();
@@ -180,5 +181,89 @@ test("bare install cannot silently replace a selected release with the running b
     const context = io({ platform: "win32" });
     await run(["install", "--state", dir], context);
     assert.deepEqual(snapshot(dir), before);
+  } finally { removeDir(dir); }
+});
+
+test("status verifies the exact selected release with separate fixture trust", async () => {
+  const dir = tempDir();
+  try {
+    const sample = installFixture(dir, "0.4.2");
+    const before = snapshot(dir);
+    const status = await statusOf(dir, io().custody!, undefined, {
+      platform: sample.input.platform, arch: sample.input.arch, trust: sample.services.releaseTrust,
+    });
+    assert.deepEqual(snapshot(dir), before);
+    assert.deepEqual(status.releaseVerification, {
+      state: "verified",
+      version: sample.manifest.version,
+      manifestDigest: active(dir).manifestDigest,
+      sourceCommit: sample.manifest.provenance.sourceCommit,
+    });
+    assert.equal(status.exitCode, 0);
+    assert.ok(status.lines.includes("Selected release: 0.4.2 verified."));
+    assert.ok(status.lines.includes("Startup: unregistered."));
+    assert.ok(status.lines.includes("Signed installers: unqualified."));
+    assert.equal(status.readyForAssignment, false);
+  } finally { removeDir(dir); }
+});
+
+for (const problem of ["missing trust", "revoked trust", "changed content", "missing content", "wrong architecture"] as const) {
+  test("selected release preflight refuses " + problem + " without changing state", async () => {
+    const dir = tempDir();
+    try {
+      const sample = installFixture(dir);
+      const trust = sample.services.releaseTrust!;
+      const artifact = join(activeDirectory(dir), FILES[0]!.path);
+      if (problem === "changed content") {
+        const bytes = readFileSync(artifact);
+        bytes[0] = bytes[0]! ^ 1;
+        writeFileSync(artifact, bytes);
+      }
+      if (problem === "missing content") unlinkSync(artifact);
+      const before = snapshot(dir);
+      const status = await statusOf(dir, io().custody!, undefined, {
+        platform: sample.input.platform,
+        arch: problem === "wrong architecture" ? "arm64" : sample.input.arch,
+        trust: problem === "missing trust" ? undefined : problem === "revoked trust" ? {
+          ...trust, revokedKeyIds: [sample.manifest.keyId],
+        } : trust,
+      });
+      assert.deepEqual(snapshot(dir), before);
+      const unavailable = problem === "missing trust";
+      assert.deepEqual(status.releaseVerification, { state: unavailable ? "unavailable" : "refused" });
+      assert.equal(status.exitCode, 1);
+      assert.ok(status.lines.includes(unavailable ? "Selected release: verification unavailable." : "Selected release: verification refused."));
+      assert.equal(status.readyForAssignment, false);
+    } finally { removeDir(dir); }
+  });
+}
+
+test("release preflight preserves bootstrap and leaves existing callers unchanged", async () => {
+  const dir = tempDir();
+  try {
+    const sample = fixture(dir);
+    install(sample.input);
+    const before = snapshot(dir);
+    const custody = io().custody!;
+    const legacy = await statusOf(dir, custody);
+    const checked = await statusOf(dir, custody, undefined, {
+      platform: sample.input.platform, arch: sample.input.arch,
+    });
+    assert.deepEqual(snapshot(dir), before);
+    assert.equal(legacy.releaseVerification, undefined);
+    assert.equal(legacy.exitCode, 0);
+    assert.deepEqual(checked.releaseVerification, { state: "bootstrap" });
+    assert.equal(checked.exitCode, 0);
+    assert.ok(checked.lines.includes("Selected release: none (bootstrap)."));
+    assert.equal(checked.readyForAssignment, false);
+
+    installFixture(dir);
+    const selected = snapshot(dir);
+    const oldReader = await statusOf(dir, custody);
+    assert.equal(oldReader.releaseVerification, undefined);
+    assert.equal(oldReader.exitCode, 0);
+    assert.ok(oldReader.lines.includes("Health: local record ok"));
+    assert.equal(oldReader.readyForAssignment, false);
+    assert.deepEqual(snapshot(dir), selected);
   } finally { removeDir(dir); }
 });
