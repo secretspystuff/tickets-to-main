@@ -9,6 +9,7 @@ export const CODEX_APP_SERVER_SCHEMA_VERSION = "0.163.0";
 export type CodexAppServerLaunch = { executable: string; version: string };
 export type CodexAppServerObservation = NativeObservation & {
   appServerTerminalLineage: { vendor: "codex"; interfaceId: "app-server"; threadId: string; turnId: string } | null;
+  appServerCompactionEvidence: { threadId: string; turnId: string; itemId: string; state: "started" | "completed" } | null;
   appServerModelEvidence: {
     beforeTurn: { model: string | null; reasoningEffort: string | null } | null;
     reroute: { fromModel: string; toModel: string; reason: "highRiskCyberActivity" } | null;
@@ -53,6 +54,7 @@ export function startCodexAppServerAssignment(
   let stage: "initialize" | "thread" | "turn" | "active" = "initialize";
   let terminalObserved = false;
   let terminalLineage: CodexAppServerObservation["appServerTerminalLineage"] = null;
+  let compactionEvidence: CodexAppServerObservation["appServerCompactionEvidence"] = null;
   let interruptSent = false;
   const pending = new Set<number>();
   const helpers = new Map<string, string>();
@@ -62,6 +64,7 @@ export function startCodexAppServerAssignment(
     return {
       ...copyObservation(state),
       appServerTerminalLineage: terminalLineage && { ...terminalLineage },
+      appServerCompactionEvidence: compactionEvidence && { ...compactionEvidence },
       appServerModelEvidence: {
         beforeTurn: beforeTurn && { ...beforeTurn },
         reroute: reroute && { ...reroute },
@@ -150,6 +153,18 @@ export function startCodexAppServerAssignment(
     if (!sameContext(params)) { invalid(); return; }
     const value = record(params.item);
     if (!value || !safeId(value.id) || typeof value.type !== "string") { invalid(); return; }
+    if (value.type === "contextCompaction") {
+      const { threadId, turnId, outcome } = state;
+      if ((outcome !== "starting" && outcome !== "running") || threadId === null || turnId === null
+        || !Number.isSafeInteger(params[completed ? "completedAtMs" : "startedAtMs"])
+        || ![threadId, turnId, value.id].every(safeEvidenceText)) return;
+      if (!completed && compactionEvidence === null) {
+        compactionEvidence = { threadId, turnId, itemId: value.id, state: "started" };
+      } else if (completed && compactionEvidence?.state === "started" && compactionEvidence.itemId === value.id) {
+        compactionEvidence = { ...compactionEvidence, state: "completed" };
+      }
+      return;
+    }
     if (value.type === "agentMessage" && completed && (value.phase === undefined || value.phase === null || value.phase === "final_answer")) {
       if (typeof value.text !== "string") { invalid(); return; }
       state.resultText = safeNativeText(value.text, secrets, request.prompt);

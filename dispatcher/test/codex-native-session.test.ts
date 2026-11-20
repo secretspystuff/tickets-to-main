@@ -3,7 +3,7 @@ import { test } from "node:test";
 import { startCodexAppServerAssignment, runCodexCliAssignment } from "../src/adapters/codex.ts";
 import { applyHarnessEvidence, claimCovers, type AssignmentRequest } from "../src/adapters/contract.ts";
 import { documentedCodexClaim } from "../src/adapters/codex.ts";
-import { safeNativeText, type NativeObservation } from "../src/adapters/native-result.ts";
+import { safeNativeText } from "../src/adapters/native-result.ts";
 import { processNativeTransport, type NativeEvents, type NativeTransport } from "../src/native-transport.ts";
 import { CLI_RESULT, scriptedTransport } from "./native-fixtures.ts";
 
@@ -11,12 +11,13 @@ const REQUEST: AssignmentRequest = { assignmentId: "fixture", workspace: "C:\\fi
 const LAUNCH = { executable: "C:\\fixture\\codex.exe", version: "0.163.0" };
 const THREAD = "thread-1";
 const TURN = "turn-1";
+const COMPACTION = { threadId: THREAD, turnId: TURN, itemId: "compaction-1" };
 function emit(events: NativeEvents, value: unknown): void { events.stdout(`${JSON.stringify(value)}\n`); }
-function terminal(events: NativeEvents, status = "completed", turnId = TURN): void {
-  emit(events, { method: "turn/completed", params: { threadId: THREAD, turn: { id: turnId, status, items: [] } } });
+function terminal(events: NativeEvents, status = "completed", turnId = TURN, threadId = THREAD): void {
+  emit(events, { method: "turn/completed", params: { threadId, turn: { id: turnId, status, items: [] } } });
 }
-function message(events: NativeEvents, text = "Result.", turnId = TURN): void {
-  emit(events, { method: "item/completed", params: { threadId: THREAD, turnId, item: { id: "msg-1", type: "agentMessage", text } } });
+function message(events: NativeEvents, text = "Result.", turnId = TURN, threadId = THREAD): void {
+  emit(events, { method: "item/completed", params: { threadId, turnId, item: { id: "msg-1", type: "agentMessage", text } } });
 }
 function permission(events: NativeEvents, method = "item/commandExecution/requestApproval"): void {
   const context = { threadId: THREAD, turnId: TURN, itemId: "cmd-1", startedAtMs: 1 };
@@ -25,10 +26,17 @@ function permission(events: NativeEvents, method = "item/commandExecution/reques
     : context;
   emit(events, { id: 100, method, params });
 }
+function compaction(events: NativeEvents, phase: "started" | "completed", itemId = COMPACTION.itemId, fields: Record<string, unknown> = {}) {
+  emit(events, { method: `item/${phase}`, params: {
+    threadId: THREAD, turnId: TURN, item: { type: "contextCompaction", id: itemId },
+    [`${phase}AtMs`]: phase === "started" ? 100 : 200, ...fields,
+  } });
+}
 function server(
   turn: (events: NativeEvents) => void,
-  options: { observedModel?: string; reasoningEffort?: unknown; workspace?: string; threadId?: string;
-    startedBeforeReply?: boolean; interrupt?: (events: NativeEvents, id: number) => void } = {},
+  options: { observedModel?: string; reasoningEffort?: unknown; workspace?: string; threadId?: string; turnId?: string;
+    startedBeforeReply?: boolean; beforeTurnReply?: (events: NativeEvents) => void;
+    interrupt?: (events: NativeEvents, id: number) => void } = {},
 ) {
   return scriptedTransport((input, events) => {
     const msg = JSON.parse(input) as { id?: number; method: string };
@@ -39,8 +47,10 @@ function server(
       approvalPolicy: "on-request", approvalsReviewer: "user", sandbox: { type: "workspaceWrite" },
     } });
     if (msg.method === "turn/start") {
-      if (options.startedBeforeReply) emit(events, { method: "turn/started", params: { threadId: THREAD, turn: { id: TURN, items: [], status: "inProgress" } } });
-      emit(events, { id: msg.id, result: { turn: { id: TURN, items: [], status: "inProgress" } } });
+      const turnResult = { id: options.turnId ?? TURN, items: [], status: "inProgress" };
+      if (options.startedBeforeReply) emit(events, { method: "turn/started", params: { threadId: options.threadId ?? THREAD, turn: turnResult } });
+      options.beforeTurnReply?.(events);
+      emit(events, { id: msg.id, result: { turn: turnResult } });
       turn(events);
     }
     if (msg.method === "turn/interrupt") {
@@ -49,7 +59,7 @@ function server(
     }
   });
 }
-async function finish(transport: NativeTransport, request = REQUEST, secrets: readonly string[] = []): Promise<NativeObservation> {
+async function finish(transport: NativeTransport, request = REQUEST, secrets: readonly string[] = []) {
   const handle = startCodexAppServerAssignment(request, transport, {}, secrets, LAUNCH);
   await handle.settled;
   handle.closeInput();
@@ -73,6 +83,149 @@ test("app-server uses native configuration, correlated fresh context and no pers
   assert.deepEqual(sent[2].params, { cwd: REQUEST.workspace });
   assert.deepEqual(sent[3].params, { threadId: THREAD, input: [{ type: "text", text: REQUEST.prompt }] });
   assert.equal(result.observed.helperCompletion, undefined);
+});
+
+test("app-server observes the first exact in-turn compaction pair without settling the assignment", async () => {
+  let resolveTurn!: (events: NativeEvents) => void;
+  const turn = new Promise<NativeEvents>(resolve => { resolveTurn = resolve; });
+  const transport = server(resolveTurn);
+  const handle = startCodexAppServerAssignment(REQUEST, transport, {}, [], LAUNCH);
+  const native = await turn;
+  const before = handle.snapshot();
+  assert.equal(before.appServerCompactionEvidence, null);
+  compaction(native, "completed");
+  compaction(native, "started", COMPACTION.itemId, { startedAtMs: undefined });
+  assert.equal(handle.snapshot().appServerCompactionEvidence, null);
+
+  compaction(native, "started");
+  const started = handle.snapshot();
+  assert.deepEqual(started.appServerCompactionEvidence, { ...COMPACTION, state: "started" });
+  compaction(native, "started", "another-compaction");
+  compaction(native, "completed", "another-compaction");
+  compaction(native, "completed", COMPACTION.itemId, { completedAtMs: 1.5 });
+  assert.deepEqual(handle.snapshot().appServerCompactionEvidence, started.appServerCompactionEvidence);
+  assert.equal(handle.snapshot().outcome, "running");
+
+  compaction(native, "completed");
+  const completed = { ...COMPACTION, state: "completed" };
+  assert.deepEqual(handle.snapshot().appServerCompactionEvidence, completed);
+  assert.deepEqual(started.appServerCompactionEvidence, { ...COMPACTION, state: "started" });
+  compaction(native, "started");
+  compaction(native, "completed");
+  assert.deepEqual(handle.snapshot().appServerCompactionEvidence, completed);
+  assert.equal(handle.snapshot().outcome, "running");
+  assert.equal(handle.snapshot().appServerTerminalLineage, null);
+  assert.deepEqual(handle.snapshot().observed, before.observed);
+
+  terminal(native);
+  const settled = await handle.settled;
+  handle.closeInput();
+  const closed = await handle.closed;
+  for (const observation of [settled, closed]) {
+    assert.equal(observation.outcome, "protocol-error");
+    assert.equal(observation.resultText, null);
+    assert.equal(observation.writerState, "unknown");
+    assert.equal(observation.appServerTerminalLineage, null);
+    assert.deepEqual(observation.appServerCompactionEvidence, completed);
+  }
+  assert.deepEqual(transport.calls[0]!.input.map((line) => JSON.parse(line).method),
+    ["initialize", "initialized", "thread/start", "turn/start"]);
+});
+
+test("app-server refuses compaction evidence from a different thread or turn", async t => {
+  for (const [name, fields] of [["thread", { threadId: "other-thread" }], ["turn", { turnId: "older-turn" }]] as const) {
+    await t.test(name, async () => {
+      const transport = server(events => {
+        compaction(events, "started");
+        compaction(events, "completed", COMPACTION.itemId, fields);
+      });
+      const result = await finish(transport);
+      assert.equal(result.outcome, "protocol-error");
+      assert.equal(result.writerState, "unknown");
+      assert.deepEqual(result.appServerCompactionEvidence, { ...COMPACTION, state: "started" });
+    });
+  }
+});
+
+test("app-server compaction evidence requires a correlated turn and safe item ID", async t => {
+  for (const startedBeforeReply of [false, true]) {
+    await t.test(startedBeforeReply ? "announced before the reply" : "turn identity not established", async () => {
+      const result = await finish(server(events => { compaction(events, "completed"); message(events); terminal(events); }, {
+        startedBeforeReply, beforeTurnReply: events => compaction(events, "started"),
+      }));
+      assert.equal(result.outcome, startedBeforeReply ? "completed" : "protocol-error");
+      assert.deepEqual(result.appServerCompactionEvidence, startedBeforeReply ? { ...COMPACTION, state: "completed" } : null);
+    });
+  }
+  await t.test("reserved held value", async () => {
+    const held = "fabricated-held-compaction-id";
+    const result = await finish(server(events => compaction(events, "started", held)), REQUEST, [held]);
+    assert.equal(result.outcome, "protocol-error");
+    assert.equal(result.appServerCompactionEvidence, null);
+    assert.equal(JSON.stringify(result).includes(held), false);
+  });
+  await t.test("assignment text echoed as an item ID", async () => {
+    const result = await finish(server(events => {
+      compaction(events, "started", REQUEST.prompt);
+      compaction(events, "completed", REQUEST.prompt);
+      message(events);
+      terminal(events);
+    }));
+    assert.equal(result.outcome, "completed");
+    assert.equal(result.appServerCompactionEvidence, null);
+    assert.equal(JSON.stringify(result).includes(REQUEST.prompt), false);
+  });
+  for (const field of ["threadId", "turnId"] as const) {
+    await t.test(`assignment text echoed as ${field}`, async () => {
+      const context = { threadId: THREAD, turnId: TURN, [field]: REQUEST.prompt };
+      const result = await finish(server(events => {
+        compaction(events, "started", COMPACTION.itemId, context);
+        compaction(events, "completed", COMPACTION.itemId, context);
+        message(events, "Result.", context.turnId, context.threadId);
+        terminal(events, "completed", context.turnId, context.threadId);
+      }, context));
+      assert.equal(result.outcome, "completed");
+      assert.equal(result.resultText, "Result.");
+      assert.equal(result.appServerCompactionEvidence, null);
+    });
+  }
+});
+
+test("app-server compaction evidence stops advancing on terminal or held assignments", async t => {
+  for (const outcome of ["completed", "held", "interrupted"] as const) {
+    await t.test(outcome, async () => {
+      let resolveTurn!: (events: NativeEvents) => void;
+      const turn = new Promise<NativeEvents>(resolve => { resolveTurn = resolve; });
+      const transport = server(resolveTurn);
+      const handle = startCodexAppServerAssignment(REQUEST, transport, {}, [], LAUNCH);
+      const native = await turn;
+      if (outcome === "completed") { compaction(native, "started"); message(native); terminal(native); }
+      if (outcome === "held") permission(native);
+      if (outcome === "interrupted") assert.equal(handle.interrupt(), true);
+      const settled = await handle.settled;
+      const expected = outcome === "completed" ? { ...COMPACTION, state: "started" } : null;
+      assert.equal(settled.outcome, outcome);
+      assert.deepEqual(settled.appServerCompactionEvidence, expected);
+      compaction(native, "started");
+      compaction(native, "completed");
+      assert.deepEqual(handle.snapshot(), settled);
+      handle.closeInput();
+      const closed = await handle.closed;
+      assert.deepEqual(closed, settled);
+      assert.equal(closed.writerState, "unknown");
+      assert.equal(closed.interruptRequest, outcome === "interrupted" ? "acknowledged" : "not-requested");
+      assert.equal(closed.approvalAnswered, false);
+    });
+  }
+});
+
+test("a refused app-server workspace has no compaction evidence or turn input", async () => {
+  const transport = server(() => assert.fail("a foreign workspace must receive no assignment"), { workspace: "C:\\unexpected-workspace" });
+  const result = await finish(transport);
+  assert.equal(result.outcome, "refused");
+  assert.equal(result.appServerCompactionEvidence, null);
+  assert.deepEqual(transport.calls[0]!.input.map((line) => JSON.parse(line).method),
+    ["initialize", "initialized", "thread/start"]);
 });
 
 test("model and effort preserve exact native values without permission or auth overrides", async () => {
