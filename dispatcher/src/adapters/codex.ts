@@ -75,7 +75,8 @@ export async function runCodexCliAssignment(
     state.reason = request.model !== null ? "Model selection is unknown on Codex cli." : "Effort selection is unknown on Codex cli.";
     return state;
   }
-  if ([request.prompt, request.workspace, request.assignmentId, executable].some((part) => hasHeldSecret(part, secrets) || safeNativeText(part, secrets) !== part)) {
+  const prompt = request.prompt;
+  if ([prompt, request.workspace, request.assignmentId, executable].some((part) => hasHeldSecret(part, secrets) || safeNativeText(part, secrets) !== part)) {
     state.outcome = "refused";
     state.reason = "The assignment includes a Dispatcher secret or credential. It was not sent.";
     return state;
@@ -104,7 +105,7 @@ export async function runCodexCliAssignment(
       if (!item || !opaqueId(item.id) || typeof item.type !== "string") { invalid(); return; }
       if (msg.type === "item.completed" && item.type === "agent_message") {
         if (typeof item.text !== "string") { invalid(); return; }
-        state.resultText = safeNativeText(item.text, secrets, request.prompt);
+        state.resultText = safeNativeText(item.text, secrets, prompt);
       }
     } else if (msg.type === "turn.completed") {
       if (!started || terminal || state.resultText === null || state.outcome !== "running") { invalid(); return; }
@@ -124,7 +125,7 @@ export async function runCodexCliAssignment(
     function sendInput(): void {
       if (!child || !state.spawned || inputStarted || connectionClosed || state.outcome !== "starting") return;
       inputStarted = true;
-      if (!child.write(request.prompt)) {
+      if (!child.write(prompt)) {
         state.outcome = "disconnected";
         state.reason = "Native input is unavailable. Writer completion is unknown.";
       }
