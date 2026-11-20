@@ -1,14 +1,16 @@
 import assert from "node:assert/strict";
-import { spawn } from "node:child_process";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { spawn, spawnSync } from "node:child_process";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { basename, dirname, join } from "node:path";
 import { setTimeout as pause } from "node:timers/promises";
 import { fileURLToPath } from "node:url";
 import { test, type TestContext } from "node:test";
+import { processBirth } from "../src/process-identity.ts";
 import { processAlive } from "../src/workspace.ts";
 
 const repo = realpathSync(fileURLToPath(new URL("../../", import.meta.url)));
 const controller = fileURLToPath(new URL("./windows-owned-handoff.fixture.ts", import.meta.url));
+const controllerProbe = new URL("./windows-owned-handoff-probe.fixture.ts", import.meta.url).href;
 const recovery = fileURLToPath(new URL("./windows-job-recovery.fixture.ts", import.meta.url));
 const platform = { skip: process.platform !== "win32", timeout: 40_000 };
 const unqualified = { qualification: "unqualified-harness", publishable: false };
@@ -46,9 +48,11 @@ function fixture(t: TestContext) {
     return observed;
   };
   const peers = new Set<ReturnType<typeof launch>>();
+  const observedChildren = new Set<number>();
 
-  function launch(file: string, args: string[], input?: string) {
-    const child = spawn(realpathSync(process.execPath), ["--experimental-strip-types", file, ...args], {
+  function launch(file: string, args: string[], input?: string, probe = false) {
+    const options = probe ? ["--import", controllerProbe] : [];
+    const child = spawn(realpathSync(process.execPath), ["--experimental-strip-types", ...options, file, ...args], {
       cwd: root, env: { SystemRoot: process.env.SystemRoot, TEMP: tmp, TMP: tmp },
       shell: false, windowsHide: true, stdio: ["pipe", "pipe", "ignore"],
     });
@@ -75,8 +79,12 @@ function fixture(t: TestContext) {
     abort();
     try {
       await bounded(Promise.allSettled([...peers].map(peer => peer.result)), "Fabricated peer did not close after abort.");
-      const tracked = ["writer-pid", "reader-pid", "broker-pid"].filter(name => existsSync(marker(name))).map(pid);
-      await until(() => tracked.every(processId => !processAlive(processId)), "Owned fixture process did not exit.");
+      const probedBrokers = readdirSync(control).filter(name => /^native-broker-[1-9][0-9]*$/.test(name))
+        .map(name => JSON.parse(readFileSync(marker(name), "utf8")).pid as number);
+      const tracked = new Set([...observedChildren, ...probedBrokers,
+        ...["writer-pid", "reader-pid", "broker-pid"].filter(name => existsSync(marker(name))).map(pid)]);
+      for (const processId of tracked) assert.ok(Number.isSafeInteger(processId) && processId > 0 && processId !== process.pid);
+      await until(() => [...tracked].every(processId => !processAlive(processId)), "Owned fixture process did not exit.");
     } catch (error) {
       for (const { child } of peers) {
         child.stdin.destroy();
@@ -91,7 +99,11 @@ function fixture(t: TestContext) {
 
   return {
     workspace, signal, marker, pid, abort, snapshot: () => files.map(file => readFileSync(file)) as [Buffer, Buffer],
-    start: () => launch(controller, ["controller", root, String(process.pid)]),
+    start: (probe = false) => launch(controller, ["controller", root, String(process.pid)], undefined,
+      probe || existsSync(marker("owned-admission"))),
+    trackChild: (child: number) => observedChildren.add(child),
+    readProbe: (name: string) => JSON.parse(readFileSync(marker(name), "utf8")),
+    nativeRecords: (kind: "launch" | "input") => readdirSync(control).filter(name => new RegExp(`^native-${kind}-[1-9][0-9]*$`).test(name)).sort(),
     async replay(next: boolean) {
       const peer = launch(recovery, ["recover", root, String(process.pid), "loss-origin"],
         JSON.stringify({ next, authorized: true, observation: null }));
@@ -104,6 +116,25 @@ function fixture(t: TestContext) {
 }
 
 type Fixture = ReturnType<typeof fixture>;
+
+function onlyBrokerReader(broker: number): number {
+  assert.ok(Number.isSafeInteger(broker) && broker > 0);
+  const system = process.env.SystemRoot;
+  assert.ok(system);
+  const shell = join(system, "System32", "WindowsPowerShell", "v1.0", "powershell.exe");
+  const result = spawnSync(shell, ["-NoLogo", "-NoProfile", "-NonInteractive", "-Command",
+    `$ErrorActionPreference='Stop'; Get-CimInstance -ClassName Win32_Process -Filter "ParentProcessId = ${broker}" -Property ProcessId,Name | ForEach-Object { "$($_.ProcessId):$($_.Name)" }`],
+  { encoding: "utf8", shell: false, windowsHide: true, env: { SystemRoot: system } });
+  assert.equal(result.status, 0, "The fixture could not observe the broker's own direct child.");
+  const executable = basename(process.execPath).toLowerCase();
+  const rows = result.stdout.trim().split(/\r?\n/).filter(row => row.split(":")[1]?.toLowerCase() === executable);
+  assert.equal(rows.length, 1);
+  const [pid] = rows[0]!.split(":");
+  assert.match(pid ?? "", /^[1-9][0-9]*$/);
+  const reader = Number(pid);
+  assert.ok(Number.isSafeInteger(reader) && reader !== broker);
+  return reader;
+}
 
 async function atRootClose(f: Fixture, initial: ReturnType<Fixture["start"]>, owned = false) {
   await until(() => {
@@ -150,8 +181,16 @@ async function finishWriter(f: Fixture, writer: number) {
 }
 
 test("the owned launcher retains a live late writer at root close and completes only after original Job drain", platform, async t => {
-  const f = fixture(t), initial = f.start();
-  const { before, writer, intent } = await atRootClose(f, initial);
+  const f = fixture(t), initial = f.start(true);
+  const { before, writer, broker, intent } = await atRootClose(f, initial);
+  assert.deepEqual(f.nativeRecords("launch"), ["native-launch-1"]);
+  assert.deepEqual(f.readProbe("native-broker-1"), { pid: broker });
+  assert.equal(f.readProbe("native-verified-1"), true);
+  assert.deepEqual(f.nativeRecords("input"), ["native-input-1"]);
+  const legacyInput = f.readProbe("native-input-1");
+  assert.equal(legacyInput.broker, broker);
+  assert.equal(legacyInput.permitted, false);
+  assert.deepEqual(legacyInput.rows, before[0].toString().trimEnd().split("\n").map(line => JSON.parse(line)));
   assert.deepEqual(await f.replay(false), { result: { state: "held", ...unqualified }, effects: 0, reconciliations: 0, readDigest: null });
   assert.deepEqual(f.snapshot(), before);
   await finishWriter(f, writer);
@@ -219,6 +258,18 @@ test("the opted-in controller retains one Job from suspended preparation through
   assert.equal(prepared.pid, initial.child.pid);
   assert.deepEqual(rest, []);
   assert.deepEqual(JSON.parse(preparedLedger.toString()).workspace, { path: f.workspace, writerPid: initial.child.pid, qualified: false });
+  assert.equal(f.readProbe("native-probe-open"), true);
+  assert.deepEqual(f.nativeRecords("launch"), ["native-launch-1"]);
+  assert.deepEqual(f.readProbe("native-launch-1"), { broker: true });
+  assert.equal(f.readProbe("native-verified-1"), true);
+  const originalBroker = f.readProbe("native-broker-1").pid as number;
+  assert.equal(processAlive(originalBroker), true);
+  const originalReader = onlyBrokerReader(originalBroker);
+  f.trackChild(originalReader);
+  const brokerBirth = processBirth(originalBroker), readerBirth = processBirth(originalReader);
+  assert.ok(brokerBirth && readerBirth && BigInt(readerBirth.slice(6)) >= BigInt(brokerBirth.slice(6)));
+  assert.equal(existsSync(f.marker("native-resume-1")), false);
+  assert.deepEqual(f.nativeRecords("input"), []);
   assert.equal(existsSync(f.marker("writer-pid")), false);
   assert.equal(existsSync(join(f.workspace, "received.bin")), false);
   writeFileSync(join(f.workspace, "work.txt"), "fabricated pre-existing work\n", { flag: "wx" });
@@ -237,13 +288,22 @@ test("the opted-in controller retains one Job from suspended preparation through
     claimGeneration: bound.workspace.claimGeneration });
   assert.deepEqual(bound.boundWorkspaceIntents, [prepared.id]);
   assert.equal(existsSync(f.marker("writer-pid")), false);
-  const originalBroker = f.pid("broker-pid");
+  assert.equal(f.pid("broker-pid"), originalBroker);
+  assert.equal(f.pid("reader-pid"), originalReader);
+  assert.equal(processBirth(originalBroker), brokerBirth);
+  assert.equal(processBirth(originalReader), readerBirth);
+  const expectedNativeWrite = { broker: originalBroker, permitted: true, rows: [prepared, started],
+    workspace: bound.workspace, bindings: [prepared.id] };
+  assert.deepEqual(f.readProbe("native-resume-1"), expectedNativeWrite);
+  assert.deepEqual(f.nativeRecords("input"), []);
   f.signal("allow-owned-input");
 
   const { before, writer, broker, intent } = await atRootClose(f, initial, true);
   assert.deepEqual(intent, prepared);
   assert.equal(broker, originalBroker);
   assert.deepEqual(before, [startedBytes, startedLedger]);
+  assert.deepEqual(f.nativeRecords("input"), ["native-input-1"]);
+  assert.deepEqual(f.readProbe("native-input-1"), expectedNativeWrite);
   assert.deepEqual(await f.replay(false), { result: { state: "held", ...unqualified }, effects: 0, reconciliations: 0, readDigest: null });
   assert.deepEqual(f.snapshot(), before);
   await finishWriter(f, writer);
@@ -258,6 +318,8 @@ test("the opted-in controller retains one Job from suspended preparation through
   assert.equal(readFileSync(f.marker("drain-receipt"), "utf8"), "original-job-active=0");
   assert.equal(f.pid("broker-pid"), broker);
   assert.equal(processAlive(broker), true);
+  assert.equal(processBirth(broker), brokerBirth);
+  assert.deepEqual(f.nativeRecords("launch"), ["native-launch-1"]);
   const result = { kind: "result", id: intent.id, sequence: 1, requestDigest: intent.requestDigest, at: 1000, outcome: "completed" };
   const terminal = Buffer.concat([before[0], Buffer.from(JSON.stringify(result) + "\n")]);
   assert.deepEqual(f.snapshot(), [terminal, before[1]]);
@@ -275,6 +337,8 @@ test("the opted-in controller retains one Job from suspended preparation through
   const after = f.snapshot();
   assert.deepEqual(after[0], terminal);
   assert.deepEqual(JSON.parse(after[1].toString()), expectedLedger);
+  assert.deepEqual(f.nativeRecords("launch"), ["native-launch-1"]);
+  assert.deepEqual(f.nativeRecords("input"), ["native-input-1"]);
   assert.deepEqual(await f.replay(false), { result: { state: "completed", ...unqualified }, effects: 0, reconciliations: 0, readDigest: null });
   assert.deepEqual(f.snapshot(), after);
   assert.equal(readFileSync(join(f.workspace, "work.txt"), "utf8"), "fabricated pre-existing work\n");
@@ -286,12 +350,16 @@ test("the opted-in controller cannot fall back to a legacy launch when owned pre
   f.signal("refuse-owned-preparation");
   const initial = f.start();
   await until(() => {
+    assert.deepEqual(f.nativeRecords("launch"), [], "Refused owned preparation made a native launch attempt.");
     assert.equal(existsSync(f.marker("reader-pid")), false, "Refused owned preparation fell through to the legacy reader.");
     return initial.child.exitCode !== null;
   }, "The controller did not produce its owned preparation refusal.");
   const ended = await bounded(initial.result, "Controller did not settle after owned preparation was refused.");
   assert.deepEqual({ code: ended.code, signal: ended.signal }, { code: 0, signal: null });
   assert.deepEqual(JSON.parse(ended.output), { state: "not-started", ...unqualified });
+  assert.equal(f.readProbe("native-probe-open"), true);
+  assert.deepEqual(f.nativeRecords("launch"), []);
+  assert.deepEqual(f.nativeRecords("input"), []);
   const after = f.snapshot();
   const [intent, result, ...rest] = after[0].toString().trimEnd().split("\n").map(line => JSON.parse(line));
   assert.equal(intent.kind, "intent");
