@@ -9,14 +9,14 @@ import { loadLedger, updateLedger, type BoardFeedCursorRecord, type Ledger } fro
 type BoardFeedContext = Readonly<{ board: string; binding: string; session: string }>;
 type Replay = ReturnType<typeof createBoardFeedReplay>;
 type ReplayEvent = Parameters<typeof stepBoardFeedReplay>[1];
-type CursorEvent = ReplayEvent | (Extract<ReplayEvent, { kind: "snapshot-applied" }> & { response: string; capture: object });
+type CursorEvent = ReplayEvent | (Extract<ReplayEvent, { requestId: string | number }> & { capture: object; response?: string });
 type ReplayStep = ReturnType<typeof stepBoardFeedReplay>;
 type UnavailableCursor = { kind: "missing" | "invalid" | "scope-mismatch" };
 type CursorLookup = { kind: "matched"; record: BoardFeedCursorRecord } | UnavailableCursor;
 type RestoredCursor = { kind: "loaded"; replay: Replay } | UnavailableCursor;
 type CursorStep = { kind: "stepped"; step: ReplayStep } | { kind: "held" };
 type Recovery = { epoch: string; current: Replay; selection: RecoverySelection; resumeSnapshot: boolean;
-  pendingCapture?: ReplayStep["actions"][number]; heldValues: string[] };
+  pendingRead?: ReplayStep["actions"][number]; heldValues: string[] };
 type Origin = { stateDir: string; binding: string; recovery?: Recovery };
 
 const origins = new WeakMap<Replay, Origin>();
@@ -88,12 +88,16 @@ export function stepBoardFeedCursor(stateDir: string, current: BoardFeedContext,
   if (cursor.kind !== "matched" || cursor.record.handled !== replay.cursor || cursor.record.recoveryEpoch !== recovery?.epoch) return { kind: "held" };
   if (cursor.record.recoveryRequired && !replay.snapshotRequired) return { kind: "held" };
 
+  if (recovery && "requestId" in event) {
+    const kind = event.kind === "snapshot-applied" || event.kind === "snapshot-read-failed" ? "read-snapshot" : "read-changes";
+    if (!("capture" in event) || !recovery.pendingRead || event.capture !== recovery.pendingRead
+      || replay.pending?.kind !== kind || replay.pending.requestId !== event.requestId
+      || event.scope.board !== current.board || event.scope.session !== current.session) return { kind: "held" };
+  }
   let snapshot: RecoverySnapshot | null = null;
   if (event.kind === "snapshot-applied") {
-    if (!recovery || !("response" in event) || !recovery.pendingCapture || event.capture !== recovery.pendingCapture
-      || !replay.snapshotRequired || replay.terminal
-      || event.scope.board !== current.board || event.scope.session !== current.session
-      || replay.pending?.kind !== "read-snapshot" || replay.pending.requestId !== event.requestId) return { kind: "held" };
+    if (!recovery || !("response" in event) || typeof event.response !== "string"
+      || !replay.snapshotRequired || replay.terminal) return { kind: "held" };
     snapshot = readRecoverySnapshot(event.response, current.board, recovery.selection);
     if (!snapshot || snapshot.next !== event.next) return { kind: "held" };
   }
@@ -103,8 +107,8 @@ export function stepBoardFeedCursor(stateDir: string, current: BoardFeedContext,
       || event.kind === "signal" && step.state.announcedSequence > replay.announcedSequence)) {
     step = stepBoardFeedReplay(step.state, { kind: "wake", scope: event.scope });
   }
-  const capture = step.actions.find(action => action.kind === "read-snapshot");
-  const markRequired = recovery !== undefined && capture !== undefined && !cursor.record.recoveryRequired;
+  const issued = step.actions[0];
+  const markRequired = recovery !== undefined && issued?.kind === "read-snapshot" && !cursor.record.recoveryRequired;
   if (markRequired || snapshot || step.state.cursor !== replay.cursor) {
     const nextEpoch = snapshot ? epoch() : recovery?.epoch;
     try {
@@ -126,11 +130,11 @@ export function stepBoardFeedCursor(stateDir: string, current: BoardFeedContext,
     }
   }
   if (recovery) {
-    if (capture) {
-      recovery.pendingCapture = capture;
+    if (issued) {
+      recovery.pendingRead = issued;
       recovery.resumeSnapshot = false;
-    } else if (step.state.pending?.kind !== "read-snapshot") {
-      delete recovery.pendingCapture;
+    } else if (!step.state.pending) {
+      delete recovery.pendingRead;
     }
     recovery.current = step.state;
   }
