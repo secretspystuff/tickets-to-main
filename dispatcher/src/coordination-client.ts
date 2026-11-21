@@ -37,7 +37,7 @@ type Hello = {
 type Activation = { repo: ExplicitRepoReference } & (
   { active: true; board_id: string; activation_id: string } | { active: false; board_id: null; activation_id: null }
 );
-type ReadContext = { bearer: string; signal: AbortSignal; credentialEpoch: object | null };
+type ReadContext = { bearer: string; signal: AbortSignal; order: number; credentialEpoch: object | null };
 type SelectionEntry = { repo: ExplicitRepoReference; activation_id: string };
 type Observation = {
   reader: object; board: string; credentialEpoch: object; entry: SelectionEntry; current: () => boolean;
@@ -126,16 +126,17 @@ export function createCoordinationReads({ boardId, getDeviceBearer, send = globa
 }) {
   const endpoint = isOpaqueId(boardId) ? `${ENDPOINT}?board=${boardId}` : null;
   const latestListing = new Map<string, object>(), latestIdentity = new Map<string, object>();
-  let started = 0, latestLookup = 0, epochStart = 0;
-  let credentialDigest: string | null = null, credentialEpoch = {};
+  let started = 0, latestLookup = 0, epochStart = 0, lastRefusal = 0;
+  let credentialDigest: string | null | undefined, credentialEpoch = {};
 
   function observeCredential(order: number, bearer: string | null): object | null {
     const digest = bearer && createHash("sha256").update(bearer).digest("hex");
+    // Credential lookups may finish out of order, including across a key rotation.
     if (order < epochStart || (order < latestLookup && digest !== credentialDigest)) return null;
     if (digest !== credentialDigest) {
+      epochStart = credentialDigest === undefined ? 0 : order;
       credentialDigest = digest;
       credentialEpoch = {};
-      epochStart = order;
     }
     latestLookup = Math.max(order, latestLookup);
     return digest ? credentialEpoch : null;
@@ -159,11 +160,9 @@ export function createCoordinationReads({ boardId, getDeviceBearer, send = globa
           return failure("credential_unavailable");
         }
         const observed = observeCredential(order, bearer);
-        const result = await read({ bearer, signal, credentialEpoch: observed });
+        const result = await read({ bearer, signal, order, credentialEpoch: observed });
         if (!result.ok && result.code === "unauthorized" && observed === credentialEpoch) {
-          credentialDigest = null;
-          credentialEpoch = {};
-          epochStart = latestLookup;
+          lastRefusal = Math.max(lastRefusal, order);
         }
         return result;
       });
@@ -245,6 +244,7 @@ export function createCoordinationReads({ boardId, getDeviceBearer, send = globa
       } catch {
         return fail(null);
       }
+      if (signal?.aborted) return failure("cancelled");
       const { board_repo_id: listing, identity_id: identity } = selected;
       const attempt = {};
       latestListing.set(listing, attempt);
@@ -260,10 +260,11 @@ export function createCoordinationReads({ boardId, getDeviceBearer, send = globa
         if (body.active === false) return { ok: true, body: { repo: selected, active: false, board_id: null, activation_id: null } };
         if (body.board_id !== boardId || !isOpaqueId(body.activation_id)) return failure("invalid_response");
         const result = { ok: true, body: { repo: selected, active: true, board_id: boardId, activation_id: body.activation_id } } as const;
-        const observed = context.credentialEpoch;
+        const { credentialEpoch: observed, order } = context;
+        // The caller owns the returned object, so retain a separate copy of the observed identity.
         if (observed && latest() && observed === credentialEpoch) activeReads.set(result, {
           reader, board: boardId, credentialEpoch: observed, entry: { repo: structuredClone(selected), activation_id: body.activation_id },
-          current: () => observed === credentialEpoch && latest(),
+          current: () => observed === credentialEpoch && order > lastRefusal && latest(),
         });
         return result;
       }, signal);
