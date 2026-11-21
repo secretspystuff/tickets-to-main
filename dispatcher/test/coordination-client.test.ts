@@ -1,7 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { createCoordinationReads } from "../src/coordination-client.ts";
-import * as coordination from "../src/coordination-client.ts";
+import { createCoordinationReads, matchesObservedActivations } from "../src/coordination-client.ts";
 import { readRecoverySelection } from "../src/board-feed-recovery.ts";
 
 const protocol = "tickets-to-main.coordination";
@@ -81,10 +80,6 @@ const unsupported = {
 
 test("a parsed recovery selection matches only the original active observations from one device reader", async () => {
   type Selection = NonNullable<ReturnType<typeof readRecoverySelection>>;
-  type Match = (reader: ReturnType<typeof createCoordinationReads>, boardId: string, selection: Selection, observations: readonly unknown[]) => boolean;
-  const matcher = (coordination as unknown as { matchesObservedActivations?: Match }).matchesObservedActivations;
-  assert.equal(typeof matcher, "function");
-  if (!matcher) throw new Error("The observed activation matcher is missing");
   let device = bearer;
   let available = true;
   let generation = activeBody.activation_id;
@@ -99,7 +94,8 @@ test("a parsed recovery selection matches only the original active observations 
   };
   const local = harness(reply, { getDeviceBearer: async () => device });
   const elsewhere = harness(reply);
-  const match = (boardId: string, selected: Selection, observations: readonly unknown[]) => matcher(local.client, boardId, selected, observations);
+  const match = (boardId: string, selected: Selection, observations: readonly unknown[]) =>
+    matchesObservedActivations(local.client, boardId, selected, observations);
   const observed = [await local.client.activation(repo), await local.client.activation(second)];
   const selection = readRecoverySelection(JSON.stringify({ version: 1, selection: [
     { repo, activation_id: activeBody.activation_id }, { repo: second, activation_id: secondGeneration },
@@ -172,9 +168,7 @@ test("a late active observation cannot revive a repo after a newer inactive repl
   finish();
   const late = await earlier;
   assert.ok(late.ok && late.body.active);
-  const match = Reflect.get(coordination, "matchesObservedActivations");
-  assert.equal(typeof match, "function");
-  assert.equal(match(local.client, board, [{ repo, activation_id: activeBody.activation_id }], [late]), false);
+  assert.equal(matchesObservedActivations(local.client, board, [{ repo, activation_id: activeBody.activation_id }], [late]), false);
 });
 
 function refused(result: unknown, code: string, then = "stop"): void {

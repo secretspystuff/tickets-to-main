@@ -31,6 +31,8 @@ Recovery requires current device approval, board access and active repo generati
 
 The local cursor API accepts the serialized v1 request when restoring a recovery-enabled replay. Supply the current selection again on restart. Keep each issued read action with its callback and pass that action as `capture` on success or failure. For a snapshot, pass the serialized response as `response`. The ledger saves the scoped graph and its cursor together before emitting the next changes read. A pending recovery survives restart. The local API performs no network I/O.
 
+To check a proposed selection before requesting recovery, pass the reader, concrete board, parsed v1 selection and original activation results to `matchesObservedActivations`. It checks that the same reader observed each listed generation under one credential, in the order supplied. A later read can supersede an observation. The check is local. Enrollment evidence and the device's recovery response are still required to establish a first checkpoint.
+
 ## Check
 
 ```sh
