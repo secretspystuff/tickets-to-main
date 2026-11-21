@@ -1,0 +1,42 @@
+{
+  "version": 1,
+  "board": "fabricated-board",
+  "selection": [
+    {
+      "repo": {
+        "board_repo_id": "fabricated-repo",
+        "identity_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "locator": null
+      },
+      "activation_id": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+    }
+  ],
+  "graph_revision": 12,
+  "next": 42,
+  "tickets": [
+    {
+      "id": "cccccccccccccccccccccccccccccccc",
+      "repo_id": "fabricated-repo",
+      "status": "open",
+      "handoff": "draft",
+      "handoff_seq": 40,
+      "last_seq": 41,
+      "fast_track": false,
+      "manual_order": 1,
+      "relationships": {
+        "revision": 12,
+        "parent": null,
+        "children": [],
+        "closed_direct": 0,
+        "direct_total": 0,
+        "depends_on": [],
+        "blocks": [],
+        "dependencies_satisfied": true,
+        "related": [],
+        "duplicate_of": { "excluded": false, "canonical": null },
+        "batch": null,
+        "eligibility": { "ready": false, "eligible": false }
+      }
+    }
+  ]
+}

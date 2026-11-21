@@ -19,6 +19,16 @@ This tree is Apache-2.0. It loads the included public coordination protocol, its
 
 The CLI does not sign an installer, register startup, open a live Tickets Please connection, admit work, start a coding session, or claim a supported Windows or macOS release. The workspace claim is a local writer record, not a separate user or container. A test keychain is unqualified and is used only when the test switch is set. The stub adapter is not offered.
 
+## Recovering a board change feed
+
+When `GET /api/changes?board=<board>&since=<cursor>` returns 410, recover the board's current Open graph before resuming the feed. Send `POST /api/ttm/recovery?board=<board>` with the enrolled device's bearer in the Authorization header and a UTF-8 JSON body. Use one explicit board and the current selections from `repo.activation.read`. Each entry contains the board repo ID, its explicit identity and canonical locator (or null), and its active generation. The selection must be nonempty, with unique repo and identity IDs. The body limit is 65,536 bytes.
+
+A successful response repeats the selection and returns the selected Open tickets, their scoped relationships, the graph revision and the matching changes cursor in `next`. An empty ticket list is a valid snapshot. A link outside the selection can be represented by a link ID and `unavailable: true`. Reconcile the snapshot with locally retained work, then continue the same board's changes feed from `next`. A subsequent 410 requires a fresh recovery. See the fabricated [request](../src/lib/ttm-protocol/feed-recovery/request.json) and [response](../src/lib/ttm-protocol/feed-recovery/response.json).
+
+Keep the saved cursor after a refused or incomplete recovery. Correct an invalid request before retrying a 400. Stop after a 403 and check the device's board access and selected activation generations. On a 429, wait for `Retry-After`. A 503 with `recovery_unavailable` allows a retry.
+
+Recovery requires current device approval, board access and active repo generations. Browser sessions and ordinary agent or MCP credentials cannot perform this read. A successful capture grants no execution authority. This section describes the HTTP contract for Dispatcher implementations.
+
 ## Check
 
 ```sh

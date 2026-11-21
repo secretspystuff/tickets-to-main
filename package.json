@@ -31,6 +31,7 @@
     "dispatcher/LICENSE",
     "src/lib/ttm-protocol.ts",
     "src/lib/ttm-protocol/manifest.json",
-    "src/lib/ttm-protocol/fixtures/"
+    "src/lib/ttm-protocol/fixtures/",
+    "src/lib/ttm-protocol/feed-recovery/"
   ]
 }

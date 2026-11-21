@@ -1,0 +1,13 @@
+{
+  "version": 1,
+  "selection": [
+    {
+      "repo": {
+        "board_repo_id": "fabricated-repo",
+        "identity_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "locator": null
+      },
+      "activation_id": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+    }
+  ]
+}
