@@ -92,44 +92,55 @@ test("owned NativeTransport delivers only admitted bytes and retains the real Jo
   assert.deepEqual(readFileSync(ledger), claimed);
 });
 
-test("original exit fences an unfinished input write while the same Job still holds the pipe", platform, async t => {
-  const { cwd, env } = space(t);
-  const ready = deferred<void>(), closed = deferred<NativeExit>();
-  const events: string[] = [];
-  let output = "";
-  const launcher = await windowsProcessLauncher().start(
-    [realpathSync(process.execPath), fileURLToPath(new URL("./windows-owned-input.fixture.mjs", import.meta.url)), "parent"], { cwd, env }, {
-      spawned() {}, stderr() {},
-      stdout(chunk) { output += chunk; if (output.includes("reader-ready\n")) ready.resolve(); },
-      inputError() { events.push("input-error"); },
-      closed(result) { events.push("closed"); closed.resolve(result); },
-    });
-  assert.ok(launcher);
-  const finish = (name: string) => writeFileSync(join(cwd, name), "");
-  try {
-    assert.ok(await launcher.verify());
-    assert.equal(await launcher.activate(), true);
-    assert.equal(await Promise.race([ready.promise, closed.promise]), undefined);
-    assert.deepEqual(await launcher.observe(), { job: launcher.originalJob, activeProcesses: 2, complete: true });
-    assert.equal(launcher.pipe.write("a".repeat(32768)), true);
-    launcher.pipe.endInput();
-    finish("finish-parent");
-    assert.deepEqual(await closed.promise, clean);
-    assert.deepEqual(events, ["input-error", "closed"]);
-    assert.deepEqual(await launcher.observe(), { job: launcher.originalJob, activeProcesses: 1, complete: true });
-    finish("finish-reader");
-    const deadline = Date.now() + 8000;
-    let group = await launcher.observe();
-    while (group?.activeProcesses === 1 && Date.now() < deadline) {
-      await pause(10);
-      group = await launcher.observe();
+for (const mode of ["parent", "drain"] as const) {
+  test(`original exit fences unfinished input while a Job member can ${mode === "drain" ? "drain it later" : "hold its pipe open"}`, platform, async t => {
+    const { cwd, env } = space(t);
+    const ready = deferred<void>(), closed = deferred<NativeExit>();
+    const events: string[] = [];
+    let output = "";
+    const launcher = await windowsProcessLauncher().start(
+      [realpathSync(process.execPath), fileURLToPath(new URL("./windows-owned-input.fixture.mjs", import.meta.url)), mode], { cwd, env }, {
+        spawned() {}, stderr() {},
+        stdout(chunk) { output += chunk; if (output.includes("reader-ready\n")) ready.resolve(); },
+        inputError() { events.push("input-error"); },
+        closed(result) { events.push("closed"); closed.resolve(result); },
+      });
+    assert.ok(launcher);
+    const finish = (name: string) => writeFileSync(join(cwd, name), "");
+    async function expectCount(count: number) {
+      const deadline = Date.now() + 8000;
+      let group = await launcher!.observe();
+      while (group && group.activeProcesses !== count && Date.now() < deadline) {
+        await pause(10);
+        group = await launcher!.observe();
+      }
+      assert.deepEqual(group, { job: launcher!.originalJob, activeProcesses: count, complete: true });
     }
-    assert.deepEqual(group, { job: launcher.originalJob, activeProcesses: 0, complete: true });
-    assert.deepEqual(events, ["input-error", "closed"]);
-  } finally {
-    finish("finish-parent");
-    finish("finish-reader");
-    launcher.pipe.endInput();
-    launcher.closeObservation?.();
-  }
-});
+    try {
+      assert.ok(await launcher.verify());
+      assert.equal(await launcher.activate(), true);
+      assert.equal(await Promise.race([ready.promise, closed.promise]), undefined);
+      await expectCount(2);
+      assert.equal(launcher.pipe.write("a".repeat(32768)), true);
+      launcher.pipe.endInput();
+      finish("finish-parent");
+      await expectCount(1);
+      if (mode === "drain") {
+        assert.deepEqual(events, []);
+        finish("finish-reader");
+      }
+      assert.deepEqual(await closed.promise, clean);
+      assert.deepEqual(events, ["input-error", "closed"]);
+      if (mode === "drain") assert.match(output, /reader-drained=32768\n/);
+      else await expectCount(1);
+      finish("finish-reader");
+      await expectCount(0);
+      assert.deepEqual(events, ["input-error", "closed"]);
+    } finally {
+      finish("finish-parent");
+      finish("finish-reader");
+      launcher.pipe.endInput();
+      launcher.closeObservation?.();
+    }
+  });
+}
