@@ -43,6 +43,7 @@ test("the public surface imports no private app code and isolates network access
   const processUsers = combined.filter((path) => readFileSync(path, "utf8").includes("node:child_process"));
   assert.deepEqual(processUsers.map((path) => basename(path)).sort(), ["command.ts", "custody.ts", "native-transport.ts", "process-identity.ts", "windows-privacy-worker.ts", "windows-privacy.ts"]);
   assert.deepEqual(outside.sort((a, b) => a[0].localeCompare(b[0])), [
+    ["board-feed-recovery.ts", "../../src/lib/ttm-protocol.ts"],
     ["check-attempt.ts", "../../src/lib/ttm-protocol.ts"],
     ["coordination-client.ts", "../../src/lib/ttm-protocol.ts"],
     ["coordination.ts", "../../src/lib/ttm-protocol.ts"],

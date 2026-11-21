@@ -1,15 +1,13 @@
 import { createHash } from "node:crypto";
-import { hasCredentialShape } from "./secret-text.ts";
+import { scanCredentialText } from "./secret-text.ts";
 
 const MAX_ENTRIES = 128;
 const MAX_ENTRY_BYTES = 1024 * 1024;
 const MAX_TOTAL_BYTES = 4 * MAX_ENTRY_BYTES;
 const MAX_NAME_BYTES = 512;
 const MAX_SECRET_BYTES = 4096;
-const MAX_DECODE_PASSES = 8;
 const SHA256 = /^[a-f0-9]{64}$/;
 const OPAQUE_CONTROLS = /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f-\u009f]/;
-const PERCENT_CHARACTER = /%(?:[cd][0-9a-f]%[89ab][0-9a-f]|e[0-9a-f](?:%[89ab][0-9a-f]){2}|f[0-4](?:%[89ab][0-9a-f]){3}|[0-9a-f]{2})/gi;
 const decoder = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true });
 const typedByteLength = Object.getOwnPropertyDescriptor(Object.getPrototypeOf(Uint8Array.prototype), "byteLength")!.get!;
 
@@ -103,24 +101,6 @@ function expectedEntries(input: readonly unknown[]): { plan: Map<string, Expecta
   return { plan, complete };
 }
 
-function scanText(input: string, secrets: readonly string[]): State {
-  const rawState = OPAQUE_CONTROLS.test(input) ? "held" : "clear";
-  let text = input;
-  for (let depth = 0; ; depth++) {
-    if (secrets.some(secret => text.includes(secret)) || hasCredentialShape(text)) return "stopped";
-    const decoded = text.replace(PERCENT_CHARACTER, encoded => {
-      try { return decodeURIComponent(encoded); }
-      catch {
-        // A lone surrogate separates malformed escapes without matching verified UTF-8 or held values.
-        return "\ud800";
-      }
-    });
-    if (decoded === text) return rawState;
-    if (depth === MAX_DECODE_PASSES) return "held";
-    text = decoded;
-  }
-}
-
 function verifiedText(expected: Expectation | undefined, supplied: unknown): string | null {
   try {
     if (!expected || !ArrayBuffer.isView(supplied) || !(supplied instanceof Uint8Array)
@@ -152,7 +132,7 @@ function check(input: unknown): State {
       incomplete = true;
       continue;
     }
-    const nameState = scanText(item.name, scanSecrets);
+    const nameState = scanCredentialText(item.name, scanSecrets);
     if (nameState === "stopped") return "stopped";
     if (nameState === "held" || seen.has(item.name)) incomplete = true;
     seen.add(item.name);
@@ -163,7 +143,7 @@ function check(input: unknown): State {
       continue;
     }
     verified.add(item.name);
-    const contentState = scanText(content, scanSecrets);
+    const contentState = scanCredentialText(content, scanSecrets);
     if (contentState === "stopped") return "stopped";
     if (contentState === "held") incomplete = true;
   }

@@ -68,3 +68,28 @@ export function unfold(value: string): string | null {
   }
   return current.includes("%") ? null : current;
 }
+
+const OPAQUE_CONTROLS = /[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f-\u009f]/;
+const PERCENT_CHARACTER = /%(?:[cd][0-9a-f]%[89ab][0-9a-f]|e[0-9a-f](?:%[89ab][0-9a-f]){2}|f[0-4](?:%[89ab][0-9a-f]){3}|[0-9a-f]{2})/gi;
+
+export function decodeTextEscapes(text: string): string {
+  return text.replace(PERCENT_CHARACTER, encoded => {
+    try { return decodeURIComponent(encoded); }
+    catch {
+      // Keep malformed bytes separate from valid text in every decoded view.
+      return "\ud800";
+    }
+  });
+}
+
+export function scanCredentialText(input: string, secrets: readonly string[]): "clear" | "held" | "stopped" {
+  const rawState = OPAQUE_CONTROLS.test(input) ? "held" : "clear";
+  let text = input;
+  for (let depth = 0; ; depth++) {
+    if (secrets.some(secret => text.includes(secret)) || hasCredentialShape(text)) return "stopped";
+    const decoded = decodeTextEscapes(text);
+    if (decoded === text) return rawState;
+    if (depth === DECODE_LIMIT) return "held";
+    text = decoded;
+  }
+}

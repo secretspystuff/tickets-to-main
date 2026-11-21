@@ -29,6 +29,8 @@ Keep the saved cursor after a refused or incomplete recovery. Correct an invalid
 
 Recovery requires current device approval, board access and active repo generations. Browser sessions and ordinary agent or MCP credentials cannot perform this read. A successful capture grants no execution authority. This section describes the HTTP contract for Dispatcher implementations.
 
+The local cursor API accepts the serialized v1 request when restoring a recovery-enabled replay. Supply the current selection again on restart. Keep each issued read action with its callback and pass that action as `capture` on success or failure. For a snapshot, pass the serialized response as `response`. The ledger saves the scoped graph and its cursor together before emitting the next changes read. A pending recovery survives restart. The local API performs no network I/O.
+
 ## Check
 
 ```sh
