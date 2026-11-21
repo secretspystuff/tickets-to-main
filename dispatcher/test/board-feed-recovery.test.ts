@@ -19,7 +19,7 @@ const other = { board: "fabricated-other-board", binding: "other-binding", handl
 type Context = typeof current;
 type Replay = Extract<ReturnType<typeof restoreBoardFeedCursor>, { kind: "loaded" }>["replay"];
 type Event = Parameters<typeof stepBoardFeedCursor>[3];
-type Completion = Extract<Event, { kind: "snapshot-applied" }> & { response: string };
+type Completion = Extract<Event, { kind: "snapshot-applied" }> & { response: string; capture: object };
 const restore: (dir: string, context: Context, request: string, heldValues?: string[]) => ReturnType<typeof restoreBoardFeedCursor> = restoreBoardFeedCursor;
 
 function start(dir: string, at = 91) {
@@ -35,18 +35,21 @@ function gap(dir: string, context = current, selected = request, heldValues?: st
   const hi = stepBoardFeedCursor(dir, context, restored.replay, { kind: "hi", scope, seq: 92 });
   assert.equal(hi.kind, "stepped");
   const changes = hi.step.actions[0];
+  if (changes?.kind === "read-snapshot") {
+    return { state: hi.step.state, scope, requestId: changes.requestId, capture: changes };
+  }
   assert.equal(changes?.kind, "read-changes");
   const tooOld = stepBoardFeedCursor(dir, context, hi.step.state, { kind: "changes-too-old", scope, requestId: changes.requestId });
   assert.equal(tooOld.kind, "stepped");
   const snapshot = tooOld.step.actions[0];
   assert.equal(snapshot?.kind, "read-snapshot");
-  return { state: tooOld.step.state, scope, requestId: snapshot.requestId };
+  return { state: tooOld.step.state, scope, requestId: snapshot.requestId, capture: snapshot };
 }
 
 function apply(dir: string, read: ReturnType<typeof gap>, response = reference, context = current, state: Replay = read.state,
   next = response.next, body = JSON.stringify(response)) {
   const event: Completion = { kind: "snapshot-applied", scope: read.scope, requestId: read.requestId,
-    next, response: body };
+    next, response: body, capture: read.capture };
   return stepBoardFeedCursor(dir, context, state, event);
 }
 
@@ -84,6 +87,7 @@ test("current capture accepts an empty graph at an unchanged cursor but not a la
   const dir = tempDir();
   try {
     start(dir, reference.next);
+    gap(dir);
     const old = gap(dir);
     const replacement = JSON.parse(request);
     replacement.selection[0].activation_id = "d".repeat(32);
@@ -118,17 +122,10 @@ test("a changed selection keeps its previous baseline until the fresh 410 captur
     const read = stepBoardFeedCursor(dir, current, opened.replay, { kind: "wake", scope });
     assert.equal(read.kind, "stepped");
     const action = read.step.actions[0];
-    assert.ok(action?.kind === "read-changes");
-    assert.deepEqual(stepBoardFeedCursor(dir, current, read.step.state, {
-      kind: "changes-applied", scope, requestId: action.requestId, next: reference.next + 1, more: false,
-    }), { kind: "held" });
+    assert.ok(action?.kind === "read-snapshot");
     assert.deepEqual(saved(dir).recoverySnapshot, reference);
-    const follow = stepBoardFeedCursor(dir, current, read.step.state, { kind: "changes-too-old", scope, requestId: action.requestId });
-    assert.equal(follow.kind, "stepped");
-    const pending = follow.step.actions[0];
-    assert.ok(pending?.kind === "read-snapshot");
     const fresh = { ...reference, next: reference.next + 1, selection: changed.selection };
-    assert.equal(apply(dir, { state: follow.step.state, scope, requestId: pending.requestId }, fresh).kind, "stepped");
+    assert.equal(apply(dir, { state: read.step.state, scope, requestId: action.requestId, capture: action }, fresh).kind, "stepped");
     assert.deepEqual(saved(dir).recoverySnapshot, fresh);
   } finally { removeDir(dir); }
 });
@@ -195,7 +192,7 @@ test("a retried read cannot consume the previous response or lose its own matchi
     const before = readFileSync(ledgerPath(dir));
     assert.deepEqual(apply(dir, old), { kind: "held" });
     assert.deepEqual(readFileSync(ledgerPath(dir)), before);
-    assert.equal(apply(dir, { ...old, state: retry.step.state, requestId: action.requestId }).kind, "stepped");
+    assert.equal(apply(dir, { ...old, state: retry.step.state, requestId: action.requestId, capture: action }).kind, "stepped");
     assert.deepEqual(saved(dir).recoverySnapshot, reference);
   } finally { removeDir(dir); }
 });
@@ -257,7 +254,7 @@ test("after process interruption the reopened ledger contains exactly one comple
         };
         syncBuiltinESMExports();
         stepBoardFeedCursor(dir, current, gap.step.state, { kind: "snapshot-applied", scope,
-          requestId: gap.step.actions[0].requestId, next: JSON.parse(response).next, response });
+          requestId: gap.step.actions[0].requestId, capture: gap.step.actions[0], next: JSON.parse(response).next, response });
         process.exit(74);
       `, [dir, phase, JSON.stringify(current), request, JSON.stringify(reference)]);
       assert.equal(run.status, 73, run.stderr);
@@ -274,4 +271,39 @@ test("after process interruption the reopened ledger contains exactly one comple
       assert.deepEqual(JSON.parse(reopen.stdout), { ...expected, retained: ["5".repeat(32)], other });
     } finally { removeDir(dir); }
   });
+});
+
+test("a restarted process reads a fresh snapshot after the 410 was observed locally", () => {
+  const dir = tempDir();
+  try {
+    start(dir);
+    gap(dir);
+    const result = runChild(`
+      import { restoreBoardFeedCursor, stepBoardFeedCursor } from ${JSON.stringify(cursorModule)};
+      const [dir, context, request] = process.argv.slice(1), current = JSON.parse(context);
+      const replay = restoreBoardFeedCursor(dir, current, request).replay;
+      const scope = { board: current.board, session: current.session };
+      const hi = stepBoardFeedCursor(dir, current, replay, { kind: "hi", scope, seq: 94 });
+      process.stdout.write(JSON.stringify(hi.step.actions.map(action => action.kind)));
+    `, [dir, JSON.stringify({ ...current, session: "fresh-process" }), request]);
+    assert.equal(result.status, 0, result.stderr);
+    assert.deepEqual(JSON.parse(result.stdout), ["read-snapshot"]);
+    assert.equal(saved(dir).handled, 91);
+  } finally { removeDir(dir); }
+});
+
+test("the original capture distinguishes matching numeric request IDs on a newer current replay", () => {
+  const dir = tempDir();
+  try {
+    start(dir);
+    gap(dir);
+    const earlier = gap(dir), latest = gap(dir);
+    assert.equal(earlier.requestId, latest.requestId);
+    const before = readFileSync(ledgerPath(dir));
+    assert.deepEqual(apply(dir, earlier, reference, current, latest.state), { kind: "held" });
+    assert.deepEqual(readFileSync(ledgerPath(dir)), before);
+    const fresh = { ...reference, next: reference.next + 1 };
+    assert.equal(apply(dir, latest, fresh).kind, "stepped");
+    assert.deepEqual(saved(dir).recoverySnapshot, fresh);
+  } finally { removeDir(dir); }
 });
