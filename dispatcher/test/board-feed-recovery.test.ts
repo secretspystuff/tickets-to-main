@@ -21,6 +21,7 @@ type Replay = Extract<ReturnType<typeof restoreBoardFeedCursor>, { kind: "loaded
 type Event = Parameters<typeof stepBoardFeedCursor>[3];
 type Completion = Extract<Event, { kind: "snapshot-applied" }> & { response: string; capture: object };
 const restore: (dir: string, context: Context, request: string, heldValues?: string[]) => ReturnType<typeof restoreBoardFeedCursor> = restoreBoardFeedCursor;
+const completion = <E extends Event>(event: E, capture: object) => ({ ...event, capture });
 
 function start(dir: string, at = 91) {
   const baseline = { ...emptyLedger(), boundWorkspaceIntents: ["5".repeat(32)],
@@ -39,7 +40,7 @@ function gap(dir: string, context = current, selected = request, heldValues?: st
     return { state: hi.step.state, scope, requestId: changes.requestId, capture: changes };
   }
   assert.equal(changes?.kind, "read-changes");
-  const tooOld = stepBoardFeedCursor(dir, context, hi.step.state, { kind: "changes-too-old", scope, requestId: changes.requestId });
+  const tooOld = stepBoardFeedCursor(dir, context, hi.step.state, completion({ kind: "changes-too-old", scope, requestId: changes.requestId }, changes));
   assert.equal(tooOld.kind, "stepped");
   const snapshot = tooOld.step.actions[0];
   assert.equal(snapshot?.kind, "read-snapshot");
@@ -183,7 +184,8 @@ test("a retried read cannot consume the previous response or lose its own matchi
   try {
     start(dir);
     const old = gap(dir);
-    const failed = stepBoardFeedCursor(dir, current, old.state, { kind: "snapshot-read-failed", scope: old.scope, requestId: old.requestId });
+    const failed = stepBoardFeedCursor(dir, current, old.state,
+      completion({ kind: "snapshot-read-failed", scope: old.scope, requestId: old.requestId }, old.capture));
     assert.equal(failed.kind, "stepped");
     const retry = stepBoardFeedCursor(dir, current, failed.step.state, { kind: "wake", scope: old.scope });
     assert.equal(retry.kind, "stepped");
@@ -245,7 +247,7 @@ test("after process interruption the reopened ledger contains exactly one comple
         const opened = restoreBoardFeedCursor(dir, current, request);
         const reading = stepBoardFeedCursor(dir, current, opened.replay, { kind: "wake", scope });
         const gap = stepBoardFeedCursor(dir, current, reading.step.state, {
-          kind: "changes-too-old", scope, requestId: reading.step.actions[0].requestId });
+          kind: "changes-too-old", scope, requestId: reading.step.actions[0].requestId, capture: reading.step.actions[0] });
         const rename = fs.renameSync, target = ledgerPath(dir);
         fs.renameSync = (from, to) => {
           if (to !== target) return rename(from, to);
@@ -301,6 +303,8 @@ test("the original capture distinguishes matching numeric request IDs on a newer
     assert.equal(earlier.requestId, latest.requestId);
     const before = readFileSync(ledgerPath(dir));
     assert.deepEqual(apply(dir, earlier, reference, current, latest.state), { kind: "held" });
+    const delayedFailure = completion({ kind: "snapshot-read-failed", scope: earlier.scope, requestId: earlier.requestId }, earlier.capture);
+    assert.deepEqual(stepBoardFeedCursor(dir, current, latest.state, delayedFailure), { kind: "held" });
     assert.deepEqual(readFileSync(ledgerPath(dir)), before);
     const fresh = { ...reference, next: reference.next + 1 };
     assert.equal(apply(dir, latest, fresh).kind, "stepped");
@@ -324,16 +328,45 @@ test("a recorded gap still fences an ordinary page if the rename acknowledgment 
       if (to === ledgerPath(dir)) throw new Error("fabricated lost acknowledgment");
     };
     syncBuiltinESMExports();
-    assert.deepEqual(stepBoardFeedCursor(dir, current, reading.step.state, { kind: "changes-too-old", scope, requestId: action.requestId }), { kind: "held" });
+    assert.deepEqual(stepBoardFeedCursor(dir, current, reading.step.state,
+      completion({ kind: "changes-too-old", scope, requestId: action.requestId }, action)), { kind: "held" });
     fs.renameSync = rename;
     syncBuiltinESMExports();
     const afterRename = readFileSync(ledgerPath(dir));
-    assert.deepEqual(stepBoardFeedCursor(dir, current, reading.step.state, {
+    assert.deepEqual(stepBoardFeedCursor(dir, current, reading.step.state, completion({
       kind: "changes-applied", scope, requestId: action.requestId, next: 93, more: false,
-    }), { kind: "held" });
+    }, action)), { kind: "held" });
     assert.deepEqual(readFileSync(ledgerPath(dir)), afterRename);
     const fresh = gap(dir);
     assert.equal(apply(dir, fresh).kind, "stepped");
     assert.deepEqual(saved(dir).recoverySnapshot, reference);
   } finally { fs.renameSync = rename; syncBuiltinESMExports(); removeDir(dir); }
+});
+
+test("only the current issued changes read can retire the cursor or report an applied page", () => {
+  const dir = tempDir();
+  try {
+    start(dir);
+    const scope = { board: current.board, session: current.session };
+    function wake() {
+      const loaded = restore(dir, current, request);
+      assert.equal(loaded.kind, "loaded");
+      const result = stepBoardFeedCursor(dir, current, loaded.replay, { kind: "wake", scope });
+      assert.equal(result.kind, "stepped");
+      const action = result.step.actions[0];
+      assert.ok(action?.kind === "read-changes");
+      return { state: result.step.state, action };
+    }
+    const first = wake(), active = wake();
+    assert.equal(first.action.requestId, active.action.requestId);
+    const retired = { kind: "changes-too-old", scope, requestId: first.action.requestId } as const;
+    const progress = { kind: "changes-applied", scope, requestId: first.action.requestId, next: 92, more: false } as const;
+    const before = readFileSync(ledgerPath(dir));
+    assert.deepEqual(stepBoardFeedCursor(dir, current, active.state, completion(retired, first.action)), { kind: "held" });
+    assert.deepEqual(stepBoardFeedCursor(dir, current, active.state, completion(progress, first.action)), { kind: "held" });
+    assert.deepEqual(readFileSync(ledgerPath(dir)), before);
+    const next = stepBoardFeedCursor(dir, current, active.state, completion(progress, active.action));
+    assert.equal(next.kind, "stepped");
+    assert.equal(saved(dir).handled, 92);
+  } finally { removeDir(dir); }
 });
