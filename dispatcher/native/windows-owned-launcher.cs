@@ -300,7 +300,12 @@ internal static class WindowsOwnedLauncher
             {
                 using (child.Input)
                     foreach (byte[] data in writes.GetConsumingEnumerable())
-                        if (Volatile.Read(ref inputFailed) == 0) { child.Input.Write(data, 0, data.Length); child.Input.Flush(); }
+                        if (Volatile.Read(ref inputFailed) == 0)
+                        {
+                            child.Input.Write(data, 0, data.Length);
+                            child.Input.Flush();
+                            Reply("input-written");
+                        }
             }
             catch (IOException)
             {
