@@ -82,38 +82,44 @@ export function stepBoardFeedCursor(stateDir: string, current: BoardFeedContext,
   const origin = origins.get(replay);
   if (!origin || origin.stateDir !== resolve(stateDir) || origin.binding !== current.binding
     || replay.scope.board !== current.board || replay.scope.session !== current.session) return { kind: "held" };
+  if (!event?.scope || typeof event.scope.board !== "string" || typeof event.scope.session !== "string") return { kind: "held" };
   const recovery = origin.recovery;
   if (recovery && recovery.current !== replay) return { kind: "held" };
   const cursor = readCursor(stateDir, current);
   if (cursor.kind !== "matched" || cursor.record.handled !== replay.cursor || cursor.record.recoveryEpoch !== recovery?.epoch) return { kind: "held" };
   if (cursor.record.recoveryRequired && !replay.snapshotRequired) return { kind: "held" };
 
-  if (recovery && "requestId" in event) {
+  if (recovery && (event.kind === "changes-applied" || event.kind === "changes-too-old"
+    || event.kind === "snapshot-applied" || event.kind === "snapshot-read-failed")) {
     const kind = event.kind === "snapshot-applied" || event.kind === "snapshot-read-failed" ? "read-snapshot" : "read-changes";
-    if (!("capture" in event) || !recovery.pendingRead || event.capture !== recovery.pendingRead
+    if (typeof event.requestId !== "number" || !("capture" in event) || !recovery.pendingRead || event.capture !== recovery.pendingRead
       || replay.pending?.kind !== kind || replay.pending.requestId !== event.requestId
       || event.scope.board !== current.board || event.scope.session !== current.session) return { kind: "held" };
   }
   let snapshot: RecoverySnapshot | null = null;
   if (event.kind === "snapshot-applied") {
-    if (!recovery || !("response" in event) || typeof event.response !== "string"
+    if (!recovery || !cursor.record.recoveryRequired || !("response" in event) || typeof event.response !== "string"
       || !replay.snapshotRequired || replay.terminal) return { kind: "held" };
     snapshot = readRecoverySnapshot(event.response, current.board, recovery.selection);
     if (!snapshot || snapshot.next !== event.next) return { kind: "held" };
   }
   let step = stepBoardFeedReplay(replay, event);
+  if (!step) return { kind: "held" };
   if (recovery?.resumeSnapshot && event.scope.board === current.board && event.scope.session === current.session
     && (event.kind === "hi" && Number.isSafeInteger(event.seq) && event.seq >= 0
       || event.kind === "signal" && step.state.announcedSequence > replay.announcedSequence)) {
     step = stepBoardFeedReplay(step.state, { kind: "wake", scope: event.scope });
   }
   const issued = step.actions[0];
+  if (snapshot && (step.state === replay || step.state.snapshotRequired || step.state.cursor !== snapshot.next
+    || issued?.kind !== "read-changes" || issued.since !== snapshot.next)) return { kind: "held" };
   const markRequired = recovery !== undefined && issued?.kind === "read-snapshot" && !cursor.record.recoveryRequired;
   if (markRequired || snapshot || step.state.cursor !== replay.cursor) {
     const nextEpoch = snapshot ? epoch() : recovery?.epoch;
     try {
       updateLedger(stateDir, recovery?.heldValues ?? [], ledger => {
         const latest = checkedCursor(ledger, current, replay.cursor, recovery?.epoch);
+        if (snapshot && !latest.recoveryRequired) throw new StateError("The recovery request changed. Its record was preserved.");
         latest.handled = step.state.cursor;
         if (markRequired) latest.recoveryRequired = true;
         if (snapshot) {
