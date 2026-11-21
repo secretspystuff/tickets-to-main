@@ -132,7 +132,11 @@ export function createCoordinationReads({ boardId, getDeviceBearer, send = globa
   function observeCredential(order: number, bearer: string | null): object | null {
     const digest = bearer && createHash("sha256").update(bearer).digest("hex");
     // Credential lookups may finish out of order, including across a key rotation.
-    if (order < epochStart || (order < latestLookup && digest !== credentialDigest)) return null;
+    if (order < epochStart) return null;
+    if (order < latestLookup && digest !== credentialDigest) {
+      epochStart = order + 1;
+      return null;
+    }
     if (digest !== credentialDigest) {
       epochStart = credentialDigest === undefined ? 0 : order;
       credentialDigest = digest;
@@ -264,7 +268,7 @@ export function createCoordinationReads({ boardId, getDeviceBearer, send = globa
         // The caller owns the returned object, so retain a separate copy of the observed identity.
         if (observed && latest() && observed === credentialEpoch) activeReads.set(result, {
           reader, board: boardId, credentialEpoch: observed, entry: { repo: structuredClone(selected), activation_id: body.activation_id },
-          current: () => observed === credentialEpoch && order > lastRefusal && latest(),
+          current: () => observed === credentialEpoch && order >= epochStart && order > lastRefusal && latest(),
         });
         return result;
       }, signal);
