@@ -370,3 +370,22 @@ test("only the current issued changes read can retire the cursor or report an ap
     assert.equal(saved(dir).handled, 92);
   } finally { removeDir(dir); }
 });
+
+test("an incomplete local completion preserves the pending capture and the original ledger", () => {
+  const dir = tempDir();
+  try {
+    start(dir);
+    const pending = gap(dir), before = readFileSync(ledgerPath(dir));
+    const complete = { kind: "snapshot-applied", scope: pending.scope, next: reference.next,
+      response: JSON.stringify(reference), requestId: pending.requestId, capture: pending.capture };
+    for (const key of ["scope", "next", "response", "requestId", "capture"] as const) {
+      const incomplete: Partial<typeof complete> = { ...complete };
+      delete incomplete[key];
+      assert.deepEqual(stepBoardFeedCursor(dir, current, pending.state, incomplete as Event), { kind: "held" });
+      assert.deepEqual(readFileSync(ledgerPath(dir)), before);
+    }
+    assert.equal(apply(dir, pending).kind, "stepped");
+    assert.deepEqual(saved(dir).recoverySnapshot, reference);
+    assert.equal(saved(dir).handled, reference.next);
+  } finally { removeDir(dir); }
+});
