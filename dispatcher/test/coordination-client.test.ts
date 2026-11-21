@@ -211,6 +211,24 @@ test("later success remains observable after an earlier refusal arrives and a ca
   assert.equal(matchesObservedActivations(local.client, board, selected, [latest]), true);
 });
 
+test("a delayed credential change separates earlier and later observations from the same device", async () => {
+  let calls = 0, finish!: (value: string) => void;
+  const delayed = new Promise<string>(done => { finish = done; });
+  const local = harness(call => call.request.command === "protocol.hello" ? answer(call, helloBody) :
+    answer(call, { ...activeBody, repo: (call.request.body as { repo: typeof repo }).repo }), {
+    getDeviceBearer: async () => ++calls === 2 ? delayed : bearer,
+  });
+  const third = { ...repo, board_repo_id: "third-repo", identity_id: "r".repeat(32) };
+  const first = await local.client.activation(repo);
+  const middle = local.client.activation({ ...repo, board_repo_id: "second-repo", identity_id: "s".repeat(32) });
+  const latest = await local.client.activation(third);
+  finish(newBearer);
+  assert.ok((await middle).ok);
+  const selection = [repo, third].map(repo => ({ repo, activation_id: activeBody.activation_id }));
+  assert.equal(matchesObservedActivations(local.client, board, selection, [first, latest]), false);
+  assert.equal(matchesObservedActivations(local.client, board, [selection[1]!], [latest]), true);
+});
+
 function refused(result: unknown, code: string, then = "stop"): void {
   assert.ok(result && typeof result === "object");
   assert.equal(Reflect.get(result, "ok"), false);
