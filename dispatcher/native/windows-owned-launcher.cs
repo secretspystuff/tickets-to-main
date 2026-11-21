@@ -193,6 +193,11 @@ internal sealed class OwnedWindowsChild : IDisposable
             ? (uint?)code : null;
     }
 
+    internal bool IsRunning()
+    {
+        return WaitForSingleObject(child.Process, 0) == 258; // WAIT_TIMEOUT
+    }
+
     public void Dispose()
     {
         if (!activated && child.Process != IntPtr.Zero &&
@@ -300,7 +305,14 @@ internal static class WindowsOwnedLauncher
             {
                 using (child.Input)
                     foreach (byte[] data in writes.GetConsumingEnumerable())
-                        if (Volatile.Read(ref inputFailed) == 0) { child.Input.Write(data, 0, data.Length); child.Input.Flush(); }
+                        if (Volatile.Read(ref inputFailed) == 0)
+                        {
+                            child.Input.Write(data, 0, data.Length);
+                            child.Input.Flush();
+                            // A descendant can drain inherited stdin and keep stdout open after the
+                            // original process exits. Only its live process handle can fence this flush.
+                            if (child.IsRunning()) Reply("input-written");
+                        }
             }
             catch (IOException)
             {

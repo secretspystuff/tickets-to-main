@@ -381,6 +381,8 @@ export function windowsProcessLauncher(): WindowsOwnedLauncher {
       const output = new StringDecoder("utf8"), error = new StringDecoder("utf8");
       let pending: { resolve: (answer: Answer) => void; reject: (error: Error) => void; expects: string[] } | undefined;
       let group: Promise<Answer> | undefined;
+      let outstandingWrites = 0;
+      let inputFailed = false, exitSeen = false;
       let line = "", running = false, closed = false, detached = false, ended = false;
 
       function stop(graceful = false) {
@@ -406,12 +408,19 @@ export function windowsProcessLauncher(): WindowsOwnedLauncher {
         });
       }
 
-      function close(code: number | null) {
+      function reportInputError() {
+        if (inputFailed) return;
+        inputFailed = true;
+        events.inputError();
+      }
+
+      function close(code: number | null, unsettled = outstandingWrites !== 0) {
         if (closed) return;
         closed = true;
         const lastOut = output.end(), lastErr = error.end();
         if (lastOut) events.stdout(lastOut);
         if (lastErr) events.stderr(lastErr);
+        if (unsettled) reportInputError();
         events.closed({ code, signal: null, error: code === null ? "spawn" : null });
       }
 
@@ -426,9 +435,16 @@ export function windowsProcessLauncher(): WindowsOwnedLauncher {
           operation.resolve({ kind, value });
           return;
         }
-        if (!running || closed) { stop(); return; }
+        // A surviving Job member can keep stdin open after the original child exits.
+        // Its later pipe result cannot revise the original exit or close the Job observer.
+        if (exitSeen && (kind === "input-written" || kind === "input-error")) return;
+        if (!running || closed || exitSeen) { stop(); return; }
         // Activation resolves before a coalesced child output or close frame is delivered.
         switch (kind) {
+          case "input-written":
+            if (value !== undefined || outstandingWrites === 0) { stop(); return; }
+            outstandingWrites--;
+            break;
           case "stdout":
           case "stderr":
             if (!value || !/^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/.test(value)) { stop(); return; }
@@ -438,12 +454,15 @@ export function windowsProcessLauncher(): WindowsOwnedLauncher {
             break;
           case "input-error":
             if (value !== undefined) { stop(); return; }
-            setImmediate(() => events.inputError());
+            setImmediate(reportInputError);
             break;
-          case "closed":
+          case "closed": {
             if (value !== undefined && !/^\d{1,10}$/.test(value)) { stop(); return; }
-            setImmediate(() => close(value === undefined ? null : Number(value)));
+            exitSeen = true;
+            const unsettled = outstandingWrites !== 0;
+            setImmediate(() => close(value === undefined ? null : Number(value), unsettled));
             break;
+          }
           default:
             stop();
         }
@@ -478,7 +497,9 @@ export function windowsProcessLauncher(): WindowsOwnedLauncher {
         pipe: {
           write(text) {
             const bytes = Buffer.from(text, "utf8");
-            return running && !ended && !closed && bytes.length <= 32768 && write("input\t" + bytes.toString("base64"));
+            if (!running || ended || closed || exitSeen || bytes.length > 32768 || !write("input\t" + bytes.toString("base64"))) return false;
+            outstandingWrites++;
+            return true;
           },
           endInput,
         },
