@@ -89,6 +89,7 @@ export type BoardFeedCursorRecord = {
   binding: string;
   handled: number;
   recoveryEpoch?: string;
+  recoveryRequired?: true;
   recoverySnapshot?: RecoverySnapshot;
 };
 
@@ -203,12 +204,14 @@ function isBoardFeedCursor(value: unknown): value is BoardFeedCursorRecord {
   const row = value as Record<string, unknown>;
   const keys = ["board", "binding", "handled"];
   if (Object.hasOwn(row, "recoveryEpoch")) keys.push("recoveryEpoch");
+  if (Object.hasOwn(row, "recoveryRequired")) keys.push("recoveryRequired");
   if (Object.hasOwn(row, "recoverySnapshot")) keys.push("recoverySnapshot");
   return Object.keys(row).length === keys.length && keys.every(key => Object.hasOwn(row, key))
     && typeof row.board === "string" && row.board.length > 0
     && typeof row.binding === "string" && row.binding.length > 0
     && typeof row.handled === "number" && Number.isSafeInteger(row.handled) && row.handled >= 0
     && (row.recoveryEpoch === undefined || typeof row.recoveryEpoch === "string" && /^[a-f0-9]{32}$/.test(row.recoveryEpoch))
+    && (row.recoveryRequired === undefined || row.recoveryRequired === true && row.recoveryEpoch !== undefined)
     && (row.recoverySnapshot === undefined || row.recoveryEpoch !== undefined
       && validRecoverySnapshot(row.recoverySnapshot, row.board) && row.recoverySnapshot.next <= row.handled);
 }

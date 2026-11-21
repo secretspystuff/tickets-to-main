@@ -307,3 +307,33 @@ test("the original capture distinguishes matching numeric request IDs on a newer
     assert.deepEqual(saved(dir).recoverySnapshot, fresh);
   } finally { removeDir(dir); }
 });
+
+test("a recorded gap still fences an ordinary page if the rename acknowledgment is lost", () => {
+  const dir = tempDir(), rename = fs.renameSync;
+  try {
+    start(dir);
+    const opened = restore(dir, current, request);
+    assert.equal(opened.kind, "loaded");
+    const scope = { board: current.board, session: current.session };
+    const reading = stepBoardFeedCursor(dir, current, opened.replay, { kind: "wake", scope });
+    assert.equal(reading.kind, "stepped");
+    const action = reading.step.actions[0];
+    assert.ok(action?.kind === "read-changes");
+    fs.renameSync = (from, to) => {
+      rename(from, to);
+      if (to === ledgerPath(dir)) throw new Error("fabricated lost acknowledgment");
+    };
+    syncBuiltinESMExports();
+    assert.deepEqual(stepBoardFeedCursor(dir, current, reading.step.state, { kind: "changes-too-old", scope, requestId: action.requestId }), { kind: "held" });
+    fs.renameSync = rename;
+    syncBuiltinESMExports();
+    const afterRename = readFileSync(ledgerPath(dir));
+    assert.deepEqual(stepBoardFeedCursor(dir, current, reading.step.state, {
+      kind: "changes-applied", scope, requestId: action.requestId, next: 93, more: false,
+    }), { kind: "held" });
+    assert.deepEqual(readFileSync(ledgerPath(dir)), afterRename);
+    const fresh = gap(dir);
+    assert.equal(apply(dir, fresh).kind, "stepped");
+    assert.deepEqual(saved(dir).recoverySnapshot, reference);
+  } finally { fs.renameSync = rename; syncBuiltinESMExports(); removeDir(dir); }
+});

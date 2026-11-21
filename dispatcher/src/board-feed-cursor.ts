@@ -9,13 +9,14 @@ import { loadLedger, updateLedger, type BoardFeedCursorRecord, type Ledger } fro
 type BoardFeedContext = Readonly<{ board: string; binding: string; session: string }>;
 type Replay = ReturnType<typeof createBoardFeedReplay>;
 type ReplayEvent = Parameters<typeof stepBoardFeedReplay>[1];
-type CursorEvent = ReplayEvent | (Extract<ReplayEvent, { kind: "snapshot-applied" }> & { response: string });
+type CursorEvent = ReplayEvent | (Extract<ReplayEvent, { kind: "snapshot-applied" }> & { response: string; capture: object });
 type ReplayStep = ReturnType<typeof stepBoardFeedReplay>;
 type UnavailableCursor = { kind: "missing" | "invalid" | "scope-mismatch" };
 type CursorLookup = { kind: "matched"; record: BoardFeedCursorRecord } | UnavailableCursor;
 type RestoredCursor = { kind: "loaded"; replay: Replay } | UnavailableCursor;
 type CursorStep = { kind: "stepped"; step: ReplayStep } | { kind: "held" };
-type Recovery = { epoch: string; current: Replay; selection: RecoverySelection; baselineChanged: boolean; heldValues: string[] };
+type Recovery = { epoch: string; current: Replay; selection: RecoverySelection; resumeSnapshot: boolean;
+  pendingCapture?: ReplayStep["actions"][number]; heldValues: string[] };
 type Origin = { stateDir: string; binding: string; recovery?: Recovery };
 
 const origins = new WeakMap<Replay, Origin>();
@@ -51,22 +52,25 @@ export function restoreBoardFeedCursor(stateDir: string, current: BoardFeedConte
   const cursor = readCursor(stateDir, current);
   if (cursor.kind !== "matched") return cursor;
   const { board, session } = current;
-  const replay = createBoardFeedReplay({ board, session }, cursor.record.handled);
+  let replay = createBoardFeedReplay({ board, session }, cursor.record.handled);
   const origin: Origin = { stateDir: resolve(stateDir), binding: cursor.record.binding };
   if (recoveryRequest !== undefined) {
     const selection = readRecoverySelection(recoveryRequest);
     if (!selection || !/^[A-Za-z0-9_-]{1,300}$/.test(board)) return { kind: "invalid" };
-    const prior = cursor.record.recoverySnapshot;
     const nextEpoch = epoch();
+    let resumeSnapshot = false;
     try {
       updateLedger(stateDir, heldValues, ledger => {
-        checkedCursor(ledger, current, replay.cursor, cursor.record.recoveryEpoch).recoveryEpoch = nextEpoch;
+        const row = checkedCursor(ledger, current, replay.cursor, cursor.record.recoveryEpoch);
+        row.recoveryEpoch = nextEpoch;
+        if (row.recoverySnapshot && !isDeepStrictEqual(row.recoverySnapshot.selection, selection)) row.recoveryRequired = true;
+        resumeSnapshot = row.recoveryRequired === true;
       });
     } catch {
       return { kind: "invalid" };
     }
-    origin.recovery = { epoch: nextEpoch, current: replay, selection,
-      baselineChanged: prior !== undefined && !isDeepStrictEqual(prior.selection, selection), heldValues: [...heldValues] };
+    if (resumeSnapshot) replay = { ...replay, snapshotRequired: true, announcedSequence: 0 };
+    origin.recovery = { epoch: nextEpoch, current: replay, selection, resumeSnapshot, heldValues: [...heldValues] };
   } else if (cursor.record.recoveryEpoch !== undefined) {
     return { kind: "scope-mismatch" };
   }
@@ -79,28 +83,39 @@ export function stepBoardFeedCursor(stateDir: string, current: BoardFeedContext,
   if (!origin || origin.stateDir !== resolve(stateDir) || origin.binding !== current.binding
     || replay.scope.board !== current.board || replay.scope.session !== current.session) return { kind: "held" };
   const recovery = origin.recovery;
-  if (recovery && (recovery.current !== replay || recovery.baselineChanged && event.kind === "changes-applied")) return { kind: "held" };
+  if (recovery && recovery.current !== replay) return { kind: "held" };
   const cursor = readCursor(stateDir, current);
   if (cursor.kind !== "matched" || cursor.record.handled !== replay.cursor || cursor.record.recoveryEpoch !== recovery?.epoch) return { kind: "held" };
+  if (cursor.record.recoveryRequired && !replay.snapshotRequired) return { kind: "held" };
 
   let snapshot: RecoverySnapshot | null = null;
   if (event.kind === "snapshot-applied") {
-    if (!recovery || !("response" in event) || !replay.snapshotRequired || replay.terminal
+    if (!recovery || !("response" in event) || !recovery.pendingCapture || event.capture !== recovery.pendingCapture
+      || !replay.snapshotRequired || replay.terminal
       || event.scope.board !== current.board || event.scope.session !== current.session
       || replay.pending?.kind !== "read-snapshot" || replay.pending.requestId !== event.requestId) return { kind: "held" };
     snapshot = readRecoverySnapshot(event.response, current.board, recovery.selection);
     if (!snapshot || snapshot.next !== event.next) return { kind: "held" };
   }
-  const step = stepBoardFeedReplay(replay, event);
-  if (snapshot || step.state.cursor !== replay.cursor) {
+  let step = stepBoardFeedReplay(replay, event);
+  if (recovery?.resumeSnapshot && event.scope.board === current.board && event.scope.session === current.session
+    && (event.kind === "hi" && Number.isSafeInteger(event.seq) && event.seq >= 0
+      || event.kind === "signal" && step.state.announcedSequence > replay.announcedSequence)) {
+    step = stepBoardFeedReplay(step.state, { kind: "wake", scope: event.scope });
+  }
+  const capture = step.actions.find(action => action.kind === "read-snapshot");
+  const markRequired = recovery !== undefined && capture !== undefined && !cursor.record.recoveryRequired;
+  if (markRequired || snapshot || step.state.cursor !== replay.cursor) {
     const nextEpoch = snapshot ? epoch() : recovery?.epoch;
     try {
       updateLedger(stateDir, recovery?.heldValues ?? [], ledger => {
         const latest = checkedCursor(ledger, current, replay.cursor, recovery?.epoch);
         latest.handled = step.state.cursor;
+        if (markRequired) latest.recoveryRequired = true;
         if (snapshot) {
           latest.recoverySnapshot = snapshot;
           latest.recoveryEpoch = nextEpoch;
+          delete latest.recoveryRequired;
         }
       });
     } catch {
@@ -108,10 +123,17 @@ export function stepBoardFeedCursor(stateDir: string, current: BoardFeedContext,
     }
     if (recovery && snapshot && nextEpoch) {
       recovery.epoch = nextEpoch;
-      recovery.baselineChanged = false;
     }
   }
-  if (recovery) recovery.current = step.state;
+  if (recovery) {
+    if (capture) {
+      recovery.pendingCapture = capture;
+      recovery.resumeSnapshot = false;
+    } else if (step.state.pending?.kind !== "read-snapshot") {
+      delete recovery.pendingCapture;
+    }
+    recovery.current = step.state;
+  }
   origins.set(step.state, origin);
   return { kind: "stepped", step };
 }
