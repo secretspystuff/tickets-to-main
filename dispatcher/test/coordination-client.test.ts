@@ -1,6 +1,8 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { createCoordinationReads } from "../src/coordination-client.ts";
+import * as coordination from "../src/coordination-client.ts";
+import { readRecoverySelection } from "../src/board-feed-recovery.ts";
 
 const protocol = "tickets-to-main.coordination";
 const feature = "explicit_repo_identity_v1";
@@ -76,6 +78,63 @@ const unsupported = {
   error: "This program speaks a coordination version the server does not.", code: "unsupported_protocol", field: "client_version",
   fix: "Update Tickets to Main and try again.", then: "stop",
 };
+
+test("a parsed recovery selection matches only the original active observations from one device reader", async () => {
+  type Selection = NonNullable<ReturnType<typeof readRecoverySelection>>;
+  type Match = (boardId: string, selection: Selection, observations: readonly unknown[]) => boolean;
+  const match = (coordination as unknown as { matchesObservedActivations?: Match }).matchesObservedActivations;
+  assert.equal(typeof match, "function");
+  if (!match) throw new Error("The observed activation matcher is missing");
+  let device = bearer;
+  let available = true;
+  let generation = activeBody.activation_id;
+  const second = { board_repo_id: "second-repo", identity_id: "z".repeat(32), locator: null };
+  const secondGeneration = "y".repeat(32);
+  const reply = (call: Call) => {
+    if (call.request.command === "protocol.hello") return answer(call, helloBody);
+    const selected = (call.request.body as { repo: typeof second }).repo;
+    if (!available) return answer(call, { ...inactiveBody, repo: selected });
+    return answer(call, { repo: selected, active: true, board_id: board,
+      activation_id: selected.board_repo_id === repo.board_repo_id ? generation : secondGeneration });
+  };
+  const local = harness(reply, { getDeviceBearer: async () => device });
+  const elsewhere = harness(reply);
+  const observed = [await local.client.activation(repo), await local.client.activation(second)];
+  const selection = readRecoverySelection(JSON.stringify({ version: 1, selection: [
+    { repo, activation_id: activeBody.activation_id }, { repo: second, activation_id: secondGeneration },
+  ] }));
+  assert.ok(selection);
+  const readsBefore = local.credentialReads();
+  assert.equal(match(board, selection, observed), true);
+  assert.equal(match(otherBoard, selection, observed), false);
+  assert.equal(match(board, selection, observed.slice(1)), false);
+  assert.equal(match(board, selection, [observed[0], observed[0]]), false);
+  assert.equal(match(board, selection, structuredClone(observed)), false);
+  assert.equal(match(board, [], []), false);
+  const changed = structuredClone(selection);
+  changed[0]!.activation_id = "r".repeat(32);
+  assert.equal(match(board, changed, observed), false);
+  assert.equal(local.calls.length, 4);
+  assert.equal(local.credentialReads(), readsBefore);
+  const anotherReader = await elsewhere.client.activation(second);
+  assert.deepEqual(anotherReader, observed[1]);
+  assert.equal(match(board, selection, [observed[0], anotherReader]), false);
+  device = newBearer;
+  const anotherDevice = await local.client.activation(second);
+  assert.deepEqual(anotherDevice, observed[1]);
+  assert.equal(match(board, selection, [observed[0], anotherDevice]), false);
+  assert.equal(match(board, selection, observed), false);
+  device = bearer;
+  const current = [await local.client.activation(repo), await local.client.activation(second)];
+  assert.equal(match(board, selection, current), true);
+  generation = "v".repeat(32);
+  await local.client.activation(repo);
+  assert.equal(match(board, selection, current), false);
+  available = false;
+  const inactive = await local.client.activation(second);
+  assert.equal(match(board, [selection[1]!], [current[1]]), false);
+  assert.equal(match(board, [selection[1]!], [inactive]), false);
+});
 
 function refused(result: unknown, code: string, then = "stop"): void {
   assert.ok(result && typeof result === "object");
