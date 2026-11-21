@@ -173,13 +173,14 @@ test("a restored replay stays with the binding and ledger that supplied its curs
     const idle = { kind: "idle", scope } as const;
     const before = saveFixture(original, [row(5)]);
     const other = saveFixture(independent, [row(5)]);
+    const waiting = restored(api.restoreBoardFeedCursor(original, current), current, 5);
     const replay = restored(api.restoreBoardFeedCursor(original, current), current, 5);
     const begun = accepted(api.stepBoardFeedCursor(original, current, replay, { kind: "hi", scope, seq: 8 }));
     read(begun, current, 5);
     assert.deepEqual(accepted(api.stepBoardFeedCursor(original, current, begun.state, idle)), {
       state: begun.state, actions: [],
     });
-    const atIndependentLedger = api.stepBoardFeedCursor(independent, current, begun.state, idle);
+    const otherLedger = [waiting, begun.state].map(state => api.stepBoardFeedCursor(independent, current, state, idle).kind);
     assert.deepEqual(readFileSync(ledgerPath(original)), before);
     assert.deepEqual(readFileSync(ledgerPath(independent)), other);
 
@@ -188,9 +189,9 @@ test("a restored replay stays with the binding and ledger that supplied its curs
     assert.deepEqual(accepted(api.stepBoardFeedCursor(original, otherBinding, fresh, idle)), {
       state: fresh, actions: [],
     });
-    const afterRebinding = api.stepBoardFeedCursor(original, otherBinding, begun.state, idle);
+    const afterRebinding = [waiting, begun.state].map(state => api.stepBoardFeedCursor(original, otherBinding, state, idle).kind);
     assert.deepEqual(readFileSync(ledgerPath(original)), rebound);
-    assert.deepEqual([atIndependentLedger.kind, afterRebinding.kind], ["held", "held"]);
+    assert.deepEqual({ otherLedger, afterRebinding }, { otherLedger: ["held", "held"], afterRebinding: ["held", "held"] });
   } finally { removeDir(independent); removeDir(original); }
 });
 
