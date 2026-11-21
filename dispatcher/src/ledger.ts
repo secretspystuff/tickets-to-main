@@ -7,6 +7,7 @@ import { KEY_MARK, unfold } from "./secret-text.ts";
 import { PACKAGE_VERSION } from "./version.ts";
 import { StateError, assertPrivateDirectory, writePrivateFile } from "./fs-safety.ts";
 import { validCheckAttemptRecord, type CheckAttemptRecord } from "./check-attempt-record.ts";
+import { recoveryTextIsStorable, validRecoverySnapshot, type RecoverySnapshot } from "./board-feed-recovery.ts";
 import type { AppServerTerminalLineage } from "./adapters/codex-app-server.ts";
 import { nativePredecessorId, record } from "./adapters/native-result.ts";
 import { matchesNativePredecessorJournal } from "./assignment-journal.ts";
@@ -87,6 +88,8 @@ export type BoardFeedCursorRecord = {
   board: string;
   binding: string;
   handled: number;
+  recoveryEpoch?: string;
+  recoverySnapshot?: RecoverySnapshot;
 };
 
 export type Ledger = {
@@ -199,10 +202,29 @@ function isBoardFeedCursor(value: unknown): value is BoardFeedCursorRecord {
   if (value === null || typeof value !== "object" || Array.isArray(value)) return false;
   const row = value as Record<string, unknown>;
   const keys = ["board", "binding", "handled"];
+  if (Object.hasOwn(row, "recoveryEpoch")) keys.push("recoveryEpoch");
+  if (Object.hasOwn(row, "recoverySnapshot")) keys.push("recoverySnapshot");
   return Object.keys(row).length === keys.length && keys.every(key => Object.hasOwn(row, key))
     && typeof row.board === "string" && row.board.length > 0
     && typeof row.binding === "string" && row.binding.length > 0
-    && typeof row.handled === "number" && Number.isSafeInteger(row.handled) && row.handled >= 0;
+    && typeof row.handled === "number" && Number.isSafeInteger(row.handled) && row.handled >= 0
+    && (row.recoveryEpoch === undefined || typeof row.recoveryEpoch === "string" && /^[a-f0-9]{32}$/.test(row.recoveryEpoch))
+    && (row.recoverySnapshot === undefined || row.recoveryEpoch !== undefined
+      && validRecoverySnapshot(row.recoverySnapshot, row.board) && row.recoverySnapshot.next <= row.handled);
+}
+
+function assertLedgerRecord(value: Ledger, secrets: readonly string[]): void {
+  if (!Array.isArray(value.boardFeedCursors) || !value.boardFeedCursors.some(row => row?.recoverySnapshot !== undefined)) {
+    assertPublicRecord(value, secrets);
+    return;
+  }
+  // Display headings and locators can contain ordinary percent signs. Scan their decoded forms with the text checker.
+  const cursors = value.boardFeedCursors.map(({ recoverySnapshot, ...cursor }) => {
+    if (recoverySnapshot !== undefined && (!validRecoverySnapshot(recoverySnapshot, cursor.board)
+      || !recoveryTextIsStorable(recoverySnapshot, secrets))) throw new StateError("The recovery snapshot could not be saved safely.");
+    return cursor;
+  });
+  assertPublicRecord({ ...value, boardFeedCursors: cursors }, secrets);
 }
 
 function isDeliveryReceipt(value: unknown): value is DeliveryReceipt {
@@ -295,7 +317,7 @@ export function parseLedger(text: string): Ledger | null {
   if (predecessor !== undefined && (!isNativePredecessor(predecessor) || workspace?.claimGeneration === predecessor.claimGeneration
     || boundWorkspaceIntents?.includes(predecessor.assignmentId))) return null;
   try {
-    assertPublicRecord(parsed, []);
+    assertLedgerRecord(parsed as Ledger, []);
   } catch {
     return null;
   }
@@ -358,7 +380,7 @@ function validateSave(ledger: Ledger, secrets: readonly string[]): void {
     || new Set(ledger.checkAttempts.map((attempt) => attempt.attemptId)).size !== ledger.checkAttempts.length)) {
     throw new StateError("The check attempt record is not valid. It was not saved.");
   }
-  assertPublicRecord(ledger, secrets);
+  assertLedgerRecord(ledger, secrets);
   if (parseLedger(JSON.stringify(ledger)) === null) throw new StateError("The local record is not valid. It was not saved.");
 }
 

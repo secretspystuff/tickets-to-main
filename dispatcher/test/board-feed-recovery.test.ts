@@ -20,7 +20,7 @@ type Context = typeof current;
 type Replay = Extract<ReturnType<typeof restoreBoardFeedCursor>, { kind: "loaded" }>["replay"];
 type Event = Parameters<typeof stepBoardFeedCursor>[3];
 type Completion = Extract<Event, { kind: "snapshot-applied" }> & { response: string };
-const restore: (dir: string, context: Context, request: string) => ReturnType<typeof restoreBoardFeedCursor> = restoreBoardFeedCursor;
+const restore: (dir: string, context: Context, request: string, heldValues?: string[]) => ReturnType<typeof restoreBoardFeedCursor> = restoreBoardFeedCursor;
 
 function start(dir: string, at = 91) {
   const baseline = { ...emptyLedger(), boundWorkspaceIntents: ["5".repeat(32)],
@@ -28,8 +28,8 @@ function start(dir: string, at = 91) {
   writeFileSync(ledgerPath(dir), JSON.stringify(baseline), { mode: 0o600 });
 }
 
-function gap(dir: string, context = current, selected = request) {
-  const restored = restore(dir, context, selected);
+function gap(dir: string, context = current, selected = request, heldValues?: string[]) {
+  const restored = restore(dir, context, selected, heldValues);
   assert.equal(restored.kind, "loaded");
   const scope = { board: context.board, session: context.session };
   const hi = stepBoardFeedCursor(dir, context, restored.replay, { kind: "hi", scope, seq: 92 });
@@ -87,8 +87,9 @@ test("current capture accepts an empty graph at an unchanged cursor but not a la
     const old = gap(dir);
     const replacement = JSON.parse(request);
     replacement.selection[0].activation_id = "d".repeat(32);
-    const nextContext = { ...current, session: "fabricated-second-session" };
+    const nextContext = { ...current };
     const active = gap(dir, nextContext, JSON.stringify(replacement));
+    assert.equal(old.requestId, active.requestId);
     const during = readFileSync(ledgerPath(dir));
     assert.deepEqual(apply(dir, old), { kind: "held" });
     assert.deepEqual(readFileSync(ledgerPath(dir)), during);
@@ -100,6 +101,50 @@ test("current capture accepts an empty graph at an unchanged cursor but not a la
     assert.deepEqual(apply(dir, active, empty, nextContext), { kind: "held" });
     assert.deepEqual(readFileSync(ledgerPath(dir)), before);
     assert.deepEqual(saved(dir).recoverySnapshot, empty);
+  } finally { removeDir(dir); }
+});
+
+test("a changed selection keeps its previous baseline until the fresh 410 capture commits", () => {
+  const dir = tempDir();
+  try {
+    start(dir);
+    assert.equal(apply(dir, gap(dir)).kind, "stepped");
+    const changed = JSON.parse(request);
+    changed.selection[0].activation_id = "2".repeat(32);
+    const selected = JSON.stringify(changed);
+    const opened = restore(dir, current, selected);
+    assert.equal(opened.kind, "loaded");
+    const scope = { board: current.board, session: current.session };
+    const read = stepBoardFeedCursor(dir, current, opened.replay, { kind: "wake", scope });
+    assert.equal(read.kind, "stepped");
+    const action = read.step.actions[0];
+    assert.ok(action?.kind === "read-changes");
+    assert.deepEqual(stepBoardFeedCursor(dir, current, read.step.state, {
+      kind: "changes-applied", scope, requestId: action.requestId, next: reference.next + 1, more: false,
+    }), { kind: "held" });
+    assert.deepEqual(saved(dir).recoverySnapshot, reference);
+    const follow = stepBoardFeedCursor(dir, current, read.step.state, { kind: "changes-too-old", scope, requestId: action.requestId });
+    assert.equal(follow.kind, "stepped");
+    const pending = follow.step.actions[0];
+    assert.ok(pending?.kind === "read-snapshot");
+    const fresh = { ...reference, next: reference.next + 1, selection: changed.selection };
+    assert.equal(apply(dir, { state: follow.step.state, scope, requestId: pending.requestId }, fresh).kind, "stepped");
+    assert.deepEqual(saved(dir).recoverySnapshot, fresh);
+  } finally { removeDir(dir); }
+});
+
+test("a held value in a display heading keeps the saved cursor and graph private", () => {
+  const dir = tempDir();
+  try {
+    start(dir);
+    const read = gap(dir, current, request, ["fabricated private phrase"]);
+    const body = structuredClone(reference);
+    body.tickets[0].relationships.depends_on[0].heading = "a fabricated private phrase";
+    const before = readFileSync(ledgerPath(dir));
+    assert.deepEqual(apply(dir, read, body), { kind: "held" });
+    assert.deepEqual(readFileSync(ledgerPath(dir)), before);
+    assert.equal(apply(dir, read).kind, "stepped");
+    assert.deepEqual(saved(dir).recoverySnapshot, reference);
   } finally { removeDir(dir); }
 });
 
