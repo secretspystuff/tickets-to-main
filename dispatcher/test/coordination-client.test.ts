@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { createCoordinationReads } from "../src/coordination-client.ts";
+import { createCoordinationReads, matchesObservedActivations } from "../src/coordination-client.ts";
+import { readRecoverySelection } from "../src/board-feed-recovery.ts";
 
 const protocol = "tickets-to-main.coordination";
 const feature = "explicit_repo_identity_v1";
@@ -76,6 +77,157 @@ const unsupported = {
   error: "This program speaks a coordination version the server does not.", code: "unsupported_protocol", field: "client_version",
   fix: "Update Tickets to Main and try again.", then: "stop",
 };
+
+test("a parsed recovery selection matches only the original active observations from one device reader", async () => {
+  type Selection = NonNullable<ReturnType<typeof readRecoverySelection>>;
+  let device = bearer;
+  let available = true;
+  let generation = activeBody.activation_id;
+  const second = { board_repo_id: "second-repo", identity_id: "z".repeat(32), locator: null };
+  const secondGeneration = "y".repeat(32);
+  const reply = (call: Call) => {
+    if (call.request.command === "protocol.hello") return answer(call, helloBody);
+    const selected = (call.request.body as { repo: typeof second }).repo;
+    if (!available) return answer(call, { ...inactiveBody, repo: selected });
+    return answer(call, { repo: selected, active: true, board_id: board,
+      activation_id: selected.board_repo_id === repo.board_repo_id ? generation : secondGeneration });
+  };
+  const local = harness(reply, { getDeviceBearer: async () => device });
+  const elsewhere = harness(reply);
+  const match = (boardId: string, selected: Selection, observations: readonly unknown[]) =>
+    matchesObservedActivations(local.client, boardId, selected, observations);
+  const observed = [await local.client.activation(repo), await local.client.activation(second)];
+  const selection = readRecoverySelection(JSON.stringify({ version: 1, selection: [
+    { repo, activation_id: activeBody.activation_id }, { repo: second, activation_id: secondGeneration },
+  ] }));
+  assert.ok(selection);
+  const readsBefore = local.credentialReads();
+  assert.equal(match(board, selection, observed), true);
+  assert.equal(match(otherBoard, selection, observed), false);
+  assert.equal(match(board, selection, observed.slice(1)), false);
+  assert.equal(match(board, selection, [observed[0], observed[0]]), false);
+  assert.equal(match(board, selection, [...observed].reverse()), false);
+  assert.equal(match(board, selection, structuredClone(observed)), false);
+  assert.equal(match(board, [], []), false);
+  const changed = structuredClone(selection);
+  changed[0]!.activation_id = "r".repeat(32);
+  assert.equal(match(board, changed, observed), false);
+  const anotherIdentity = structuredClone(selection);
+  anotherIdentity[0]!.repo.identity_id = "k".repeat(32);
+  assert.equal(match(board, anotherIdentity, observed), false);
+  const anotherLocator = structuredClone(selection);
+  anotherLocator[0]!.repo.locator = null;
+  assert.equal(match(board, anotherLocator, observed), false);
+  assert.equal(local.calls.length, 4);
+  assert.equal(local.credentialReads(), readsBefore);
+  const anotherReader = await elsewhere.client.activation(second);
+  assert.deepEqual(anotherReader, observed[1]);
+  assert.equal(match(board, selection, [observed[0], anotherReader]), false);
+  assert.equal(match(board, selection, [await elsewhere.client.activation(repo), anotherReader]), false);
+  device = newBearer;
+  const anotherDevice = await local.client.activation(second);
+  assert.deepEqual(anotherDevice, observed[1]);
+  assert.equal(match(board, selection, [observed[0], anotherDevice]), false);
+  assert.equal(match(board, selection, observed), false);
+  device = bearer;
+  const current = [await local.client.activation(repo), await local.client.activation(second)];
+  assert.equal(match(board, selection, current), true);
+  assert.equal(match(board, selection, observed), false);
+  generation = "v".repeat(32);
+  await local.client.activation(repo);
+  assert.equal(match(board, selection, current), false);
+  available = false;
+  const inactive = await local.client.activation(second);
+  assert.equal(match(board, [selection[1]!], [current[1]]), false);
+  assert.equal(match(board, [selection[1]!], [inactive]), false);
+  available = true;
+  generation = activeBody.activation_id;
+  const mutable = await local.client.activation(repo);
+  assert.ok(mutable.ok && mutable.body.active);
+  mutable.body.repo.locator = null;
+  assert.equal(match(board, [anotherLocator[0]!], [mutable]), false);
+});
+
+test("a late active observation cannot revive a repo after a newer inactive reply", async () => {
+  let entered!: () => void, finish!: () => void, calls = 0;
+  const waiting = new Promise<void>(resolve => { entered = resolve; });
+  const release = new Promise<void>(resolve => { finish = resolve; });
+  const local = harness(async call => {
+    if (call.request.command === "protocol.hello") return answer(call, helloBody);
+    if (calls++ === 0) {
+      entered();
+      await release;
+      return answer(call, activeBody);
+    }
+    return answer(call, inactiveBody);
+  });
+  const earlier = local.client.activation(repo);
+  await waiting;
+  const inactive = await local.client.activation(repo);
+  assert.ok(inactive.ok && !inactive.body.active);
+  finish();
+  const late = await earlier;
+  assert.ok(late.ok && late.body.active);
+  assert.equal(matchesObservedActivations(local.client, board, [{ repo, activation_id: activeBody.activation_id }], [late]), false);
+});
+
+test("overlapping reads for distinct repos retain the same credential when its first lookup finishes second", async () => {
+  const second = { ...repo, board_repo_id: "second-repo", identity_id: "s".repeat(32) };
+  let finish!: (value: string) => void, calls = 0;
+  const firstCredential = new Promise<string>(done => { finish = done; });
+  const local = harness(call => call.request.command === "protocol.hello" ? answer(call, helloBody) :
+    answer(call, { ...activeBody, repo: (call.request.body as { repo: typeof repo }).repo }), {
+    getDeviceBearer: async () => calls++ === 0 ? firstCredential : bearer,
+  });
+  const older = local.client.activation(repo);
+  const newer = await local.client.activation(second);
+  finish(bearer);
+  const first = await older;
+  assert.ok(first.ok && newer.ok);
+  const selection = [repo, second].map(repo => ({ repo, activation_id: activeBody.activation_id }));
+  assert.equal(matchesObservedActivations(local.client, board, selection, [first, newer]), true);
+});
+
+test("later success remains observable after an earlier refusal arrives and a cancelled read makes no request", async () => {
+  let enter!: () => void, finish!: () => void, calls = 0;
+  const waiting = new Promise<void>(done => { enter = done; });
+  const release = new Promise<void>(done => { finish = done; });
+  const local = harness(async call => {
+    if (call.request.command === "protocol.hello") return answer(call, helloBody);
+    if (calls++ === 0) { enter(); await release; return new Response(null, { status: 403 }); }
+    return answer(call, activeBody);
+  });
+  const older = local.client.activation(repo);
+  await waiting;
+  const selected = [{ repo, activation_id: activeBody.activation_id }];
+  const latest = await local.client.activation(repo);
+  assert.equal(matchesObservedActivations(local.client, board, selected, [latest]), true);
+  finish();
+  refused(await older, "unauthorized");
+  assert.equal(matchesObservedActivations(local.client, board, selected, [latest]), true);
+  const count = local.calls.length;
+  refused(await local.client.activation(repo, AbortSignal.abort()), "cancelled");
+  assert.equal(local.calls.length, count);
+  assert.equal(matchesObservedActivations(local.client, board, selected, [latest]), true);
+});
+
+test("a delayed credential change separates earlier and later observations from the same device", async () => {
+  let calls = 0, finish!: (value: string) => void;
+  const delayed = new Promise<string>(done => { finish = done; });
+  const local = harness(call => call.request.command === "protocol.hello" ? answer(call, helloBody) :
+    answer(call, { ...activeBody, repo: (call.request.body as { repo: typeof repo }).repo }), {
+    getDeviceBearer: async () => ++calls === 2 ? delayed : bearer,
+  });
+  const third = { ...repo, board_repo_id: "third-repo", identity_id: "r".repeat(32) };
+  const first = await local.client.activation(repo);
+  const middle = local.client.activation({ ...repo, board_repo_id: "second-repo", identity_id: "s".repeat(32) });
+  const latest = await local.client.activation(third);
+  finish(newBearer);
+  assert.ok((await middle).ok);
+  const selection = [repo, third].map(repo => ({ repo, activation_id: activeBody.activation_id }));
+  assert.equal(matchesObservedActivations(local.client, board, selection, [first, latest]), false);
+  assert.equal(matchesObservedActivations(local.client, board, [selection[1]!], [latest]), true);
+});
 
 function refused(result: unknown, code: string, then = "stop"): void {
   assert.ok(result && typeof result === "object");
