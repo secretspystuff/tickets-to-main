@@ -171,6 +171,46 @@ test("a late active observation cannot revive a repo after a newer inactive repl
   assert.equal(matchesObservedActivations(local.client, board, [{ repo, activation_id: activeBody.activation_id }], [late]), false);
 });
 
+test("overlapping reads for distinct repos retain the same credential when its first lookup finishes second", async () => {
+  const second = { ...repo, board_repo_id: "second-repo", identity_id: "s".repeat(32) };
+  let finish!: (value: string) => void, calls = 0;
+  const firstCredential = new Promise<string>(done => { finish = done; });
+  const local = harness(call => call.request.command === "protocol.hello" ? answer(call, helloBody) :
+    answer(call, { ...activeBody, repo: (call.request.body as { repo: typeof repo }).repo }), {
+    getDeviceBearer: async () => calls++ === 0 ? firstCredential : bearer,
+  });
+  const older = local.client.activation(repo);
+  const newer = await local.client.activation(second);
+  finish(bearer);
+  const first = await older;
+  assert.ok(first.ok && newer.ok);
+  const selection = [repo, second].map(repo => ({ repo, activation_id: activeBody.activation_id }));
+  assert.equal(matchesObservedActivations(local.client, board, selection, [first, newer]), true);
+});
+
+test("later success remains observable after an earlier refusal arrives and a cancelled read makes no request", async () => {
+  let enter!: () => void, finish!: () => void, calls = 0;
+  const waiting = new Promise<void>(done => { enter = done; });
+  const release = new Promise<void>(done => { finish = done; });
+  const local = harness(async call => {
+    if (call.request.command === "protocol.hello") return answer(call, helloBody);
+    if (calls++ === 0) { enter(); await release; return new Response(null, { status: 403 }); }
+    return answer(call, activeBody);
+  });
+  const older = local.client.activation(repo);
+  await waiting;
+  const selected = [{ repo, activation_id: activeBody.activation_id }];
+  const latest = await local.client.activation(repo);
+  assert.equal(matchesObservedActivations(local.client, board, selected, [latest]), true);
+  finish();
+  refused(await older, "unauthorized");
+  assert.equal(matchesObservedActivations(local.client, board, selected, [latest]), true);
+  const count = local.calls.length;
+  refused(await local.client.activation(repo, AbortSignal.abort()), "cancelled");
+  assert.equal(local.calls.length, count);
+  assert.equal(matchesObservedActivations(local.client, board, selected, [latest]), true);
+});
+
 function refused(result: unknown, code: string, then = "stop"): void {
   assert.ok(result && typeof result === "object");
   assert.equal(Reflect.get(result, "ok"), false);
