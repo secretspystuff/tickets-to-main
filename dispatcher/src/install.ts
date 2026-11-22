@@ -5,11 +5,12 @@ import { emptyLedger, loadLedger, updateLedger, type Ledger } from "./ledger.ts"
 import { stateLeaseStatus } from "./state-lease.ts";
 import { PACKAGE_VERSION } from "./version.ts";
 import {
-  releaseDirectory, releaseError, releaseVersion, sha256, verifiedArtifacts, verifyManifest,
-  type ReleaseManifest, type ReleaseRequest, type ReleaseServices, type ReleaseTrust,
+  MAX_MANIFEST_BYTES, WINDOWS_ARCHIVE_FILE, WINDOWS_DESCRIPTOR_FILE,
+  releaseDirectory, releaseError, releaseVersion, sha256, verifiedArtifacts, verifyManifest, verifyWindowsPackageDescriptor,
+  type ReleaseManifest, type ReleaseRequest, type ReleaseServices, type ReleaseTrust, type WindowsPackageDescriptor, type WindowsPackagePolicy,
 } from "./release-manifest.ts";
 import {
-  assertReleaseRoot, exists, publishRelease, readReleaseMetadata,
+  assertReleaseRoot, exists, publishRelease, readReleaseFile, readReleaseMetadata,
   cleanupOwnedStage, ownedStageIntents, stageRelease, verifyPartialStage, verifyReleaseTree, withReleaseLock, type OwnedStage,
 } from "./release-store.ts";
 
@@ -50,8 +51,9 @@ function result(ledger: Ledger): InstallResult {
 
 export type VerifiedSelectedRelease = { version: string; manifestDigest: string; sourceCommit: string };
 
-export function verifySelectedRelease(input: Pick<InstallInput, "stateDir" | "platform" | "arch">, ledger: Ledger,
-  trust: ReleaseTrust | undefined): VerifiedSelectedRelease | undefined {
+type ReleaseTarget = Pick<InstallInput, "stateDir" | "platform" | "arch">;
+
+function readVerifiedSelectedRelease(input: ReleaseTarget, ledger: Ledger, trust: ReleaseTrust | undefined) {
   const selected = ledger.install?.release;
   if (!selected || !ledger.install) return;
   const directory = join(input.stateDir, selected.directory);
@@ -62,7 +64,49 @@ export function verifySelectedRelease(input: Pick<InstallInput, "stateDir" | "pl
     version: ledger.install.packageVersion, platform: input.platform, arch: input.arch, dataVersion: ledger.version,
   });
   verifyReleaseTree(directory, manifest, manifestBytes, signatureBytes);
-  return { version: manifest.version, manifestDigest: selected.manifestDigest, sourceCommit: manifest.provenance.sourceCommit };
+  const selection = { version: manifest.version, manifestDigest: selected.manifestDigest, sourceCommit: manifest.provenance.sourceCommit };
+  return { directory, manifest, selection };
+}
+
+export function verifySelectedRelease(input: ReleaseTarget, ledger: Ledger,
+  trust: ReleaseTrust | undefined): VerifiedSelectedRelease | undefined {
+  return readVerifiedSelectedRelease(input, ledger, trust)?.selection;
+}
+
+function readVerifiedMember(directory: string, file: ReleaseManifest["files"][number]): Buffer {
+  const bytes = readReleaseFile(join(directory, file.path), file.size);
+  if (bytes.byteLength !== file.size || sha256(bytes) !== file.sha256) throw releaseError();
+  return bytes;
+}
+
+export type SelectedWindowsPackageSnapshot = {
+  selection: VerifiedSelectedRelease;
+  descriptor: WindowsPackageDescriptor;
+  archiveBytes: Uint8Array;
+};
+
+// A later native submission must establish its own current selection and submission authority.
+export function prepareSelectedWindowsPackage(input: ReleaseTarget, expected: VerifiedSelectedRelease,
+  trust: ReleaseTrust | undefined, policy: WindowsPackagePolicy): SelectedWindowsPackageSnapshot {
+  if (input.platform !== "win32" || input.arch !== "x64") throw releaseError();
+  return withReleaseLock(input.stateDir, false, () => {
+    const selected = readVerifiedSelectedRelease(input, localLedger(input.stateDir), trust);
+    if (!selected) throw releaseError();
+    const { directory, manifest, selection } = selected;
+    if (selection.version !== expected.version || selection.manifestDigest !== expected.manifestDigest
+      || selection.sourceCommit !== expected.sourceCommit) throw releaseError();
+
+    const archives = manifest.files.filter((file) => /\.msix$/i.test(file.path));
+    const archive = archives[0];
+    const companion = manifest.files.find((file) => file.path === WINDOWS_DESCRIPTOR_FILE);
+    if (archives.length !== 1 || archive?.path !== WINDOWS_ARCHIVE_FILE || archive.size === 0
+      || !companion || companion.size > MAX_MANIFEST_BYTES) throw releaseError();
+
+    const descriptor = verifyWindowsPackageDescriptor(readVerifiedMember(directory, companion), manifest, archive, policy);
+    // Check the returned bytes against the signed member even after the complete tree was verified.
+    const archiveBytes = readVerifiedMember(directory, archive);
+    return { selection, descriptor, archiveBytes };
+  });
 }
 
 function sameSelection(a: Ledger, b: Ledger): boolean {

@@ -1,5 +1,7 @@
 import { createHash, KeyObject, verify } from "node:crypto";
 
+type ReleaseFile = { path: string; size: number; sha256: string };
+
 export type ReleaseManifest = {
   schema: 1;
   version: string;
@@ -8,7 +10,23 @@ export type ReleaseManifest = {
   keyId: string;
   provenance: { repository: string; workflow: string; ref: string; sourceCommit: string };
   dataCompatibility: { min: number; max: number };
-  files: Array<{ path: string; size: number; sha256: string; executable: boolean }>;
+  files: Array<ReleaseFile & { executable: boolean }>;
+};
+
+export type WindowsPackagePolicy = {
+  packageName: string;
+  publisher: string;
+  publisherId: string;
+  applicationId: string;
+  signerSha256: string;
+};
+
+export type WindowsPackageDescriptor = {
+  schema: 1;
+  release: { version: string; sourceCommit: string };
+  archive: { path: string; sha256: string };
+  package: WindowsPackagePolicy & { fullName: string; version: string; architecture: string };
+  installed: { supervisor: string; guardian: string; interpreter: string; entry: string; files: ReleaseFile[] };
 };
 
 export type ReleaseRequest = {
@@ -34,6 +52,8 @@ export type ReleaseServices = {
 
 export const MANIFEST_FILE = ".release-manifest.json";
 export const SIGNATURE_FILE = ".release-signature";
+export const WINDOWS_ARCHIVE_FILE = "windows/dispatcher.msix";
+export const WINDOWS_DESCRIPTOR_FILE = "windows/admission.json";
 export const MAX_MANIFEST_BYTES = 1024 * 1024;
 export const MAX_ARTIFACT_BYTES = 256 * 1024 * 1024;
 const MAX_RELEASE_BYTES = 512 * 1024 * 1024;
@@ -45,6 +65,14 @@ export function releaseError(): Error {
 function exact(value: unknown, keys: readonly string[]): value is Record<string, unknown> {
   return value !== null && typeof value === "object" && !Array.isArray(value)
     && Object.keys(value).length === keys.length && keys.every((key) => Object.hasOwn(value, key));
+}
+
+function compactJson(bytes: Uint8Array): unknown {
+  if (!(bytes instanceof Uint8Array) || bytes.byteLength === 0 || bytes.byteLength > MAX_MANIFEST_BYTES) throw releaseError();
+  const row: unknown = JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(bytes));
+  // One compact representation excludes duplicate members and alternate parser interpretations.
+  if (!Buffer.from(JSON.stringify(row)).equals(Buffer.from(bytes))) throw releaseError();
+  return row;
 }
 
 function releaseVersionParts(value: unknown): RegExpExecArray | null {
@@ -94,17 +122,36 @@ export function releaseDirectory(version: string, digest: string): string {
   return `releases/${version}-${digest}`;
 }
 
+function verifyInventory(files: unknown, hasExecutableFlag: boolean): ReleaseFile[] {
+  if (!Array.isArray(files) || files.length === 0 || files.length > 4096) throw releaseError();
+  const keys = hasExecutableFlag ? ["path", "size", "sha256", "executable"] : ["path", "size", "sha256"];
+  const paths = new Set<string>();
+  let total = 0;
+  for (const file of files) {
+    if (!exact(file, keys) || !portableReleasePath(file.path)
+      || typeof file.size !== "number" || !Number.isSafeInteger(file.size) || file.size < 0 || file.size > MAX_ARTIFACT_BYTES
+      || typeof file.sha256 !== "string" || !/^[a-f0-9]{64}$/.test(file.sha256)
+      || (hasExecutableFlag && typeof file.executable !== "boolean")) throw releaseError();
+    const path = file.path.toLowerCase();
+    if (paths.has(path)) throw releaseError();
+    paths.add(path);
+    total += file.size;
+  }
+  if (total > MAX_RELEASE_BYTES) throw releaseError();
+  for (const path of paths) {
+    const parts = path.split("/");
+    for (let count = 1; count < parts.length; count++) if (paths.has(parts.slice(0, count).join("/"))) throw releaseError();
+  }
+  return files as ReleaseFile[];
+}
+
 export function verifyManifest(bytes: Uint8Array, signature: Uint8Array, trust: ReleaseTrust | undefined,
   expected: { version: string; sourceCommit?: string; platform: NodeJS.Platform; arch: string; dataVersion: number }): ReleaseManifest {
   try {
-    if (!(bytes instanceof Uint8Array) || bytes.byteLength === 0 || bytes.byteLength > MAX_MANIFEST_BYTES
-      || !(signature instanceof Uint8Array) || signature.byteLength !== 64 || !trust
+    if (!(signature instanceof Uint8Array) || signature.byteLength !== 64 || !trust
       || !(trust.keys instanceof Map) || !Array.isArray(trust.revokedKeyIds)) throw releaseError();
-    const decoded = new TextDecoder("utf-8", { fatal: true }).decode(bytes);
-    const row: unknown = JSON.parse(decoded);
-    // Signing one compact representation also excludes duplicate members and alternate parser interpretations.
-    if (!Buffer.from(JSON.stringify(row)).equals(Buffer.from(bytes))
-      || !exact(row, ["schema", "version", "platform", "arch", "keyId", "provenance", "dataCompatibility", "files"])
+    const row = compactJson(bytes);
+    if (!exact(row, ["schema", "version", "platform", "arch", "keyId", "provenance", "dataCompatibility", "files"])
       || row.schema !== 1 || !releaseVersion(row.version) || row.version !== expected.version
       || row.platform !== expected.platform || row.arch !== expected.arch
       || typeof row.keyId !== "string" || !/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(row.keyId)
@@ -122,24 +169,38 @@ export function verifyManifest(bytes: Uint8Array, signature: Uint8Array, trust: 
     const compatible = row.dataCompatibility;
     if (!exact(compatible, ["min", "max"]) || !Number.isSafeInteger(compatible.min) || !Number.isSafeInteger(compatible.max)
       || (compatible.min as number) < 0 || (compatible.min as number) > expected.dataVersion || (compatible.max as number) < expected.dataVersion) throw releaseError();
-    if (!Array.isArray(row.files) || row.files.length === 0 || row.files.length > 4096) throw releaseError();
-    const paths = new Set<string>();
-    let total = 0;
-    for (const file of row.files) {
-      if (!exact(file, ["path", "size", "sha256", "executable"]) || !portableReleasePath(file.path)
-        || !Number.isSafeInteger(file.size) || (file.size as number) < 0 || (file.size as number) > MAX_ARTIFACT_BYTES
-        || typeof file.sha256 !== "string" || !/^[a-f0-9]{64}$/.test(file.sha256) || typeof file.executable !== "boolean") throw releaseError();
-      const path = file.path.toLowerCase();
-      if (paths.has(path)) throw releaseError();
-      paths.add(path);
-      total += file.size as number;
-    }
-    if (total > MAX_RELEASE_BYTES) throw releaseError();
-    for (const path of paths) {
-      const parts = path.split("/");
-      for (let count = 1; count < parts.length; count++) if (paths.has(parts.slice(0, count).join("/"))) throw releaseError();
-    }
+    verifyInventory(row.files, true);
     return row as ReleaseManifest;
+  } catch { throw releaseError(); }
+}
+
+const WINDOWS_POLICY_FIELDS = ["packageName", "publisher", "publisherId", "applicationId", "signerSha256"] as const;
+
+export function verifyWindowsPackageDescriptor(bytes: Uint8Array, manifest: ReleaseManifest,
+  archive: ReleaseFile, policy: WindowsPackagePolicy): WindowsPackageDescriptor {
+  try {
+    const row = compactJson(bytes);
+    if (!exact(row, ["schema", "release", "archive", "package", "installed"]) || row.schema !== 1) throw releaseError();
+    if (!exact(row.release, ["version", "sourceCommit"]) || row.release.version !== manifest.version
+      || row.release.sourceCommit !== manifest.provenance.sourceCommit) throw releaseError();
+    if (!exact(row.archive, ["path", "sha256"]) || row.archive.path !== archive.path
+      || row.archive.sha256 !== archive.sha256) throw releaseError();
+
+    const identity = row.package;
+    if (!exact(identity, [...WINDOWS_POLICY_FIELDS, "fullName", "version", "architecture"])
+      || !WINDOWS_POLICY_FIELDS.every((key) => typeof policy[key] === "string" && policy[key].length > 0 && identity[key] === policy[key])
+      || !/^[a-f0-9]{64}$/.test(policy.signerSha256)
+      || identity.architecture !== manifest.arch || typeof identity.version !== "string"
+      || !/^(?:0|[1-9][0-9]{0,4})(?:\.(?:0|[1-9][0-9]{0,4})){3}$/.test(identity.version)
+      || identity.version.split(".").some((part) => Number(part) > 65535)
+      || identity.fullName !== `${policy.packageName}_${identity.version}_${identity.architecture}__${policy.publisherId}`) throw releaseError();
+
+    const installed = row.installed;
+    if (!exact(installed, ["supervisor", "guardian", "interpreter", "entry", "files"])) throw releaseError();
+    const paths = new Set(verifyInventory(installed.files, false).map((file) => file.path));
+    const roles = [installed.supervisor, installed.guardian, installed.interpreter, installed.entry];
+    if (new Set(roles).size !== roles.length || !roles.every((path) => typeof path === "string" && paths.has(path))) throw releaseError();
+    return row as WindowsPackageDescriptor;
   } catch { throw releaseError(); }
 }
 
