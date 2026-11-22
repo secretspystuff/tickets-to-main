@@ -1,18 +1,22 @@
 import { join } from "node:path";
 import { readdirSync } from "node:fs";
+import { isDeepStrictEqual } from "node:util";
 import { osLabel, osWords } from "./platform.ts";
 import { emptyLedger, loadLedger, updateLedger, type Ledger } from "./ledger.ts";
 import { stateLeaseStatus } from "./state-lease.ts";
 import { PACKAGE_VERSION } from "./version.ts";
 import {
   MAX_MANIFEST_BYTES, WINDOWS_ARCHIVE_FILE, WINDOWS_DESCRIPTOR_FILE,
-  releaseDirectory, releaseError, releaseVersion, sha256, verifiedArtifacts, verifyManifest, verifyWindowsPackageDescriptor,
-  type ReleaseManifest, type ReleaseRequest, type ReleaseServices, type ReleaseTrust, type WindowsPackageDescriptor, type WindowsPackagePolicy,
+  releaseDirectory, releaseError, releaseVersion, sha256, verifiedArtifacts, verifyManifest,
+  verifyWindowsPackageDescriptor, verifyWindowsPackageObservation,
+  type ReleaseManifest, type ReleaseRequest, type ReleaseServices, type ReleaseTrust,
+  type WindowsPackageDescriptor, type WindowsPackageObservation, type WindowsPackagePolicy,
 } from "./release-manifest.ts";
 import {
   assertReleaseRoot, exists, publishRelease, readReleaseFile, readReleaseMetadata,
   cleanupOwnedStage, ownedStageIntents, stageRelease, verifyPartialStage, verifyReleaseTree, withReleaseLock, type OwnedStage,
 } from "./release-store.ts";
+import { readWindowsOfferFence } from "./windows-offer-fence.ts";
 
 export type { ReleaseManifest, ReleaseServices } from "./release-manifest.ts";
 
@@ -85,6 +89,15 @@ export type SelectedWindowsPackageSnapshot = {
   archiveBytes: Uint8Array;
 };
 
+function windowsPackageMembers(manifest: ReleaseManifest) {
+  const archives = manifest.files.filter((file) => /\.msix$/i.test(file.path));
+  const archive = archives[0];
+  const companion = manifest.files.find((file) => file.path === WINDOWS_DESCRIPTOR_FILE);
+  if (archives.length !== 1 || archive?.path !== WINDOWS_ARCHIVE_FILE || archive.size === 0
+    || !companion || companion.size > MAX_MANIFEST_BYTES) throw releaseError();
+  return { archive, companion };
+}
+
 // A later native submission must establish its own current selection and submission authority.
 export function prepareSelectedWindowsPackage(input: ReleaseTarget, expected: VerifiedSelectedRelease,
   trust: ReleaseTrust | undefined, policy: WindowsPackagePolicy): SelectedWindowsPackageSnapshot {
@@ -96,12 +109,7 @@ export function prepareSelectedWindowsPackage(input: ReleaseTarget, expected: Ve
     if (selection.version !== expected.version || selection.manifestDigest !== expected.manifestDigest
       || selection.sourceCommit !== expected.sourceCommit) throw releaseError();
 
-    const archives = manifest.files.filter((file) => /\.msix$/i.test(file.path));
-    const archive = archives[0];
-    const companion = manifest.files.find((file) => file.path === WINDOWS_DESCRIPTOR_FILE);
-    if (archives.length !== 1 || archive?.path !== WINDOWS_ARCHIVE_FILE || archive.size === 0
-      || !companion || companion.size > MAX_MANIFEST_BYTES) throw releaseError();
-
+    const { archive, companion } = windowsPackageMembers(manifest);
     const descriptor = verifyWindowsPackageDescriptor(readVerifiedMember(directory, companion), manifest, archive, policy);
     // Check the returned bytes against the signed member even after the complete tree was verified.
     const archiveBytes = readVerifiedMember(directory, archive);
@@ -111,6 +119,75 @@ export function prepareSelectedWindowsPackage(input: ReleaseTarget, expected: Ve
 
 function sameSelection(a: Ledger, b: Ledger): boolean {
   return JSON.stringify(a.install) === JSON.stringify(b.install);
+}
+
+function authenticateReleaseRequest(target: ReleaseTarget, request: ReleaseRequest,
+  trust: ReleaseTrust | undefined, dataVersion: number) {
+  const { requestedVersion, sourceCommit } = request;
+  if (!releaseVersion(requestedVersion) || typeof sourceCommit !== "string") throw releaseError();
+  const manifestBytes = Buffer.from(request.manifestBytes);
+  const signatureBytes = Buffer.from(request.signatureBytes);
+  const manifest = verifyManifest(manifestBytes, signatureBytes, trust, {
+    version: requestedVersion, sourceCommit, platform: target.platform, arch: target.arch, dataVersion,
+  });
+  const artifacts = verifiedArtifacts(request, manifest);
+  const manifestDigest = sha256(manifestBytes);
+  return { manifest, manifestBytes, signatureBytes, artifacts, manifestDigest };
+}
+
+type OfferedWindowsPackage = {
+  release: VerifiedSelectedRelease;
+  descriptor: WindowsPackageDescriptor;
+  archiveBytes: Uint8Array;
+};
+
+type WindowsReleaseServices = Pick<ReleaseServices, "releaseTrust"> & {
+  publisherPolicy?: WindowsPackagePolicy;
+  observeWindowsOffer?: (offer: OfferedWindowsPackage) => WindowsPackageObservation | undefined;
+  stageWindowsOffer?: (offer: OfferedWindowsPackage, appxDigest: string) => undefined;
+};
+
+function prepareWindowsReleaseOffer(input: ReleaseTarget & { release: ReleaseRequest }, services: WindowsReleaseServices) {
+  const { stateDir, platform, arch, release: request } = input;
+  const { releaseTrust, publisherPolicy, observeWindowsOffer, stageWindowsOffer } = services;
+  if (platform !== "win32" || arch !== "x64" || !request || !publisherPolicy
+    || typeof observeWindowsOffer !== "function" || typeof stageWindowsOffer !== "function") throw releaseError();
+  const initial = readWindowsOfferFence(stateDir, services);
+  if (initial.observeWindowsOffer !== observeWindowsOffer || initial.stageWindowsOffer !== stageWindowsOffer) throw releaseError();
+  const { manifest, manifestBytes, signatureBytes, artifacts, manifestDigest } = authenticateReleaseRequest(
+    { stateDir, platform, arch }, request, releaseTrust, initial.dataVersion,
+  );
+  const { archive, companion } = windowsPackageMembers(manifest);
+  const archiveBytes = artifacts.get(archive.path)!;
+  const descriptorBytes = artifacts.get(companion.path)!;
+  const descriptor = verifyWindowsPackageDescriptor(descriptorBytes, manifest, archive, publisherPolicy);
+  const release = { version: manifest.version, manifestDigest, sourceCommit: manifest.provenance.sourceCommit };
+  const offer = { release, descriptor, archiveBytes };
+  // The observer receives its own copy so that staging can use the authenticated bytes and descriptor.
+  const appxDigest = verifyWindowsPackageObservation(observeWindowsOffer(structuredClone(offer)), descriptor);
+
+  const currentPolicy = services.publisherPolicy;
+  if (!currentPolicy) throw releaseError();
+  verifyManifest(manifestBytes, signatureBytes, services.releaseTrust, {
+    version: release.version, sourceCommit: release.sourceCommit, platform, arch, dataVersion: initial.dataVersion,
+  });
+  verifyWindowsPackageDescriptor(descriptorBytes, manifest, archive, currentPolicy);
+  if (!isDeepStrictEqual(readWindowsOfferFence(stateDir, services), initial)) throw releaseError();
+
+  const evidence = {
+    release: { ...release }, archiveSha256: archive.sha256, appxDigest,
+    packageFullName: descriptor.package.fullName, signerSha256: descriptor.package.signerSha256,
+  };
+  return { offer, stageWindowsOffer, evidence };
+}
+
+// The staging dependency owns the submission boundary and its final native disposition.
+export function installWindowsRelease(input: ReleaseTarget & { release: ReleaseRequest }, services: WindowsReleaseServices) {
+  let prepared;
+  try { prepared = prepareWindowsReleaseOffer(input, services); }
+  catch { throw releaseError(); }
+  prepared.stageWindowsOffer(prepared.offer, prepared.evidence.appxDigest);
+  return prepared.evidence;
 }
 
 function installPrepared(input: InstallInput, services: ReleaseServices): InstallResult {
@@ -131,15 +208,8 @@ function installPrepared(input: InstallInput, services: ReleaseServices): Instal
   }
 
   const request = input.release;
-  if (!releaseVersion(request.requestedVersion) || typeof request.sourceCommit !== "string") throw releaseError();
-  const manifestBytes = Buffer.from(request.manifestBytes);
-  const signatureBytes = Buffer.from(request.signatureBytes);
-  const manifest = verifyManifest(manifestBytes, signatureBytes, services.releaseTrust, {
-    version: request.requestedVersion, sourceCommit: request.sourceCommit,
-    platform: input.platform, arch: input.arch, dataVersion: ledger.version,
-  });
-  const artifacts = verifiedArtifacts(request, manifest);
-  const manifestDigest = sha256(manifestBytes);
+  const { manifest, manifestBytes, signatureBytes, artifacts, manifestDigest } =
+    authenticateReleaseRequest(input, request, services.releaseTrust, ledger.version);
   const relative = releaseDirectory(manifest.version, manifestDigest);
   const destination = join(input.stateDir, relative);
   assertReleaseRoot(input.stateDir);

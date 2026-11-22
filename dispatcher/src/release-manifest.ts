@@ -1,4 +1,5 @@
 import { createHash, KeyObject, verify } from "node:crypto";
+import { isDeepStrictEqual } from "node:util";
 
 type ReleaseFile = { path: string; size: number; sha256: string };
 
@@ -27,6 +28,16 @@ export type WindowsPackageDescriptor = {
   archive: { path: string; sha256: string };
   package: WindowsPackagePolicy & { fullName: string; version: string; architecture: string };
   installed: { supervisor: string; guardian: string; interpreter: string; entry: string; files: ReleaseFile[] };
+};
+
+export type WindowsPackageObservation = {
+  archiveSha256: string;
+  appxDigest?: string;
+  windowsTrustStatus: number;
+  policySignerSha256?: string;
+  identity: Omit<WindowsPackageDescriptor["package"], "signerSha256">;
+  applicationExecutable: string;
+  files: ReleaseFile[];
 };
 
 export type ReleaseRequest = {
@@ -202,6 +213,26 @@ export function verifyWindowsPackageDescriptor(bytes: Uint8Array, manifest: Rele
     if (new Set(roles).size !== roles.length || !roles.every((path) => typeof path === "string" && paths.has(path))) throw releaseError();
     return row as WindowsPackageDescriptor;
   } catch { throw releaseError(); }
+}
+
+export function verifyWindowsPackageObservation(observation: WindowsPackageObservation | undefined,
+  descriptor: WindowsPackageDescriptor): string {
+  const { signerSha256, ...identity } = descriptor.package;
+  if (!observation || observation.windowsTrustStatus !== 0 || observation.policySignerSha256 !== signerSha256
+    || observation.archiveSha256 !== descriptor.archive.sha256
+    || observation.applicationExecutable !== descriptor.installed.supervisor
+    || !isDeepStrictEqual(observation.identity, identity)) throw releaseError();
+  const appxDigest = observation.appxDigest;
+  if (typeof appxDigest !== "string" || !/^[A-Za-z0-9+/]{43}=$/.test(appxDigest)
+    || Buffer.from(appxDigest, "base64").toString("base64") !== appxDigest) throw releaseError();
+
+  const observed = verifyInventory(observation.files, false);
+  const expected = new Map(descriptor.installed.files.map((file) => [file.path, file]));
+  if (observed.length !== expected.size || !observed.every((file) => {
+    const member = expected.get(file.path);
+    return member?.size === file.size && member.sha256 === file.sha256;
+  })) throw releaseError();
+  return appxDigest;
 }
 
 export function verifiedArtifacts(request: ReleaseRequest, manifest: ReleaseManifest): Map<string, Buffer> {
