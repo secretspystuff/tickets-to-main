@@ -1,10 +1,16 @@
 import { join } from "node:path";
-import { readdirSync } from "node:fs";
+import {
+  closeSync, constants, fsyncSync, fstatSync, lstatSync, mkdirSync, openSync, readdirSync, readSync,
+  renameSync, rmdirSync, unlinkSync, writeFileSync, type BigIntStats,
+} from "node:fs";
+import { randomUUID } from "node:crypto";
 import { isDeepStrictEqual } from "node:util";
 import { osLabel, osWords } from "./platform.ts";
 import { emptyLedger, loadLedger, updateLedger, type Ledger } from "./ledger.ts";
-import { stateLeaseStatus } from "./state-lease.ts";
+import { observeStateLease, stateLeaseStatus, withStateLease, type LeaseObservation } from "./state-lease.ts";
 import { PACKAGE_VERSION } from "./version.ts";
+import { WINDOWS_RELEASE_JOURNAL } from "./private-journal.ts";
+import { assertPrivateAccess, assertPrivateDirectory } from "./fs-safety.ts";
 import {
   MAX_MANIFEST_BYTES, WINDOWS_ARCHIVE_FILE, WINDOWS_DESCRIPTOR_FILE,
   releaseDirectory, releaseError, releaseVersion, sha256, verifiedArtifacts, verifyManifest,
@@ -13,12 +19,18 @@ import {
   type WindowsPackageDescriptor, type WindowsPackageObservation, type WindowsPackagePolicy,
 } from "./release-manifest.ts";
 import {
-  assertReleaseRoot, exists, publishRelease, readReleaseFile, readReleaseMetadata,
-  cleanupOwnedStage, ownedStageIntents, stageRelease, verifyPartialStage, verifyReleaseTree, withReleaseLock, type OwnedStage,
+  assertReleaseRoot, exists, flushDirectory, publishRelease, readReleaseFile, readReleaseMetadata,
+  cleanupOwnedStage, ownedStageIntents, stageRelease, verifyPartialStage, verifyReleaseTree, withReleaseLock, writeReleaseFile,
+  WINDOWS_RELEASE_SUBMISSION_DIRECTORY, type OwnedStage,
 } from "./release-store.ts";
-import { readWindowsOfferFence } from "./windows-offer-fence.ts";
+import { readWindowsOfferFence, windowsOfferClaimIsCurrent } from "./windows-offer-fence.ts";
+import {
+  assertPortableSelectionMayChange, classifyWindowsStageReceipt, matchingWindowsDisposition, readWindowsReleaseDisposition,
+  validWindowsReleaseAttempt, type WindowsReleaseJournalRow, type WindowsReleaseOutcome, type WindowsStageReceipt,
+} from "./windows-release-disposition.ts";
 
 export type { ReleaseManifest, ReleaseServices } from "./release-manifest.ts";
+export { readWindowsReleaseDisposition } from "./windows-release-disposition.ts";
 
 export type InstallInput = {
   stateDir: string;
@@ -141,13 +153,20 @@ type OfferedWindowsPackage = {
   archiveBytes: Uint8Array;
 };
 
-type WindowsReleaseServices = Pick<ReleaseServices, "releaseTrust"> & {
+type WindowsOfferVerification = Pick<ReleaseServices, "releaseTrust"> & {
   publisherPolicy?: WindowsPackagePolicy;
   observeWindowsOffer?: (offer: OfferedWindowsPackage) => WindowsPackageObservation | undefined;
-  stageWindowsOffer?: (offer: OfferedWindowsPackage, appxDigest: string) => undefined;
 };
 
-function prepareWindowsReleaseOffer(input: ReleaseTarget & { release: ReleaseRequest }, services: WindowsReleaseServices) {
+type WindowsReleaseServices<Receipt = undefined> = WindowsOfferVerification & {
+  stageWindowsOffer?: (offer: OfferedWindowsPackage, appxDigest: string) => Receipt;
+};
+
+type WindowsSubmissionServices = WindowsOfferVerification & {
+  submitWindowsOffer?: (offer: OfferedWindowsPackage, appxDigest: string) => WindowsStageReceipt | undefined;
+};
+
+function prepareWindowsReleaseOffer<Receipt>(input: ReleaseTarget & { release: ReleaseRequest }, services: WindowsReleaseServices<Receipt>) {
   const { stateDir, platform, arch, release: request } = input;
   const { releaseTrust, publisherPolicy, observeWindowsOffer, stageWindowsOffer } = services;
   if (platform !== "win32" || arch !== "x64" || !request || !publisherPolicy
@@ -166,28 +185,139 @@ function prepareWindowsReleaseOffer(input: ReleaseTarget & { release: ReleaseReq
   // The observer receives its own copy so that staging can use the authenticated bytes and descriptor.
   const appxDigest = verifyWindowsPackageObservation(observeWindowsOffer(structuredClone(offer)), descriptor);
 
-  const currentPolicy = services.publisherPolicy;
-  if (!currentPolicy) throw releaseError();
-  verifyManifest(manifestBytes, signatureBytes, services.releaseTrust, {
-    version: release.version, sourceCommit: release.sourceCommit, platform, arch, dataVersion: initial.dataVersion,
-  });
-  verifyWindowsPackageDescriptor(descriptorBytes, manifest, archive, currentPolicy);
+  function verifyCurrentTrust() {
+    const currentPolicy = services.publisherPolicy;
+    if (!currentPolicy) throw releaseError();
+    verifyManifest(manifestBytes, signatureBytes, services.releaseTrust, {
+      version: release.version, sourceCommit: release.sourceCommit, platform, arch, dataVersion: initial.dataVersion,
+    });
+    verifyWindowsPackageDescriptor(descriptorBytes, manifest, archive, currentPolicy);
+  }
+  verifyCurrentTrust();
   if (!isDeepStrictEqual(readWindowsOfferFence(stateDir, services), initial)) throw releaseError();
 
   const evidence = {
     release: { ...release }, archiveSha256: archive.sha256, appxDigest,
     packageFullName: descriptor.package.fullName, signerSha256: descriptor.package.signerSha256,
   };
-  return { offer, stageWindowsOffer, evidence };
+  return { offer, stageWindowsOffer, evidence, fence: initial, verifyCurrentTrust };
 }
 
-// The staging dependency owns the submission boundary and its final native disposition.
 export function installWindowsRelease(input: ReleaseTarget & { release: ReleaseRequest }, services: WindowsReleaseServices) {
   let prepared;
-  try { prepared = prepareWindowsReleaseOffer(input, services); }
+  const { stateDir } = input;
+  try {
+    prepared = prepareWindowsReleaseOffer(input, services);
+    if (readWindowsReleaseDisposition(stateDir).state !== "none") throw releaseError();
+  }
   catch { throw releaseError(); }
   prepared.stageWindowsOffer(prepared.offer, prepared.evidence.appxDigest);
   return prepared.evidence;
+}
+
+function sameEntry(actual: BigIntStats, expected: BigIntStats): boolean {
+  return actual.dev === expected.dev && actual.ino === expected.ino;
+}
+
+function publishWindowsIntent(stateDir: string, intent: Buffer, assertOwners: () => void) {
+  const directory = join(stateDir, WINDOWS_RELEASE_SUBMISSION_DIRECTORY);
+  const draft = join(stateDir, ".windows-release-intent-" + randomUUID());
+  const draftFile = join(draft, WINDOWS_RELEASE_JOURNAL);
+  mkdirSync(draft, { mode: 0o700 });
+  const folder = lstatSync(draft, { bigint: true });
+  try {
+    assertPrivateDirectory(draft);
+    writeReleaseFile(draftFile, intent);
+    const original = lstatSync(draftFile, { bigint: true });
+    if (!readReleaseFile(draftFile, intent.length).equals(intent)) throw releaseError();
+    flushDirectory(draft);
+    assertOwners();
+    // Both leases serialize publishers. A complete destination always contains the original intent.
+    if (exists(directory)) throw releaseError();
+    renameSync(draft, directory);
+    flushDirectory(stateDir);
+    return { directory, folder, original };
+  } catch (error) {
+    try {
+      const remaining = lstatSync(draft, { bigint: true });
+      if (remaining.isDirectory() && !remaining.isSymbolicLink() && sameEntry(remaining, folder)) {
+        if (exists(draftFile)) unlinkSync(draftFile);
+        rmdirSync(draft);
+      }
+    } catch { /* An unpublished draft can remain private without acting as an intent. */ }
+    throw error;
+  }
+}
+
+function recordNewWindowsSubmission(stateDir: string, owners: { release: LeaseObservation; ledger: LeaseObservation },
+  attempt: WindowsReleaseJournalRow["attempt"], descriptor: WindowsPackageDescriptor,
+  submit: () => WindowsStageReceipt | undefined): WindowsReleaseOutcome {
+  const expectedDescriptor = structuredClone(descriptor);
+  const intent = Buffer.from(JSON.stringify({ phase: "intent", attempt }) + "\n");
+  function assertOwners() {
+    if (!isDeepStrictEqual(observeStateLease(stateDir, "release"), owners.release)
+      || !isDeepStrictEqual(observeStateLease(stateDir, "ledger"), owners.ledger)) throw releaseError();
+  }
+  const { directory, folder, original } = publishWindowsIntent(stateDir, intent, assertOwners);
+  const path = join(directory, WINDOWS_RELEASE_JOURNAL);
+  const fd = openSync(path, constants.O_RDWR | constants.O_APPEND | (constants.O_NOFOLLOW ?? 0));
+  function assertOriginalIntent() {
+    assertOwners();
+    assertPrivateDirectory(directory);
+    const published = lstatSync(directory, { bigint: true });
+    const actual = fstatSync(fd, { bigint: true });
+    const listed = lstatSync(path, { bigint: true });
+    if (!sameEntry(published, folder) || !actual.isFile() || listed.isSymbolicLink() || actual.nlink !== 1n
+      || !sameEntry(actual, listed) || !sameEntry(actual, original) || actual.size !== BigInt(intent.length)) throw releaseError();
+    assertPrivateAccess(path);
+    const bytes = Buffer.alloc(intent.length);
+    if (readSync(fd, bytes, 0, bytes.length, 0) !== bytes.length || !bytes.equals(intent)) throw releaseError();
+  }
+  function append(row: Exclude<WindowsReleaseJournalRow, { phase: "intent" }>) {
+    assertOriginalIntent();
+    writeFileSync(fd, JSON.stringify(row) + "\n");
+    fsyncSync(fd);
+  }
+  try {
+    assertOriginalIntent();
+    let outcome: WindowsReleaseOutcome;
+    try { outcome = classifyWindowsStageReceipt(submit(), attempt, expectedDescriptor); }
+    catch { outcome = { state: "held", attempt }; }
+    if (outcome.state === "failed") {
+      const { state: phase, ...result } = outcome;
+      append({ phase, ...result });
+    } else if (outcome.state !== "held") {
+      append({ phase: outcome.state, attempt, activityId: outcome.activityId });
+    }
+    return outcome;
+  } finally { closeSync(fd); }
+}
+
+export function submitWindowsRelease(input: ReleaseTarget & { release: ReleaseRequest }, services: WindowsSubmissionServices) {
+  const { stateDir } = input;
+  const { releaseTrust, publisherPolicy, observeWindowsOffer, submitWindowsOffer } = services;
+  const configured = { releaseTrust, publisherPolicy, observeWindowsOffer, stageWindowsOffer: submitWindowsOffer };
+  const dependenciesAreCurrent = () => services.releaseTrust === releaseTrust && services.publisherPolicy === publisherPolicy
+    && services.observeWindowsOffer === observeWindowsOffer && services.submitWindowsOffer === submitWindowsOffer;
+  try {
+    const prepared = prepareWindowsReleaseOffer(input, configured);
+    if (!dependenciesAreCurrent()) throw releaseError();
+    const { signerSha256: _signer, ...identity } = prepared.evidence;
+    const retained = readWindowsReleaseDisposition(stateDir);
+    if (retained.state !== "none") return matchingWindowsDisposition(retained, identity);
+
+    const { release: expectedRelease, ledger: expectedLedger } = prepared.fence.leases;
+    return withStateLease(stateDir, "release", release => withStateLease(stateDir, "ledger", ledger => {
+      if (!dependenciesAreCurrent() || !release.generation) throw releaseError();
+      prepared.verifyCurrentTrust();
+      const owners = { release, ledger };
+      if (!windowsOfferClaimIsCurrent(stateDir, configured, prepared.fence, owners)) throw releaseError();
+      const attempt = { ...identity, leaseEpoch: release.epoch.toString(), leaseGeneration: release.generation };
+      if (!validWindowsReleaseAttempt(attempt)) throw releaseError();
+      return recordNewWindowsSubmission(stateDir, owners, attempt, prepared.offer.descriptor,
+        () => prepared.stageWindowsOffer(prepared.offer, identity.appxDigest));
+    }, { expected: expectedLedger }), { expected: expectedRelease });
+  } catch { throw releaseError(); }
 }
 
 function installPrepared(input: InstallInput, services: ReleaseServices): InstallResult {
@@ -195,8 +325,10 @@ function installPrepared(input: InstallInput, services: ReleaseServices): Instal
   if (input.release === undefined) {
     // A bootstrap invocation cannot replace an explicitly selected release with its own package version.
     if (ledger.install?.release) return result(ledger);
+    assertPortableSelectionMayChange(input.stateDir);
     const saved = updateLedger(input.stateDir, [], (current) => {
       if (current.install?.release) return;
+      assertPortableSelectionMayChange(input.stateDir);
       current.install = {
         packageVersion: PACKAGE_VERSION,
         platform: osLabel(input.platform), arch: input.arch,
@@ -217,6 +349,7 @@ function installPrepared(input: InstallInput, services: ReleaseServices): Instal
   if (ledger.install?.packageVersion === manifest.version && ledger.install.release?.manifestDigest !== undefined
     && ledger.install.release.manifestDigest !== manifestDigest) throw releaseError();
   if (ledger.install?.release?.manifestDigest === manifestDigest) return result(ledger);
+  assertPortableSelectionMayChange(input.stateDir);
   const releaseRoot = join(input.stateDir, "releases");
   if (exists(releaseRoot)) {
     for (const name of readdirSync(releaseRoot)) {
@@ -232,6 +365,7 @@ function installPrepared(input: InstallInput, services: ReleaseServices): Instal
   // A previously published complete release can be selected again by an explicit compatible rollback.
   if (exists(destination)) verifyReleaseTree(destination, manifest, manifestBytes, signatureBytes);
   return withReleaseLock(input.stateDir, false, () => {
+    assertPortableSelectionMayChange(input.stateDir);
     const initial = localLedger(input.stateDir);
     if (!sameSelection(initial, ledger)) throw releaseError();
     verifySelectedRelease(input, initial, services.releaseTrust);
@@ -292,7 +426,9 @@ function recoverPrepared(input: InstallInput, services: ReleaseServices): Instal
   const lease = stateLeaseStatus(input.stateDir, "release");
   if (lease === "active") throw releaseError();
   if (stages.length === 0 && lease !== "dead") return result(before);
+  assertPortableSelectionMayChange(input.stateDir);
   return withReleaseLock(input.stateDir, true, () => {
+    assertPortableSelectionMayChange(input.stateDir);
     assertReleaseRoot(input.stateDir);
     const ledger = localLedger(input.stateDir);
     if (!sameSelection(before, ledger)) throw releaseError();

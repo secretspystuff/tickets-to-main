@@ -3,14 +3,17 @@ import { join } from "node:path";
 import { assertPrivateAccess, assertPrivateDirectory } from "./fs-safety.ts";
 import { withStateLease } from "./state-lease.ts";
 
-type Journal = "assignment-intents.jsonl" | "artifact-preparation.jsonl";
+export const WINDOWS_RELEASE_JOURNAL = "windows-release-submissions.jsonl";
+const journals = ["assignment-intents.jsonl", "artifact-preparation.jsonl"] as const;
+type Journal = typeof journals[number];
+type ReadableJournal = Journal | typeof WINDOWS_RELEASE_JOURNAL;
 export type JournalWriteOptions = { existingOnly?: boolean; stateIsCurrent?: () => boolean };
 const MAX_BYTES = 8 * 1024 * 1024;
 const unavailable = () => new Error("The private journal is unavailable. Saved work was preserved.");
 
-function withJournalFile<T>(stateDir: string, journal: Journal, mode: "inspect" | "read" | "append" | "append-existing",
+function withJournalFile<T>(stateDir: string, journal: ReadableJournal, mode: "inspect" | "read" | "append" | "append-existing",
   operation: (fd: number, created: boolean) => T): T {
-  if (journal !== "assignment-intents.jsonl" && journal !== "artifact-preparation.jsonl") throw unavailable();
+  if (!journals.some((allowed) => allowed === journal) && (mode !== "inspect" || journal !== WINDOWS_RELEASE_JOURNAL)) throw unavailable();
   const path = join(stateDir, journal);
   let exists = true;
   try {
@@ -35,7 +38,7 @@ function withJournalFile<T>(stateDir: string, journal: Journal, mode: "inspect" 
   } finally { closeSync(fd); }
 }
 
-export function inspectPrivateJournal<History>(stateDir: string, journal: Journal, decode: (text: string) => History): History {
+export function inspectPrivateJournal<History>(stateDir: string, journal: ReadableJournal, decode: (text: string) => History): History {
   assertPrivateDirectory(stateDir);
   return withJournalFile(stateDir, journal, "inspect", fd => decode(readFileSync(fd, "utf8")));
 }
@@ -43,6 +46,7 @@ export function inspectPrivateJournal<History>(stateDir: string, journal: Journa
 // The caller's ledger transaction keeps this history stable through the claim update.
 export function readExistingPrivateJournalUnderLease<History>(stateDir: string, journal: Journal,
   decode: (text: string) => History): History {
+  if (!journals.includes(journal)) throw unavailable();
   assertPrivateDirectory(stateDir);
   return withJournalFile(stateDir, journal, "read", fd => {
     const history = decode(readFileSync(fd, "utf8"));
@@ -54,7 +58,7 @@ export function readExistingPrivateJournalUnderLease<History>(stateDir: string, 
 export function withPrivateJournal<History, Entry, Result>(stateDir: string, journal: Journal,
   decode: (text: string) => History, operation: (history: History, append: (entry: Entry) => void) => Result,
   options?: JournalWriteOptions): Result {
-  if (journal !== "assignment-intents.jsonl" && journal !== "artifact-preparation.jsonl") throw unavailable();
+  if (!journals.includes(journal)) throw unavailable();
   assertPrivateDirectory(stateDir);
   return withStateLease(stateDir, "ledger", () => {
     if (options?.stateIsCurrent && !options.stateIsCurrent()) throw unavailable();

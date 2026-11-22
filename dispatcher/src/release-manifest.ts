@@ -198,13 +198,13 @@ export function verifyWindowsPackageDescriptor(bytes: Uint8Array, manifest: Rele
       || row.archive.sha256 !== archive.sha256) throw releaseError();
 
     const identity = row.package;
-    if (!exact(identity, [...WINDOWS_POLICY_FIELDS, "fullName", "version", "architecture"])
-      || !WINDOWS_POLICY_FIELDS.every((key) => typeof policy[key] === "string" && policy[key].length > 0 && identity[key] === policy[key])
+    if (!exact(identity, [...WINDOWS_POLICY_FIELDS, "fullName", "version", "architecture"])) throw releaseError();
+    const fullName = parseWindowsPackageFullName(identity.fullName);
+    if (!fullName || !WINDOWS_POLICY_FIELDS.every((key) => typeof policy[key] === "string" && policy[key].length > 0 && identity[key] === policy[key])
       || !/^[a-f0-9]{64}$/.test(policy.signerSha256)
-      || identity.architecture !== manifest.arch || typeof identity.version !== "string"
-      || !/^(?:0|[1-9][0-9]{0,4})(?:\.(?:0|[1-9][0-9]{0,4})){3}$/.test(identity.version)
-      || identity.version.split(".").some((part) => Number(part) > 65535)
-      || identity.fullName !== `${policy.packageName}_${identity.version}_${identity.architecture}__${policy.publisherId}`) throw releaseError();
+      || fullName.packageName !== policy.packageName || fullName.publisherId !== policy.publisherId
+      || fullName.version !== identity.version || fullName.architecture !== identity.architecture
+      || identity.architecture !== manifest.arch) throw releaseError();
 
     const installed = row.installed;
     if (!exact(installed, ["supervisor", "guardian", "interpreter", "entry", "files"])) throw releaseError();
@@ -223,16 +223,32 @@ export function verifyWindowsPackageObservation(observation: WindowsPackageObser
     || observation.applicationExecutable !== descriptor.installed.supervisor
     || !isDeepStrictEqual(observation.identity, identity)) throw releaseError();
   const appxDigest = observation.appxDigest;
-  if (typeof appxDigest !== "string" || !/^[A-Za-z0-9+/]{43}=$/.test(appxDigest)
-    || Buffer.from(appxDigest, "base64").toString("base64") !== appxDigest) throw releaseError();
+  if (!validAppxDigest(appxDigest) || !windowsInventoryMatches(observation.files, descriptor.installed.files)) throw releaseError();
+  return appxDigest;
+}
 
-  const observed = verifyInventory(observation.files, false);
-  const expected = new Map(descriptor.installed.files.map((file) => [file.path, file]));
-  if (observed.length !== expected.size || !observed.every((file) => {
+export function validAppxDigest(value: unknown): value is string {
+  return typeof value === "string" && /^[A-Za-z0-9+/]{43}=$/.test(value)
+    && Buffer.from(value, "base64").toString("base64") === value;
+}
+
+export function parseWindowsPackageFullName(value: unknown) {
+  if (typeof value !== "string") return;
+  const parts = /^([A-Za-z0-9.-]{3,50})_((?:0|[1-9][0-9]{0,4})(?:\.(?:0|[1-9][0-9]{0,4})){3})_([a-z0-9]{3,5})__([0-9abcdefghjkmnpqrstvwxyz]{13})$/.exec(value);
+  if (!parts || parts[0] !== value) return;
+  const [, packageName, version, architecture, publisherId] = parts;
+  if (!packageName || !version || !publisherId || (architecture !== "x64" && architecture !== "arm64")
+    || version.split(".").some((part) => Number(part) > 65535)) return;
+  return { packageName, version, architecture, publisherId };
+}
+
+export function windowsInventoryMatches(files: unknown, inventory: WindowsPackageDescriptor["installed"]["files"]): boolean {
+  const observed = verifyInventory(files, false);
+  const expected = new Map(inventory.map((file) => [file.path, file]));
+  return observed.length === expected.size && observed.every((file) => {
     const member = expected.get(file.path);
     return member?.size === file.size && member.sha256 === file.sha256;
-  })) throw releaseError();
-  return appxDigest;
+  });
 }
 
 export function verifiedArtifacts(request: ReleaseRequest, manifest: ReleaseManifest): Map<string, Buffer> {
