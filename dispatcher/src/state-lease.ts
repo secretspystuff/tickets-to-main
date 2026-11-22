@@ -6,9 +6,12 @@ import { currentProcessOwner, processOwnerAlive, validProcessBirth } from "./pro
 
 type Namespace = "ledger" | "release";
 type Owner = { version: 1 | 2; namespace: Namespace; pid: number; birth?: string; nonce: string };
-export type LeaseHooks = { onCheckpoint?: (phase: "observed-stale" | "claimed" | "release-marker-writing", epoch: bigint) => void };
+export type LeaseHooks = {
+  onCheckpoint?: (phase: "observed-stale" | "claimed" | "release-marker-writing", epoch: bigint) => void;
+  expected?: LeaseObservation;
+};
 export type LeaseState = "none" | "released" | "active" | "dead";
-type LeaseObservation = { epoch: bigint; state: LeaseState; generation?: string };
+export type LeaseObservation = { epoch: bigint; state: LeaseState; generation?: string };
 
 function present(path: string): boolean {
   try { lstatSync(path); return true; }
@@ -63,6 +66,10 @@ function latest(root: string, namespace: Namespace): LeaseObservation {
     if (value > epoch) epoch = value;
   }
   if (epoch < 0n) return { epoch, state: "none" };
+  return readEpoch(root, namespace, epoch);
+}
+
+function readEpoch(root: string, namespace: Namespace, epoch: bigint): LeaseObservation {
   const directory = join(root, `epoch-${epoch}`);
   assertPrivateDirectory(directory);
   if (readdirSync(directory).some((name) => name !== "owner.json" && name !== "released" && name !== "released.prepared")) throw unavailable();
@@ -94,13 +101,26 @@ export function stateLeaseStatus(stateDir: string, namespace: Namespace): LeaseS
   return observeStateLease(stateDir, namespace).state;
 }
 
-export function withStateLease<T>(stateDir: string, namespace: Namespace, operation: () => T, hooks: LeaseHooks = {}): T {
-  let root: string;
-  let previous: { epoch: bigint; state: LeaseState };
+export function observeStateLeaseEpoch(stateDir: string, namespace: Namespace, epoch: bigint): LeaseObservation {
   try {
+    const root = rootOf(stateDir, namespace, false);
+    if (root === null || epoch < 0n) throw unavailable();
+    return readEpoch(root, namespace, epoch);
+  } catch { throw unavailable(); }
+}
+
+function sameLease(a: LeaseObservation, b: LeaseObservation): boolean {
+  return a.epoch === b.epoch && a.state === b.state && a.generation === b.generation;
+}
+
+export function withStateLease<T>(stateDir: string, namespace: Namespace, operation: (owner: LeaseObservation) => T, hooks: LeaseHooks = {}): T {
+  let root: string;
+  let previous: LeaseObservation;
+  try {
+    if (hooks.expected && !sameLease(observeStateLease(stateDir, namespace), hooks.expected)) throw unavailable();
     root = rootOf(stateDir, namespace, true)!;
     previous = latest(root, namespace);
-    if (previous.state === "active") throw unavailable();
+    if (previous.state === "active" || (hooks.expected && !sameLease(previous, hooks.expected))) throw unavailable();
   } catch { throw unavailable(); }
   if (previous.state === "dead") hooks.onCheckpoint?.("observed-stale", previous.epoch);
   const epoch = previous.epoch + 1n;
@@ -125,7 +145,7 @@ export function withStateLease<T>(stateDir: string, namespace: Namespace, operat
   }
   try {
     hooks.onCheckpoint?.("claimed", epoch);
-    return operation();
+    return operation({ epoch, state: "active", generation: createHash("sha256").update(bytes).digest("hex") });
   } finally {
     if (!read(join(destination, "owner.json")).equals(bytes)) throw unavailable();
     const prepared = join(destination, "released.prepared");

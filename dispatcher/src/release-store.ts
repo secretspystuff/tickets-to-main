@@ -5,6 +5,8 @@ import { withStateLease } from "./state-lease.ts";
 import { assertPrivateAccess, assertPrivateDirectory, writePrivateFile } from "./fs-safety.ts";
 import { MANIFEST_FILE, MAX_MANIFEST_BYTES, SIGNATURE_FILE, releaseError, sha256, type ReleaseManifest, type ReleaseServices } from "./release-manifest.ts";
 
+export const WINDOWS_RELEASE_SUBMISSION_DIRECTORY = "windows-release-submission";
+
 export function exists(path: string): boolean {
   try { lstatSync(path); return true; }
   catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") return false; throw releaseError(); }
