@@ -1,6 +1,6 @@
 import { closeSync, fsyncSync, lstatSync, mkdirSync, openSync, readFileSync, readdirSync, renameSync, rmdirSync, unlinkSync, writeFileSync } from "node:fs";
 import { isAbsolute, join } from "node:path";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { assertPrivateAccess, assertPrivateDirectory, ensurePrivateDirectory, StateError } from "./fs-safety.ts";
 import { currentProcessOwner, processOwnerAlive, validProcessBirth } from "./process-identity.ts";
 
@@ -8,6 +8,7 @@ type Namespace = "ledger" | "release";
 type Owner = { version: 1 | 2; namespace: Namespace; pid: number; birth?: string; nonce: string };
 export type LeaseHooks = { onCheckpoint?: (phase: "observed-stale" | "claimed" | "release-marker-writing", epoch: bigint) => void };
 export type LeaseState = "none" | "released" | "active" | "dead";
+type LeaseObservation = { epoch: bigint; state: LeaseState; generation?: string };
 
 function present(path: string): boolean {
   try { lstatSync(path); return true; }
@@ -54,7 +55,7 @@ function rootOf(stateDir: string, namespace: Namespace, create: boolean): string
   return root;
 }
 
-function latest(root: string, namespace: Namespace): { epoch: bigint; state: LeaseState } {
+function latest(root: string, namespace: Namespace): LeaseObservation {
   let epoch = -1n;
   for (const name of readdirSync(root)) {
     if (!/^epoch-(?:0|[1-9][0-9]*)$/.test(name)) continue;
@@ -74,18 +75,23 @@ function latest(root: string, namespace: Namespace): { epoch: bigint; state: Lea
     || owner.namespace !== namespace || !Number.isSafeInteger(owner.pid) || owner.pid < 1
     || typeof owner.nonce !== "string" || !/^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/.test(owner.nonce)) throw unavailable();
   const released = join(directory, "released");
+  const generation = createHash("sha256").update(bytes).digest("hex");
   if (present(released)) {
     if (!read(released).equals(bytes)) throw unavailable();
-    return { epoch, state: "released" };
+    return { epoch, state: "released", generation };
   }
-  return { epoch, state: processOwnerAlive(owner) ? "active" : "dead" };
+  return { epoch, state: processOwnerAlive(owner) ? "active" : "dead", generation };
+}
+
+export function observeStateLease(stateDir: string, namespace: Namespace): LeaseObservation {
+  try {
+    const root = rootOf(stateDir, namespace, false);
+    return root === null ? { epoch: -1n, state: "none" } : latest(root, namespace);
+  } catch { throw unavailable(); }
 }
 
 export function stateLeaseStatus(stateDir: string, namespace: Namespace): LeaseState {
-  try {
-    const root = rootOf(stateDir, namespace, false);
-    return root === null ? "none" : latest(root, namespace).state;
-  } catch { throw unavailable(); }
+  return observeStateLease(stateDir, namespace).state;
 }
 
 export function withStateLease<T>(stateDir: string, namespace: Namespace, operation: () => T, hooks: LeaseHooks = {}): T {
