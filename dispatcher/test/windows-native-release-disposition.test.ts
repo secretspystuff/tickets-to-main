@@ -1,10 +1,13 @@
 import assert from "node:assert/strict";
+import { spawn } from "node:child_process";
 import { once } from "node:events";
 import fs, { existsSync, readFileSync, realpathSync } from "node:fs";
 import { syncBuiltinESMExports } from "node:module";
 import { tmpdir } from "node:os";
 import { basename, dirname, join } from "node:path";
 import { test, type TestContext } from "node:test";
+import { fileURLToPath } from "node:url";
+import { deserialize, serialize } from "node:v8";
 import { Worker } from "node:worker_threads";
 import * as installer from "../src/install.ts";
 import type { InstallInput, VerifiedSelectedRelease } from "../src/install.ts";
@@ -18,6 +21,7 @@ import { withReleaseLock } from "../src/release-store.ts";
 import { observeStateLease } from "../src/state-lease.ts";
 import { removeDir, tempDir } from "./helpers.ts";
 import { COMMIT, digest, fixture, snapshot } from "./release-test-fixtures.ts";
+import type { ProcessExitOffer, ProcessExitWitness } from "./windows-release-process-exit.fixture.ts";
 
 const SUBMISSION_DIRECTORY = "windows-release-submission";
 const JOURNAL_NAME = "windows-release-submissions.jsonl";
@@ -581,4 +585,88 @@ test("an uncertain publication result leaves the complete original attempt held 
   const reopened = await reopenWithFreshModuleState(offered);
   assert.deepEqual(reopened, { pid: process.pid, journalSha256: digest(expectedBytes), read: expected, outcome: expected, submissions: 0 });
   assert.deepEqual(snapshot(stateDir), before);
+});
+
+async function runProcessExitWitness(offered: ReturnType<typeof offeredRelease>, phase: ProcessExitWitness["phase"]) {
+  const input: ProcessExitOffer = {
+    input: offered.input,
+    observation: offered.observation,
+    policy: POLICY,
+    trust: {
+      ...offered.releaseTrust,
+      keys: [...offered.releaseTrust.keys].map(([id, key]) => [id, key.export({ type: "spki", format: "der" })]),
+    },
+  };
+  const source = fileURLToPath(new URL("./windows-release-process-exit.fixture.ts", import.meta.url));
+  const temp = tmpdir();
+  const child = spawn(process.execPath, ["--experimental-strip-types", source, phase], {
+    shell: false, windowsHide: true, stdio: ["pipe", "pipe", "pipe"],
+    env: { SystemRoot: process.env.SystemRoot, TEMP: temp, TMP: temp, TMPDIR: temp, NODE_DISABLE_COMPILE_CACHE: "1" },
+  });
+  const done = once(child, "close");
+  const stdout: Buffer[] = [];
+  const stderr: Buffer[] = [];
+  let inputError: Error | undefined;
+  child.stdout.on("data", (bytes: Buffer) => stdout.push(bytes));
+  child.stderr.on("data", (bytes: Buffer) => stderr.push(bytes));
+  child.stdin.on("error", (error) => { inputError = error; });
+  child.stdin.end(serialize(input));
+  const [code, signal] = await done;
+  assert.equal(signal, null);
+  assert.equal(code, 0, Buffer.concat(stderr).toString("utf8"));
+  assert.equal(inputError, undefined);
+  assert.equal(Buffer.concat(stderr).length, 0);
+  const recorded = deserialize(Buffer.concat(stdout)) as ProcessExitWitness;
+  assert.equal(recorded.phase, phase);
+  assert.equal(recorded.pid, child.pid);
+  return recorded;
+}
+
+test("a self-exiting submission owner leaves its exact held intent for a new process", async (t) => {
+  const offered = offeredRelease(ownedState(t), true);
+  const { stateDir } = offered.input;
+  const previous = offered.previousInput?.release;
+  assert.ok(previous);
+  const ledger = readFileSync(join(stateDir, "ledger.json"));
+  const original = await runProcessExitWitness(offered, "published");
+  assert.equal(original.phase, "published");
+  assert.equal(original.observations, 1);
+  assert.equal(original.submissions, 1);
+  assert.ok(original.release.generation);
+  const attempt: Attempt = {
+    release: offered.bound.release,
+    archiveSha256: digest(offered.bound.archiveBytes),
+    appxDigest: APPX,
+    packageFullName: NEXT,
+    leaseEpoch: original.release.epoch.toString(),
+    leaseGeneration: original.release.generation,
+  };
+  const exact = Buffer.from(JSON.stringify({ phase: "intent", attempt }) + "\n");
+  assert.deepEqual(original.bytes, exact);
+  assert.deepEqual(journalBytes(stateDir), exact);
+  assert.deepEqual(readFileSync(join(stateDir, "ledger.json")), ledger);
+  const retained = snapshot(stateDir);
+
+  const reopened = await runProcessExitWitness(offered, "reopened");
+  assert.equal(reopened.phase, "reopened");
+  assert.deepEqual(reopened.release, { ...original.release, state: "dead" });
+  assert.deepEqual(reopened.ledger, { ...original.ledger, state: "dead" });
+  assert.deepEqual(reopened.bytes, exact);
+  assert.deepEqual(reopened.disposition, { state: "held", attempt });
+  assert.deepEqual(reopened.ledgerRecord, offered.initialLedger);
+  assert.deepEqual(reopened.selected, {
+    version: previous.requestedVersion, sourceCommit: previous.sourceCommit, manifestDigest: digest(previous.manifestBytes),
+  });
+  assert.match(reopened.repeated, /release operation could not finish safely/i);
+  assert.match(reopened.recovery, /release operation could not finish safely/i);
+  assert.equal(reopened.observations, 0);
+  assert.equal(reopened.submissions, 0);
+  assert.deepEqual(readFileSync(join(stateDir, "ledger.json")), ledger);
+  assert.deepEqual(snapshot(stateDir), retained);
+  t.diagnostic(JSON.stringify({
+    originalPid: original.pid, reopenedPid: reopened.pid, intentSha256: digest(exact),
+    releaseEpoch: attempt.leaseEpoch, releaseGeneration: attempt.leaseGeneration, ledgerGeneration: original.ledger.generation,
+    disposition: reopened.disposition.state, repeated: reopened.repeated, recovery: reopened.recovery,
+    observations: reopened.observations, submissions: reopened.submissions,
+  }));
 });
